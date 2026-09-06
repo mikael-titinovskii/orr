@@ -1,10 +1,13 @@
-# open router router
+# orr
 
 `orr` is a local OpenRouter proxy. It keeps the model selected by your client
 and applies provider preferences from `providers.yaml` to generation requests.
 
 It gives you provider routing, manual pins, live performance and spend data, and
 a terminal dashboard without recording prompts or API keys.
+
+`orr` is an independent project and is not affiliated with or endorsed by
+OpenRouter. OpenRouter is a trademark of OpenRouter, Inc.
 
 ## Dashboard
 
