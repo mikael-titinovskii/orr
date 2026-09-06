@@ -1,4 +1,4 @@
-# orr
+# open router router
 
 `orr` is a local OpenRouter proxy. It keeps the model selected by your client
 and applies provider preferences from `providers.yaml` to generation requests.
