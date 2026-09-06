@@ -6,6 +6,30 @@ and applies provider preferences from `providers.yaml` to generation requests.
 It gives you provider routing, manual pins, live performance and spend data, and
 a terminal dashboard without recording prompts or API keys.
 
+## Dashboard
+
+![orr dashboard](docs/assets/dashboard.png)
+
+An interactive terminal opens the dashboard; redirected output uses plain logs.
+Set `ORR_TUI=false` to always use plain logs.
+
+The useful controls are:
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Select a provider. |
+| `Enter` | Toggle a manual pin for the selected provider. |
+| `Tab` | Switch between recently used models. |
+| `r` | Refresh and rank providers for the current model. |
+| `t` | Benchmark the selected provider. |
+| `a` | Benchmark every listed provider. |
+| `s` | Start or stop the spend stopwatch. |
+| `q` / `Ctrl+C` | Stop the proxy cleanly. |
+
+Manual pins stay until removed. Automatic pins select the best measured
+provider, expire after `ORR_PIN_TTL` (one hour by default), and can fail over
+after provider-specific 429s or an unavailable endpoint.
+
 > A valid OpenRouter API key is required. `orr` does not support keyless use.
 
 ## Quick start
@@ -87,30 +111,6 @@ Use a different dotenv file when needed:
 orr serve --env ./local.env
 orr update --max 3 --env ./local.env
 ```
-
-## Dashboard
-
-An interactive terminal opens the dashboard; redirected output uses plain logs.
-Set `ORR_TUI=false` to always use plain logs.
-
-![orr dashboard](docs/assets/dashboard.png)
-
-The useful controls are:
-
-| Key | Action |
-| --- | --- |
-| `↑` / `↓` | Select a provider. |
-| `Enter` | Toggle a manual pin for the selected provider. |
-| `Tab` | Switch between recently used models. |
-| `r` | Refresh and rank providers for the current model. |
-| `t` | Benchmark the selected provider. |
-| `a` | Benchmark every listed provider. |
-| `s` | Start or stop the spend stopwatch. |
-| `q` / `Ctrl+C` | Stop the proxy cleanly. |
-
-Manual pins stay until removed. Automatic pins select the best measured
-provider, expire after `ORR_PIN_TTL` (one hour by default), and can fail over
-after provider-specific 429s or an unavailable endpoint.
 
 ## Integrations
 
