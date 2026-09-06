@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Build release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in linux-amd64 darwin-amd64 darwin-arm64 windows-amd64; do
+            goos=${target%%-*}
+            goarch=${target#*-}
+            extension=''
+            if [ "$goos" = windows ]; then extension='.exe'; fi
+            binary="orr-${target}${extension}"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags='-s -w' -o "dist/$binary" ./cmd/orr
+            tar -czf "dist/orr_${target}.tar.gz" -C dist "$binary"
+          done
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz --generate-notes

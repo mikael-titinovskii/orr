@@ -1,0 +1,9 @@
+/orr
+/orr.exe
+/orr.exe~
+/.env
+/providers.yaml
+/.idea/
+*.test
+/orr.log
+/__pycache__/
