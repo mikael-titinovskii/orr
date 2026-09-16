@@ -20,11 +20,16 @@ const proxyBaseURL = "http://127.0.0.1:8787/v1"
 
 var (
 	tomlSection = regexp.MustCompile(`^\s*\[([^]]+)]\s*(?:#.*)?$`)
-	tomlBaseURL = regexp.MustCompile(`^(\s*base_url\s*=\s*)(["']).*(["'])(\s*(?:#.*)?)$`)
+	tomlBaseURL = regexp.MustCompile(`^(\s*base_url\s*=\s*)(["'])(.*)(["'])(\s*(?:#.*)?)$`)
 	tomlAPIKey  = regexp.MustCompile(`^(\s*api_key\s*=\s*)(["']).*(["'])(\s*(?:#.*)?)$`)
+	tomlType    = regexp.MustCompile(`^\s*type\s*=\s*["']([^"']+)["']\s*(?:#.*)?$`)
 )
 
 func runIntegrate(envPath string, output io.Writer) error {
+	return runIntegrateWithOptions(envPath, false, output)
+}
+
+func runIntegrateWithOptions(envPath string, preferEnvFile bool, output io.Writer) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("find home directory: %w", err)
@@ -34,16 +39,12 @@ func runIntegrate(envPath string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	apiKey := envValue(fileEnv, "OPENROUTER_API_KEY")
+	apiKey := envValue(fileEnv, "OPENROUTER_API_KEY", preferEnvFile)
 
 	paths := []integrationPath{
-		{path: filepath.Join(home, ".kimi", "config.toml"), kind: "kimi", create: commandExists("kimi")},
-		{path: filepath.Join(home, ".kimi-code", "config.toml"), kind: "kimi", create: commandExists("kimi-code")},
+		{path: kimiConfigPath(home), kind: "kimi", create: commandExists("kimi")},
+		{path: openCodeConfigPath(home), kind: "opencode", create: commandExists("opencode")},
 	}
-	if custom := strings.TrimSpace(os.Getenv("KIMI_SHARE_DIR")); custom != "" {
-		paths = append([]integrationPath{{path: filepath.Join(custom, "config.toml"), kind: "kimi", create: commandExists("kimi") || commandExists("kimi-code")}}, paths...)
-	}
-	paths = append(paths, integrationPath{path: openCodeConfigPath(home), kind: "opencode", create: commandExists("opencode")})
 
 	seen := make(map[string]bool)
 	for _, candidate := range paths {
@@ -83,6 +84,14 @@ type integrationPath struct {
 func commandExists(name string) bool {
 	_, err := exec.LookPath(name)
 	return err == nil
+}
+
+func kimiConfigPath(home string) string {
+	directory := strings.TrimSpace(os.Getenv("KIMI_CODE_HOME"))
+	if directory == "" {
+		directory = filepath.Join(home, ".kimi-code")
+	}
+	return filepath.Join(directory, "config.toml")
 }
 
 func openCodeConfigPath(home string) string {
@@ -210,16 +219,25 @@ func patchKimiConfig(path, apiKey string, create bool) (bool, error) {
 		if !create {
 			return false, nil
 		}
-		content := "[providers.openrouter]\n" +
-			"type = \"openai_legacy\"\n" +
+		err = nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read Kimi config %s: %w", path, err)
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		content := "default_model = \"moonshotai/kimi-k3\"\n\n" +
+			"[providers.openrouter]\n" +
+			"type = \"openai\"\n" +
 			"base_url = " + strconv.Quote(proxyBaseURL) + "\n"
 		if apiKey != "" {
 			content += "api_key = " + strconv.Quote(apiKey) + "\n"
 		}
-		return true, writeIntegratedFile(path, nil, []byte(content))
-	}
-	if err != nil {
-		return false, fmt.Errorf("read Kimi config %s: %w", path, err)
+		content += "\n[models.\"moonshotai/kimi-k3\"]\n" +
+			"provider = \"openrouter\"\n" +
+			"model = \"moonshotai/kimi-k3\"\n" +
+			"max_context_size = 1048576\n" +
+			"capabilities = [\"thinking\", \"always_thinking\", \"image_in\", \"tool_use\"]\n"
+		return true, writeIntegratedFile(path, data, []byte(content))
 	}
 	newline := "\n"
 	if bytes.Contains(data, []byte("\r\n")) {
@@ -241,7 +259,11 @@ func patchKimiConfig(path, apiKey string, create bool) (bool, error) {
 		target := strings.EqualFold(name, "openrouter")
 		baseLine := -1
 		apiKeyLine := -1
+		providerType := ""
 		for i := start + 1; i < end; i++ {
+			if parts := tomlType.FindStringSubmatch(lines[i]); parts != nil {
+				providerType = parts[1]
+			}
 			if tomlBaseURL.MatchString(lines[i]) {
 				baseLine = i
 				if strings.Contains(strings.ToLower(lines[i]), "openrouter.ai") {
@@ -253,10 +275,21 @@ func patchKimiConfig(path, apiKey string, create bool) (bool, error) {
 			}
 		}
 		if target {
-			if baseLine >= 0 && !strings.Contains(lines[baseLine], proxyBaseURL) {
+			baseURL := proxyBaseURL
+			switch providerType {
+			case "", "openai", "openai_responses", "kimi":
+			case "anthropic":
+				// The Anthropic SDK appends /v1/messages itself.
+				baseURL = strings.TrimSuffix(proxyBaseURL, "/v1")
+			default:
+				return false, fmt.Errorf("unsupported Kimi provider type in %s; configure OpenRouter with type = \"openai\" for current Kimi Code", path)
+			}
+			if baseLine >= 0 {
 				parts := tomlBaseURL.FindStringSubmatch(lines[baseLine])
-				lines[baseLine] = parts[1] + strconv.Quote(proxyBaseURL) + parts[4]
-				changed = true
+				if parts[3] != baseURL {
+					lines[baseLine] = parts[1] + strconv.Quote(baseURL) + parts[5]
+					changed = true
+				}
 			}
 			if apiKey != "" && apiKeyLine >= 0 && !strings.Contains(lines[apiKeyLine], strconv.Quote(apiKey)) {
 				parts := tomlAPIKey.FindStringSubmatch(lines[apiKeyLine])
@@ -264,8 +297,11 @@ func patchKimiConfig(path, apiKey string, create bool) (bool, error) {
 				changed = true
 			}
 			missing := make([]string, 0, 2)
+			if providerType == "" {
+				missing = append(missing, "type = \"openai\"")
+			}
 			if baseLine < 0 {
-				missing = append(missing, "base_url = "+strconv.Quote(proxyBaseURL))
+				missing = append(missing, "base_url = "+strconv.Quote(baseURL))
 			}
 			if apiKey != "" && apiKeyLine < 0 {
 				missing = append(missing, "api_key = "+strconv.Quote(apiKey))

@@ -1,9 +1,12 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math"
+	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,6 +24,12 @@ type releaseUpdateTickMsg struct{}
 type releaseUpdateResultMsg struct {
 	version string
 	err     error
+}
+
+type providerQualityMsg struct {
+	model  string
+	values map[string]providerQuality
+	err    error
 }
 
 // providerTestMsg carries the outcome of a 't' ping-pong test against one
@@ -84,6 +93,10 @@ type dashboardModel struct {
 	stopwatch        *stopwatchState
 	releaseUpdate    string
 	checkRelease     func() (string, error)
+	fetchQuality     func(model string) (map[string]providerQuality, error)
+	quality          map[string]map[string]providerQuality
+	qualityFetchedAt map[string]time.Time
+	qualityLoading   map[string]bool
 }
 
 var (
@@ -160,7 +173,7 @@ func overlayWatermarkRow(line, row string, left, width int) string {
 }
 
 func newDashboard(cfg config, stats *stats, routing *routingState) dashboardModel {
-	return dashboardModel{
+	m := dashboardModel{
 		cfg: cfg, stats: stats, routing: routing,
 		viewport:         viewport.New(0, 0),
 		autoScroll:       true,
@@ -170,6 +183,33 @@ func newDashboard(cfg config, stats *stats, routing *routingState) dashboardMode
 		allTestRevisions: make(map[string]uint64),
 		stopwatch:        newStopwatch(),
 		checkRelease:     checkForReleaseUpdate,
+		quality:          make(map[string]map[string]providerQuality),
+		qualityFetchedAt: make(map[string]time.Time),
+		qualityLoading:   make(map[string]bool),
+	}
+	if upstream, err := url.Parse(cfg.Upstream); err == nil && upstream.Scheme == "https" && upstream.Host == "openrouter.ai" {
+		client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+		m.fetchQuality = func(model string) (map[string]providerQuality, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return fetchProviderQuality(ctx, client, "https://openrouter.ai", cfg.openRouterKey(), model)
+		}
+	}
+	return m
+}
+
+func (m *dashboardModel) refreshQualityCmd() tea.Cmd {
+	if m.fetchQuality == nil || m.model == "" || m.qualityLoading[m.model] {
+		return nil
+	}
+	if last, ok := m.qualityFetchedAt[m.model]; ok && m.routing.now().Sub(last) < providerQualityTTL {
+		return nil
+	}
+	model, fetch := m.model, m.fetchQuality
+	m.qualityLoading[model] = true
+	return func() tea.Msg {
+		values, err := fetch(model)
+		return providerQualityMsg{model: model, values: values, err: err}
 	}
 }
 
@@ -220,7 +260,18 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.syncModel()
 		m.refreshLog()
 		m.stopwatch.tick(m.routing.now(), m.currentSnap())
+		if qualityCmd := m.refreshQualityCmd(); qualityCmd != nil {
+			return m, tea.Batch(tickDashboard(), qualityCmd)
+		}
 		return m, tickDashboard()
+	case providerQualityMsg:
+		delete(m.qualityLoading, msg.model)
+		m.qualityFetchedAt[msg.model] = m.routing.now()
+		// Expired data must not survive a failed refresh as if it were current.
+		delete(m.quality, msg.model)
+		if msg.err == nil {
+			m.quality[msg.model] = msg.values
+		}
 	case serverErrorMsg:
 		m.serverErr = msg.err
 		return m, tea.Quit
@@ -378,6 +429,7 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		case "r":
+			delete(m.qualityFetchedAt, m.model)
 			if m.refresh != nil && m.model != "" {
 				// Re-reading the catalog is when a user who just changed a
 				// guardrail expects orr to find out, so forget the recorded
@@ -1048,14 +1100,14 @@ func (m dashboardModel) renderRouting(snap statsSnapshot, width, height int) str
 		titleStyle.Render("Routing"),
 		"",
 		dimStyle.Render(shorten(hint, width)),
-		dimStyle.Render(shorten("measured tok/s and lat - ttl 30m", width)),
+		dimStyle.Render(shorten("Ts/mTs tok/s • Lat/mLat ms (m = measured) • GPQA/Tau OR benchmarks • Tool/Json OR weekly avg errors • mApi/mTool measured errors", width)),
 		dimStyle.Render(shorten("API P50: last 30m • website P50: 1 week", width)),
 		"",
 		shorten(modelLine, max(7, width)),
 		pinLine,
 		"",
 	}
-	tableHeight := max(1, height-len(lines)-2)
+	tableHeight := max(1, height-lipgloss.Height(strings.Join(lines, "\n"))-2)
 	lines = append(lines, m.renderProviderTable(snap, width, tableHeight))
 	content := strings.Join(lines, "\n")
 	if lipgloss.Height(content) > height {
@@ -1110,6 +1162,12 @@ type providerScores struct {
 	latency        float64
 	measThroughput float64
 	measLatency    float64
+	gpqa           float64
+	tau            float64
+	orToolError    float64
+	orJSONError    float64
+	apiError       float64
+	toolError      float64
 }
 
 func computeScores(providers []string, endpoints map[string]endpointMeta, measured map[string]measuredMetrics) map[string]providerScores {
@@ -1162,6 +1220,12 @@ func computeScores(providers []string, endpoints map[string]endpointMeta, measur
 			latency:        noScore,
 			measThroughput: noScore,
 			measLatency:    noScore,
+			gpqa:           noScore,
+			tau:            noScore,
+			orToolError:    noScore,
+			orJSONError:    noScore,
+			apiError:       noScore,
+			toolError:      noScore,
 		}
 		if _, ok := endpoints[provider]; ok {
 			if v, ok := prompts[provider]; ok {
@@ -1323,7 +1387,7 @@ func (m dashboardModel) renderProviderTable(snap statsSnapshot, width, height in
 		return dimStyle.Render(shorten("waiting for model data", width))
 	}
 
-	header := []string{"Provider", "In", "Out", "Cache", "Tok/s", "mTs", "Lat", "mLat", "TTFT", "Cache%", "API Err", "Tool Err"}
+	header := []string{"Provider", "In", "Out", "Cache", "Ts", "mTs", "Lat", "mLat", "TTFT", "GPQA", "Tau", "Tool", "Json", "mApi", "mTool"}
 
 	now := m.routing.now()
 	measured := make(map[string]measuredMetrics, len(providers))
@@ -1341,6 +1405,8 @@ func (m dashboardModel) renderProviderTable(snap statsSnapshot, width, height in
 
 	blocked := m.routing.blockedProviders(m.model)
 	scores := computeScores(providers, endpointByTag, measured)
+	applyProviderQualityScores(providers, m.quality[m.model], scores)
+	applyMeasuredErrorScores(providers, records, scores)
 	ttfts := make(map[string]float64, len(providers))
 	for _, provider := range providers {
 		if value := groupTTFTDuration(records[provider]); value > 0 {
@@ -1362,10 +1428,13 @@ func (m dashboardModel) renderProviderTable(snap statsSnapshot, width, height in
 		}
 		return lipgloss.NewStyle().Foreground(gradientColor(displayContrastScore(score))).Render(value)
 	}
-	// Below 85 cells the single-row table no longer has enough room for both
-	// readable provider labels and its metric headers. Wider panes use the
-	// elastic table. Narrow panes retain every metric in a multi-line layout.
-	if width < 85 {
+	// Keep room for a readable provider label, every metric header, and common
+	// numeric values. Narrow panes retain every metric in a multi-line layout.
+	minimumWidth := 20 + len(header) - 1
+	for _, label := range header[1:] {
+		minimumWidth += max(6, lipgloss.Width(label))
+	}
+	if width < max(110, minimumWidth) {
 		return m.renderCompactProviderTable(providers, endpointByTag, measured, records, ttftCells, scores, blocked, pinned, pinnedManual, m.selection, width, height, styleCell)
 	}
 
@@ -1415,8 +1484,13 @@ func (m dashboardModel) renderProviderTable(snap statsSnapshot, width, height in
 			mToks, mLat = 0, 0
 			s.measThroughput, s.measLatency = noScore, noScore
 		}
-		apiErr, toolErr := coloredGroupErrorRates(records[provider])
-		observed := []string{ttftCells[provider], groupCache(records[provider]), apiErr, toolErr}
+		apiErr, toolErr := coloredGroupErrorRates(records[provider], s.apiError, s.toolError)
+		quality := providerQualityCells(m.quality[m.model][provider])
+		quality[0] = styleCell(quality[0], s.gpqa)
+		quality[1] = styleCell(quality[1], s.tau)
+		quality[2] = styleQualityError(quality[2], s.orToolError)
+		quality[3] = styleQualityError(quality[3], s.orJSONError)
+		observed := []string{ttftCells[provider], quality[0], quality[1], quality[2], quality[3], apiErr, toolErr}
 		if ok {
 			cells = append(cells,
 				styleCell(pricePerM(ep.Pricing.Prompt), s.prompt),
@@ -1426,7 +1500,6 @@ func (m dashboardModel) renderProviderTable(snap statsSnapshot, width, height in
 				styleCell(formatThroughput(mToks), s.measThroughput),
 				styleCell(formatLatency(ep.Latency), s.latency),
 				styleCell(formatLatency(mLat), s.measLatency),
-				observed[0], observed[1], observed[2], observed[3],
 			)
 		} else {
 			cells = append(cells,
@@ -1434,9 +1507,9 @@ func (m dashboardModel) renderProviderTable(snap statsSnapshot, width, height in
 				styleCell(formatThroughput(mToks), s.measThroughput),
 				"",
 				styleCell(formatLatency(mLat), s.measLatency),
-				observed[0], observed[1], observed[2], observed[3],
 			)
 		}
+		cells = append(cells, observed...)
 		rows = append(rows, tableRow{cells: cells, selected: i == m.selection, blocked: isBlocked})
 	}
 
@@ -1459,16 +1532,13 @@ func (m dashboardModel) renderProviderTable(snap statsSnapshot, width, height in
 		}
 		lines = append(lines, line)
 	}
-	content := strings.Join(lines, "\n")
-	if lipgloss.Height(content) > height {
-		content = shortenLines(content, height)
-	}
-	return content
+	return renderProviderTableWindow(lines[0], lines[1:], m.selection, height)
 }
 
 func (m dashboardModel) renderCompactProviderTable(providers []string, endpoints map[string]endpointMeta, measured map[string]measuredMetrics, records map[string][]requestRecord, ttftCells map[string]string, scores map[string]providerScores, blocked map[string]blockedProvider, pinned string, pinnedManual bool, selection, width, height int, styleCell func(string, float64) string) string {
-	lines := []string{titleStyle.Render("Provider metrics")}
+	rows := make([]string, 0, len(providers))
 	for i, provider := range providers {
+		var lines []string
 		marker := " "
 		if provider == pinned {
 			if pinnedManual {
@@ -1504,35 +1574,69 @@ func (m dashboardModel) renderCompactProviderTable(providers []string, endpoints
 			mToks, mLat = 0, 0
 			s.measThroughput, s.measLatency = noScore, noScore
 		}
-		apiErr, toolErr := coloredGroupErrorRates(records[provider])
+		apiErr, toolErr := coloredGroupErrorRates(records[provider], s.apiError, s.toolError)
+		quality := providerQualityCells(m.quality[m.model][provider])
+		quality[0] = styleCell(quality[0], s.gpqa)
+		quality[1] = styleCell(quality[1], s.tau)
+		quality[2] = styleQualityError(quality[2], s.orToolError)
+		quality[3] = styleQualityError(quality[3], s.orJSONError)
 		pricing := []string{
 			"In " + styleCell(pricePerM(ep.Pricing.Prompt), s.prompt),
 			"Out " + styleCell(pricePerM(ep.Pricing.Completion), s.completion),
 			"Cache " + styleCell(pricePerM(ep.Pricing.InputCacheRead), s.cacheRead),
 		}
 		performance := []string{
-			"Tok/s " + styleCell(formatThroughput(ep.Throughput), s.throughput),
+			"Ts " + styleCell(formatThroughput(ep.Throughput), s.throughput),
 			"mTs " + styleCell(formatThroughput(mToks), s.measThroughput),
 			"Lat " + styleCell(formatLatency(ep.Latency), s.latency),
 			"mLat " + styleCell(formatLatency(mLat), s.measLatency),
 			"TTFT " + ttftCells[provider],
-			"Cache% " + groupCache(records[provider]),
+			"GPQA " + quality[0],
+			"Tau " + quality[1],
 		}
 		if width < 60 {
-			observed := []string{"TTFT " + ttftCells[provider], "Cache% " + groupCache(records[provider]), "API " + apiErr, "Tool " + toolErr}
-			lines = append(lines, shorten(strings.Join(pricing, " "), width))
-			lines = append(lines, shorten(strings.Join(performance[:4], " "), width))
-			lines = append(lines, shorten(strings.Join(observed, " "), width))
+			observed := []string{"TTFT " + ttftCells[provider], "GPQA " + quality[0], "Tau " + quality[1]}
+			lines = append(lines, ansi.Wrap(strings.Join(pricing, " "), max(1, width), ""))
+			lines = append(lines, ansi.Wrap(strings.Join(performance[:4], " "), max(1, width), ""))
+			lines = append(lines, ansi.Wrap(strings.Join(observed, " "), max(1, width), ""))
 		} else {
-			pricing = append(pricing, "API Err "+apiErr, "Tool Err "+toolErr)
-			lines = append(lines, shorten(strings.Join(pricing, " "), width))
-			lines = append(lines, shorten(strings.Join(performance, " "), width))
+			lines = append(lines, ansi.Wrap(strings.Join(pricing, " "), max(1, width), ""))
+			lines = append(lines, ansi.Wrap(strings.Join(performance, " "), max(1, width), ""))
+		}
+		lines = append(lines, ansi.Wrap("Tool "+quality[2]+" Json "+quality[3], max(1, width), ""))
+		lines = append(lines, ansi.Wrap("mApi "+apiErr+" mTool "+toolErr, max(1, width), ""))
+		rows = append(rows, strings.Join(lines, "\n"))
+	}
+	return renderProviderTableWindow(titleStyle.Render("Provider metrics"), rows, selection, height)
+}
+
+// Keep the header and the selected provider's metrics in view as navigation
+// moves beyond the pane. Compact rows can have different heights after wrapping.
+func renderProviderTableWindow(header string, rows []string, selection, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	first := 0
+	if selection >= 0 && selection < len(rows) {
+		budget := max(0, height-lipgloss.Height(header))
+		used := lipgloss.Height(rows[selection])
+		for i := 0; i < selection; i++ {
+			used += lipgloss.Height(rows[i])
+		}
+		if used > budget {
+			first = selection
+			used = lipgloss.Height(rows[selection])
+			for first > 0 && used+lipgloss.Height(rows[first-1]) <= budget {
+				first--
+				used += lipgloss.Height(rows[first])
+			}
 		}
 	}
-	if lipgloss.Height(strings.Join(lines, "\n")) > height {
-		return shortenLines(strings.Join(lines, "\n"), height)
+	content := header
+	if len(rows) > 0 {
+		content += "\n" + strings.Join(rows[first:], "\n")
 	}
-	return strings.Join(lines, "\n")
+	return shortenLines(content, height)
 }
 
 // providerTableColumnWidths gives metric columns enough room for their headers
@@ -1558,7 +1662,7 @@ func providerTableColumnWidths(rows [][]string, maxWidth int) []int {
 	widths[0] = max(20, widths[0])
 	desired[0] = min(36, max(widths[0], desired[0]))
 	for i := 1; i < columns; i++ {
-		desired[i] = min(10, max(widths[i], desired[i]))
+		desired[i] = min(max(10, widths[i]), max(widths[i], desired[i]))
 	}
 
 	available := max(columns, maxWidth-(columns-1))
@@ -1905,39 +2009,29 @@ func groupTTFTDuration(records []requestRecord) time.Duration {
 	return total / time.Duration(count)
 }
 
-// Hide zero and missing rates; color the remaining measured error rates red.
-func coloredGroupErrorRates(records []requestRecord) (api, tools string) {
+// Hide zero and missing rates; shade each measured error column independently.
+func coloredGroupErrorRates(records []requestRecord, apiScore, toolScore float64) (api, tools string) {
 	api, tools = groupErrorRates(records)
 	if api == "0.0%" || api == "" {
 		api = ""
 	} else {
-		api = errorStyle.Render(api)
+		api = styleQualityError(api, apiScore)
 	}
 	if tools == "0.0%" || tools == "" {
 		tools = ""
 	} else {
-		tools = errorStyle.Render(tools)
+		tools = styleQualityError(tools, toolScore)
 	}
 	return api, tools
 }
 
-// groupCache returns the average cache-hit percentage across records, or "".
-func groupCache(records []requestRecord) string {
-	var totalCached, totalPrompt int
-	for _, r := range records {
-		if r.PromptTokens > 0 {
-			totalCached += r.CachedTokens
-			totalPrompt += r.PromptTokens
-		}
-	}
-	if totalPrompt == 0 {
-		return ""
-	}
-	return cachePercentText(float64(totalCached) / float64(totalPrompt) * 100)
-}
-
 // groupErrorRates returns the API and tool error rates across records.
 func groupErrorRates(records []requestRecord) (api, tools string) {
+	apiRate, toolRate := groupErrorRateValues(records)
+	return formatRate(apiRate), formatRate(toolRate)
+}
+
+func groupErrorRateValues(records []requestRecord) (api, tools float64) {
 	var total, apiErrs, toolReqs, toolErrs int
 	for _, r := range records {
 		// A record with no response status was cancelled by orr — the
@@ -1958,12 +2052,12 @@ func groupErrorRates(records []requestRecord) (api, tools string) {
 		}
 	}
 	if total == 0 {
-		return "", ""
+		return noScore, noScore
 	}
-	api = formatRate(float64(apiErrs) / float64(total) * 100)
-	tools = ""
+	api = float64(apiErrs) / float64(total) * 100
+	tools = noScore
 	if toolReqs > 0 {
-		tools = formatRate(float64(toolErrs) / float64(toolReqs) * 100)
+		tools = float64(toolErrs) / float64(toolReqs) * 100
 	}
 	return api, tools
 }

@@ -94,6 +94,16 @@ func TestCompletionOffersEveryFlagOfACommand(t *testing.T) {
 	}
 }
 
+func TestDotEnvCommandsOfferPreferEnvFileFlag(t *testing.T) {
+	for _, name := range []string{"serve", "providers", "update", "reset", "integrate"} {
+		for _, cmd := range newRootCommand(io.Discard).Commands() {
+			if cmd.Name() == name && cmd.Flags().Lookup("prefer-env-file") == nil {
+				t.Errorf("%s does not offer --prefer-env-file", name)
+			}
+		}
+	}
+}
+
 func TestCompletionOffersConfiguredModelsForProviders(t *testing.T) {
 	root := t.TempDir()
 	providersPath := filepath.Join(root, "providers.yaml")
