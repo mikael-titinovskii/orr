@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -37,7 +38,7 @@ func checkForReleaseUpdate() (string, error) {
 	if _, err := gitOutput(ctx, "", "init", "--bare", "--quiet", temporary); err != nil {
 		return "", err
 	}
-	if _, err := gitOutput(ctx, temporary, "fetch", "--quiet", "--depth=1", "--tags", "--no-recurse-submodules", orrRepositoryURL()); err != nil {
+	if _, err := gitOutput(ctx, temporary, "fetch", "--quiet", "--tags", "--no-recurse-submodules", orrRepositoryURL()); err != nil {
 		return "", err
 	}
 	return repositoryHasNewerRelease(ctx, temporary)
@@ -48,7 +49,39 @@ func repositoryHasNewerRelease(ctx context.Context, repository string) (string, 
 	if err != nil {
 		return "", err
 	}
-	return newerReleaseTag(tags, Version), nil
+	revision := runningRevision()
+	if revision == "" {
+		if executable, err := os.Executable(); err == nil && isGoRunExecutable(executable) && isOrrRepository(repository) {
+			revision = "HEAD"
+		}
+	}
+	return newerReleaseForRevision(ctx, repository, tags, Version, revision)
+}
+
+func runningRevision() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range info.Settings {
+			if setting.Key == "vcs.revision" {
+				return setting.Value
+			}
+		}
+	}
+	return ""
+}
+
+func newerReleaseForRevision(ctx context.Context, repository, tags, current, revision string) (string, error) {
+	if revision != "" {
+		// Tags already contained in the running build are not upgrades, even
+		// when the source's version constant predates those tags.
+		merged, err := gitOutput(ctx, repository, "tag", "--merged", revision)
+		if err != nil {
+			return "", err
+		}
+		if included := newerReleaseTag(merged, current); included != "" {
+			current = included
+		}
+	}
+	return newerReleaseTag(tags, current), nil
 }
 
 func localOrrRepository(ctx context.Context) string {

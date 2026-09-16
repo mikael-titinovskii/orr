@@ -27,6 +27,7 @@ type config struct {
 	UpdateCacheOnly            bool
 	RateLimitFailoverThreshold int
 	providersPath              string
+	preferEnvFile              bool
 }
 
 const defaultRateLimitFailoverThreshold = 2
@@ -61,6 +62,10 @@ func (p providerConfig) hasRouting() bool {
 }
 
 func loadConfig(envPath string) (config, error) {
+	return loadConfigWithOptions(envPath, false)
+}
+
+func loadConfigWithOptions(envPath string, preferEnvFile bool) (config, error) {
 	cfg := config{
 		Listen:                     "127.0.0.1:8787",
 		Upstream:                   openRouterAPI,
@@ -69,13 +74,14 @@ func loadConfig(envPath string) (config, error) {
 		UpdateMaxProviders:         20,
 		UpdateCacheOnly:            false,
 		RateLimitFailoverThreshold: defaultRateLimitFailoverThreshold,
+		preferEnvFile:              preferEnvFile,
 	}
 
 	fileEnv, err := readDotEnv(envPath)
 	if err != nil {
 		return config{}, err
 	}
-	value := func(name string) string { return envValue(fileEnv, name) }
+	value := func(name string) string { return envValue(fileEnv, name, preferEnvFile) }
 	if listen := value("ORR_LISTEN"); listen != "" {
 		cfg.Listen = listen
 	}
@@ -126,7 +132,7 @@ func loadConfig(envPath string) (config, error) {
 	}
 	cfg.OpenRouterAPIKey = value("OPENROUTER_API_KEY")
 
-	providersPath := configuredProvidersPath(envPath, fileEnv)
+	providersPath := configuredProvidersPathWithOptions(envPath, fileEnv, preferEnvFile)
 	providerData, providerErr := os.ReadFile(providersPath)
 	if errors.Is(providerErr, os.ErrNotExist) {
 		if err := writeProvidersFileAtomic(providersPath, map[string]providerConfig{}); err != nil {
@@ -162,7 +168,11 @@ func loadConfig(envPath string) (config, error) {
 // creating it. Commands such as reset need the same environment precedence as
 // serve while leaving the file untouched until they intentionally act on it.
 func configuredProvidersPath(envPath string, fileEnv map[string]string) string {
-	providersPath := envValue(fileEnv, "ORR_PROVIDERS_FILE")
+	return configuredProvidersPathWithOptions(envPath, fileEnv, false)
+}
+
+func configuredProvidersPathWithOptions(envPath string, fileEnv map[string]string, preferEnvFile bool) string {
+	providersPath := envValue(fileEnv, "ORR_PROVIDERS_FILE", preferEnvFile)
 	if providersPath == "" {
 		providersPath = "providers.yaml"
 	}
@@ -246,7 +256,12 @@ func parseDotEnvValue(raw string) (string, error) {
 	return raw, nil
 }
 
-func envValue(fileEnv map[string]string, name string) string {
+func envValue(fileEnv map[string]string, name string, preferEnvFile bool) string {
+	if preferEnvFile {
+		if value, ok := fileEnv[name]; ok {
+			return strings.TrimSpace(value)
+		}
+	}
 	if value, ok := os.LookupEnv(name); ok {
 		return strings.TrimSpace(value)
 	}
@@ -256,6 +271,9 @@ func envValue(fileEnv map[string]string, name string) string {
 func (c config) openRouterKey() string {
 	if key := strings.TrimSpace(c.OpenRouterAPIKey); key != "" {
 		return key
+	}
+	if c.preferEnvFile {
+		return ""
 	}
 	return strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY"))
 }

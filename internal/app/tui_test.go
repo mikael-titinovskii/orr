@@ -1608,8 +1608,8 @@ func TestRoutingViewCombinesSelectionAndProviderMetrics(t *testing.T) {
 	dashboard.selection = 1
 	routing.pin(model, "cheap")
 
-	got := dashboard.renderRouting(dashboard.stats.snapshot(), 100, 20)
-	for _, want := range []string{"Routing", "Provider", "Tok/s", "Lat", "mTs", "mLat", "TTFT", "Cache%", "API Err", "Tool Err", "◆ cheap", "100", "250", "50%", "measured tok/s and lat - ttl 30m", "API P50: last 30m • website P50: 1 week"} {
+	got := dashboard.renderRouting(dashboard.stats.snapshot(), 140, 20)
+	for _, want := range []string{"Routing", "Provider", "Ts", "Lat", "mTs", "mLat", "TTFT", "mApi", "mTool", "◆ cheap", "100", "250", "Ts/mTs tok/s • Lat/mLat ms (m = measured) • GPQA/Tau OR benchmarks • Tool/Json OR weekly avg errors • mApi/mTool measured errors", "API P50: last 30m • website P50: 1 week"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("combined routing table missing %q:\n%s", want, got)
 		}
@@ -1634,18 +1634,18 @@ func TestRoutingViewCombinesSelectionAndProviderMetrics(t *testing.T) {
 		t.Fatalf("routing provider column is not reserved like Recent:\n got %q\nwant prefix %q", header, want)
 	}
 
-	medium := ansi.Strip(dashboard.renderRouting(dashboard.stats.snapshot(), 68, 20))
+	medium := ansi.Strip(dashboard.renderRouting(dashboard.stats.snapshot(), 68, 32))
 	if !strings.Contains(medium, "Provider metrics") {
 		t.Fatalf("68-cell routing view did not use the compact layout:\n%s", medium)
 	}
-	for _, want := range []string{"Provider", "Cache", "Tok/s", "mTs", "Lat", "mLat", "TTFT", "Cache%", "API Err", "Tool Err"} {
+	for _, want := range []string{"Provider", "Cache", "Ts", "mTs", "Lat", "mLat", "TTFT", "mApi", "mTool"} {
 		if !strings.Contains(medium, want) {
 			t.Fatalf("68-cell routing table is missing %q:\n%s", want, medium)
 		}
 	}
 
-	narrow := dashboard.renderRouting(dashboard.stats.snapshot(), 36, 20)
-	for _, want := range []string{"mTs", "mLat", "Tok/s", "Lat", "TTFT", "Cache%", "API", "Tool", "100", "1250"} {
+	narrow := dashboard.renderRouting(dashboard.stats.snapshot(), 36, 32)
+	for _, want := range []string{"mTs", "mLat", "Ts", "Lat", "TTFT", "mApi", "mTool", "100", "1250"} {
 		if !strings.Contains(ansi.Strip(narrow), want) {
 			t.Fatalf("narrow routing view missing %q:\n%s", want, narrow)
 		}
@@ -1676,6 +1676,9 @@ func TestProviderTableScopesObservedMetricsToProvider(t *testing.T) {
 	dashboard.selection = -1
 	for _, width := range []int{59, 84, 160} {
 		colored := dashboard.renderProviderTable(stats.snapshot(), width, 100)
+		if strings.Contains(ansi.Strip(colored), "Cache%") {
+			t.Fatalf("provider table still shows Cache%% at width %d", width)
+		}
 		for _, want := range []string{
 			errorStyle.Render("100.0%"),
 			lipgloss.NewStyle().Foreground(gradientColor(1)).Render("200"),
@@ -1707,8 +1710,8 @@ func TestProviderTableScopesObservedMetricsToProvider(t *testing.T) {
 	if strings.Contains(rows["healthy"], "50.0%") {
 		t.Fatalf("expired API/tool error leaked into healthy row: %q", rows["healthy"])
 	}
-	if !strings.Contains(rows["healthy"], "200") || !strings.Contains(rows["healthy"], "75%") {
-		t.Fatalf("healthy TTFT/cache metrics missing from its row: %q", rows["healthy"])
+	if !strings.Contains(rows["healthy"], "200") {
+		t.Fatalf("healthy TTFT missing from its row: %q", rows["healthy"])
 	}
 	if got := strings.Count(rows["failing"], "100.0%"); got != 2 {
 		t.Fatalf("failing API/tool rates = %q, want two 100.0%% values:\n%s", rows["failing"], view)
@@ -1725,7 +1728,7 @@ func TestProviderTableScopesObservedMetricsToProvider(t *testing.T) {
 
 func TestProviderTableUsesMetricSpecificWidths(t *testing.T) {
 	rows := [][]string{
-		{"Provider", "In", "Out", "Cache", "Tok/s", "mTs", "Lat", "mLat"},
+		{"Provider", "In", "Out", "Cache", "Ts", "mTs", "Lat", "mLat"},
 		{"  siliconflow/fp8", "0.15", "0.60", "0.020", "119", "138", "1040", "4623"},
 	}
 	const width = 68
@@ -1755,8 +1758,8 @@ func TestProviderTableUsesMetricSpecificWidths(t *testing.T) {
 
 func TestExpandedProviderTableFitsAllConsolidatedMetrics(t *testing.T) {
 	rows := [][]string{
-		{"Provider", "In", "Out", "Cache", "Tok/s", "mTs", "Lat", "mLat", "TTFT", "Cache%", "API Err", "Tool Err"},
-		{"  provider", "0.15", "0.60", "0.020", "119", "138", "1040", "4623", "250", "100%", "100.0%", "100.0%"},
+		{"Provider", "In", "Out", "Cache", "Ts", "mTs", "Lat", "mLat", "TTFT", "mApi", "mTool"},
+		{"  provider", "0.15", "0.60", "0.020", "119", "138", "1040", "4623", "250", "100.0%", "100.0%"},
 	}
 	const width = 85
 	columnWidths := providerTableColumnWidths(rows, width)
@@ -2089,7 +2092,7 @@ func TestRoutingTableKeepsMeasuredColumnsAlongsideRecentErrors(t *testing.T) {
 	dashboard := newDashboard(config{}, stats, routing)
 	dashboard.syncModel()
 
-	stripped := ansi.Strip(dashboard.renderRouting(stats.snapshot(), 100, 20))
+	stripped := ansi.Strip(dashboard.renderRouting(stats.snapshot(), 140, 20))
 	lines := map[string]string{}
 	for _, line := range strings.Split(stripped, "\n") {
 		if strings.Contains(line, "failing") {

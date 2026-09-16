@@ -24,6 +24,9 @@ func runUpgrade(output io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("resolve current executable: %w", err)
 	}
+	if isGoRunExecutable(executable) {
+		return errors.New("cannot upgrade a temporary go run executable; update the checkout with git pull --ff-only, then run go run ./cmd/orr serve again, or build a persistent binary with go build -o orr.exe ./cmd/orr on Windows (go build -o orr ./cmd/orr on macOS/Linux)")
+	}
 
 	repository, cleanup, err := prepareUpgradeSource(output)
 	if err != nil {
@@ -54,6 +57,18 @@ func runUpgrade(output io.Writer) error {
 
 	fmt.Fprintf(output, "Upgrade complete: %s\n", executable)
 	return nil
+}
+
+func isGoRunExecutable(executable string) bool {
+	for _, part := range strings.Split(filepath.ToSlash(executable), "/") {
+		if part == "go-build" {
+			return true
+		}
+		if suffix, ok := strings.CutPrefix(part, "go-build"); ok && suffix != "" && strings.Trim(suffix, "0123456789") == "" {
+			return true
+		}
+	}
+	return false
 }
 
 func prepareUpgradeSource(output io.Writer) (string, func(), error) {

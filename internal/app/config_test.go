@@ -225,6 +225,53 @@ func TestProcessEnvironmentOverridesDotEnv(t *testing.T) {
 	}
 }
 
+func TestDotEnvCanOverrideProcessEnvironment(t *testing.T) {
+	clearRuntimeEnv(t)
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	content := "ORR_LISTEN=127.0.0.1:1111\nORR_PROVIDERS_FILE=file-providers.yaml\n"
+	if err := os.WriteFile(envPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeProvidersFile(t, filepath.Join(dir, "file-providers.yaml"))
+	t.Setenv("ORR_LISTEN", "127.0.0.1:2222")
+	t.Setenv("ORR_PROVIDERS_FILE", "environment-providers.yaml")
+	t.Setenv("ORR_UPSTREAM", "https://environment.example/v1")
+
+	cfg, err := loadConfigWithOptions(envPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Listen != "127.0.0.1:1111" {
+		t.Fatalf("dotenv listen did not win: %q", cfg.Listen)
+	}
+	if cfg.providersPath != filepath.Join(dir, "file-providers.yaml") {
+		t.Fatalf("dotenv providers path did not win: %q", cfg.providersPath)
+	}
+	if cfg.Upstream != "https://environment.example/v1" {
+		t.Fatalf("missing dotenv value did not fall back to process environment: %q", cfg.Upstream)
+	}
+}
+
+func TestPreferredEmptyDotEnvValueOverridesProcessEnvironment(t *testing.T) {
+	clearRuntimeEnv(t)
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	if err := os.WriteFile(envPath, []byte("OPENROUTER_API_KEY=\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeProvidersFile(t, filepath.Join(dir, "providers.yaml"))
+	t.Setenv("OPENROUTER_API_KEY", "from-environment")
+
+	cfg, err := loadConfigWithOptions(envPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.openRouterKey(); got != "" {
+		t.Fatalf("explicit empty dotenv key did not win: %q", got)
+	}
+}
+
 func TestReadDotEnvQuotesCommentsAndExport(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".env")
 	content := "export SIMPLE=value # comment\nSINGLE='a # b'\nDOUBLE=\"line\\nvalue\"\n"

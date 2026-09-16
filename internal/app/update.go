@@ -13,11 +13,15 @@ import (
 )
 
 func runUpdate(envPath string, maxProviders int, cacheOnly bool, output io.Writer) error {
+	return runUpdateWithOptions(envPath, false, maxProviders, cacheOnly, output)
+}
+
+func runUpdateWithOptions(envPath string, preferEnvFile bool, maxProviders int, cacheOnly bool, output io.Writer) error {
 	if maxProviders < 1 {
 		return errors.New("max must be at least 1")
 	}
 
-	cfg, err := loadConfig(envPath)
+	cfg, err := loadConfigWithOptions(envPath, preferEnvFile)
 	if err != nil {
 		return err
 	}

@@ -14,12 +14,15 @@ import (
 // file is deliberately only read: credentials and configuration are not part
 // of the generated state and must survive a reset.
 func runReset(envPath string, output io.Writer) error {
+	return runResetWithOptions(envPath, false, output)
+}
 
+func runResetWithOptions(envPath string, preferEnvFile bool, output io.Writer) error {
 	fileEnv, err := readDotEnv(envPath)
 	if err != nil {
 		return err
 	}
-	providersPath := configuredProvidersPath(envPath, fileEnv)
+	providersPath := configuredProvidersPathWithOptions(envPath, fileEnv, preferEnvFile)
 	statsPath, err := statsFilePath()
 	if err != nil {
 		return fmt.Errorf("locate statistics file: %w", err)

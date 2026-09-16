@@ -95,6 +95,10 @@ type percentiles struct {
 }
 
 func runProviders(envPath, rawModel string, output io.Writer) error {
+	return runProvidersWithOptions(envPath, false, rawModel, output)
+}
+
+func runProvidersWithOptions(envPath string, preferEnvFile bool, rawModel string, output io.Writer) error {
 	model := strings.TrimSpace(rawModel)
 	parts := strings.SplitN(model, "/", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
@@ -105,8 +109,8 @@ func runProviders(envPath, rawModel string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	apiKey := envValue(fileEnv, "OPENROUTER_API_KEY")
-	apiBase := envValue(fileEnv, "ORR_UPSTREAM")
+	apiKey := envValue(fileEnv, "OPENROUTER_API_KEY", preferEnvFile)
+	apiBase := envValue(fileEnv, "ORR_UPSTREAM", preferEnvFile)
 	if apiBase == "" {
 		apiBase = openRouterAPI
 	}

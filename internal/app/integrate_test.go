@@ -79,7 +79,7 @@ func TestOpenCodeConfigPathDefaultsToJSONC(t *testing.T) {
 
 func TestPatchKimiConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
-	original := "[providers.router]\r\ntype = \"openai_legacy\"\r\nbase_url = \"https://openrouter.ai/api/v1\" # keep\r\napi_key = \"secret\"\r\n\r\n[models.test]\r\nprovider = \"router\"\r\n"
+	original := "[providers.router]\r\ntype = \"openai\"\r\nbase_url = \"https://openrouter.ai/api/v1\" # keep\r\napi_key = \"secret\"\r\n\r\n[models.test]\r\nprovider = \"router\"\r\n"
 	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -128,5 +128,136 @@ func TestPatchFreshClientConfigs(t *testing.T) {
 	kimi, _ := os.ReadFile(kimiPath)
 	if !strings.Contains(string(kimi), `api_key = "fresh-key"`) || !strings.Contains(string(kimi), `base_url = "`+proxyBaseURL+`"`) {
 		t.Fatalf("Kimi config: %s", kimi)
+	}
+	for _, want := range []string{
+		`type = "openai"`,
+		`default_model = "moonshotai/kimi-k3"`,
+		`[models."moonshotai/kimi-k3"]`,
+		`provider = "openrouter"`,
+		`model = "moonshotai/kimi-k3"`,
+		`max_context_size = 1048576`,
+		`"tool_use"`,
+	} {
+		if !strings.Contains(string(kimi), want) {
+			t.Errorf("fresh Kimi config missing %s", want)
+		}
+	}
+	if changed, err := patchKimiConfig(kimiPath, "fresh-key", true); err != nil || changed {
+		t.Fatalf("repeat integration changed=%v err=%v", changed, err)
+	}
+	if fileExists(kimiPath + ".orr-backup") {
+		t.Fatal("idempotent integration created a backup")
+	}
+}
+
+func TestKimiConfigPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("KIMI_CODE_HOME", "")
+	t.Setenv("KIMI_SHARE_DIR", filepath.Join(home, "legacy"))
+	if got, want := kimiConfigPath(home), filepath.Join(home, ".kimi-code", "config.toml"); got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+	custom := filepath.Join(home, "custom")
+	t.Setenv("KIMI_CODE_HOME", custom)
+	if got, want := kimiConfigPath(home), filepath.Join(custom, "config.toml"); got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+}
+
+func TestPatchKimiConfigRejectsUnsupportedOpenRouterProtocols(t *testing.T) {
+	for _, providerType := range []string{"openai_legacy", "google-genai", "vertexai"} {
+		t.Run(providerType, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			original := "[providers.openrouter]\ntype = \"" + providerType + "\"\napi_key = \"secret\"\n"
+			if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			changed, err := patchKimiConfig(path, "new-key", true)
+			if changed || err == nil || !strings.Contains(err.Error(), "unsupported Kimi provider type") {
+				t.Fatalf("changed=%v err=%v", changed, err)
+			}
+			if strings.Contains(err.Error(), "secret") {
+				t.Fatal("error exposed credentials")
+			}
+			got, err := os.ReadFile(path)
+			if err != nil || string(got) != original || fileExists(path+".orr-backup") {
+				t.Fatal("unsupported config was modified")
+			}
+		})
+	}
+}
+
+func TestPatchKimiConfigPreservesProviderProtocolsAndUsesTheirBasePaths(t *testing.T) {
+	for _, providerType := range []string{"openai", "openai_responses", "kimi", "anthropic"} {
+		t.Run(providerType, func(t *testing.T) {
+			for _, existingURL := range []string{"", "base_url = \"" + proxyBaseURL + "\" # keep\n"} {
+				path := filepath.Join(t.TempDir(), "config.toml")
+				model := "\n[models.chosen]\nprovider = \"openrouter\"\nmodel = \"some/model\"\n"
+				original := "default_model = \"chosen\"\n\n[providers.openrouter]\ntype = \"" + providerType + "\"\n" + existingURL + model
+				if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if changed, err := patchKimiConfig(path, "key", false); !changed || err != nil {
+					t.Fatalf("integration changed=%v err=%v", changed, err)
+				}
+				baseURL := proxyBaseURL
+				if providerType == "anthropic" {
+					baseURL = strings.TrimSuffix(baseURL, "/v1")
+				}
+				got, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, want := range []string{"base_url = \"" + baseURL + "\"", "type = \"" + providerType + "\"", "default_model = \"chosen\"", model} {
+					if !strings.Contains(string(got), want) {
+						t.Fatalf("protocol, base path, or selection changed: missing %q", want)
+					}
+				}
+				if existingURL != "" && !strings.Contains(string(got), "# keep") {
+					t.Fatal("base URL comment was removed")
+				}
+				if changed, err := patchKimiConfig(path, "key", false); changed || err != nil {
+					t.Fatalf("repeat integration changed=%v err=%v", changed, err)
+				}
+			}
+		})
+	}
+}
+
+func TestPatchKimiConfigPreservesSelection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	original := "default_model = \"chosen\"\n\n[providers.openrouter]\ntype = \"openai_responses\"\n\n[models.chosen]\nprovider = \"openrouter\"\nmodel = \"some/model\"\nmax_context_size = 32000\n"
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := patchKimiConfig(path, "new-key", false); err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	got, _ := os.ReadFile(path)
+	for _, want := range []string{`default_model = "chosen"`, `type = "openai_responses"`, strings.Split(original, "[models.chosen]")[1]} {
+		if !strings.Contains(string(got), want) {
+			t.Fatalf("existing selection changed: missing %q", want)
+		}
+	}
+	backup, _ := os.ReadFile(path + ".orr-backup")
+	if string(backup) != original {
+		t.Fatal("backup differs from original")
+	}
+}
+
+func TestPatchKimiConfigMissingAndEmpty(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if changed, err := patchKimiConfig(path, "key", false); changed || err != nil || fileExists(path) {
+		t.Fatalf("absent client: changed=%v err=%v", changed, err)
+	}
+	if err := os.WriteFile(path, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := patchKimiConfig(path, "key", false); !changed || err != nil {
+		t.Fatalf("empty config: changed=%v err=%v", changed, err)
+	}
+	got, _ := os.ReadFile(path)
+	if !strings.Contains(string(got), `default_model = "moonshotai/kimi-k3"`) {
+		t.Fatal("empty config did not receive a default model")
 	}
 }
