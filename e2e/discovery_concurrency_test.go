@@ -200,10 +200,9 @@ func TestConcurrentUnknownModelsAreCreatedAtomicallyAndStayIsolated(t *testing.T
 		}
 	}
 
-	data, err := os.ReadFile(orr.providersPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Read a successful snapshot while background refreshes may atomically replace
+	// the file. Windows can temporarily deny reads during that replacement.
+	data := waitForPersistedOrder(t, orr.providersPath, "one-provider", "two-provider")
 	var decoded struct {
 		Version int            `yaml:"version"`
 		Models  map[string]any `yaml:"models"`
@@ -214,8 +213,6 @@ func TestConcurrentUnknownModelsAreCreatedAtomicallyAndStayIsolated(t *testing.T
 	if decoded.Version != 1 || len(decoded.Models) != 2 || decoded.Models["author/one"] == nil || decoded.Models["author/two"] == nil {
 		t.Fatalf("concurrent model creation produced unexpected file:\n%s", data)
 	}
-	waitForPersistedOrder(t, orr.providersPath, "one-provider")
-	waitForPersistedOrder(t, orr.providersPath, "two-provider")
 	for _, model := range []string{"author/one", "author/two"} {
 		if err := sendCompletion(orr.baseURL, fmt.Sprintf(`{"model":%q,"messages":[]}`, model)); err != nil {
 			t.Fatal(err)

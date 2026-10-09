@@ -17,6 +17,7 @@ import (
 )
 
 const proxyBaseURL = "http://127.0.0.1:8787/v1"
+const proxyRegistryURL = "http://127.0.0.1:8787/registry.json"
 
 var (
 	tomlSection = regexp.MustCompile(`^\s*\[([^]]+)]\s*(?:#.*)?$`)
@@ -225,14 +226,18 @@ func patchKimiConfig(path, apiKey string, create bool) (bool, error) {
 		return false, fmt.Errorf("read Kimi config %s: %w", path, err)
 	}
 	if len(bytes.TrimSpace(data)) == 0 {
-		content := "default_model = \"moonshotai/kimi-k3\"\n\n" +
+		if apiKey == "" {
+			return false, errors.New("OPENROUTER_API_KEY is required to create the Kimi registry integration")
+		}
+		content := "default_model = \"openrouter/moonshotai/kimi-k3\"\n\n" +
 			"[providers.openrouter]\n" +
 			"type = \"openai\"\n" +
 			"base_url = " + strconv.Quote(proxyBaseURL) + "\n"
 		if apiKey != "" {
 			content += "api_key = " + strconv.Quote(apiKey) + "\n"
 		}
-		content += "\n[models.\"moonshotai/kimi-k3\"]\n" +
+		content += "\n[providers.openrouter.source]\nkind = \"apiJson\"\nurl = " + strconv.Quote(proxyRegistryURL) + "\napiKey = " + strconv.Quote(apiKey) + "\n"
+		content += "\n[models.\"openrouter/moonshotai/kimi-k3\"]\n" +
 			"provider = \"openrouter\"\n" +
 			"model = \"moonshotai/kimi-k3\"\n" +
 			"max_context_size = 1048576\n" +
@@ -245,6 +250,7 @@ func patchKimiConfig(path, apiKey string, create bool) (bool, error) {
 	}
 	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
 	changed := false
+	registryKey := ""
 	for start := 0; start < len(lines); {
 		match := tomlSection.FindStringSubmatch(lines[start])
 		if match == nil || !strings.HasPrefix(match[1], "providers.") {
@@ -275,6 +281,21 @@ func patchKimiConfig(path, apiKey string, create bool) (bool, error) {
 			}
 		}
 		if target {
+			// The registry declares exactly openrouter/openai. Attaching it to
+			// another alias or protocol would replace the wrong provider on refresh.
+			if name == "openrouter" && (providerType == "" || providerType == "openai") {
+				if apiKey != "" {
+					registryKey = strconv.Quote(apiKey)
+				} else if apiKeyLine >= 0 {
+					parts := kimiStringAssignment("api_key").FindStringSubmatch(lines[apiKeyLine])
+					if parts != nil && parts[2] != `""` && parts[2] != `''` {
+						registryKey = parts[2]
+					}
+				}
+				if registryKey == "" {
+					return false, errors.New("OPENROUTER_API_KEY or an existing Kimi api_key is required for the registry integration")
+				}
+			}
 			baseURL := proxyBaseURL
 			switch providerType {
 			case "", "openai", "openai_responses", "kimi":
@@ -291,10 +312,12 @@ func patchKimiConfig(path, apiKey string, create bool) (bool, error) {
 					changed = true
 				}
 			}
-			if apiKey != "" && apiKeyLine >= 0 && !strings.Contains(lines[apiKeyLine], strconv.Quote(apiKey)) {
-				parts := tomlAPIKey.FindStringSubmatch(lines[apiKeyLine])
-				lines[apiKeyLine] = parts[1] + strconv.Quote(apiKey) + parts[4]
-				changed = true
+			if apiKey != "" && apiKeyLine >= 0 {
+				parts := kimiStringAssignment("api_key").FindStringSubmatch(lines[apiKeyLine])
+				if parts != nil && parts[2] != strconv.Quote(apiKey) {
+					lines[apiKeyLine] = parts[1] + strconv.Quote(apiKey) + parts[3]
+					changed = true
+				}
 			}
 			missing := make([]string, 0, 2)
 			if providerType == "" {
@@ -314,10 +337,68 @@ func patchKimiConfig(path, apiKey string, create bool) (bool, error) {
 		}
 		start = end
 	}
+	if registryKey != "" {
+		var sourceChanged bool
+		lines, sourceChanged = patchKimiRegistrySource(lines, registryKey)
+		changed = changed || sourceChanged
+	}
 	if !changed {
 		return false, nil
 	}
 	return true, writeIntegratedFile(path, data, []byte(strings.Join(lines, newline)))
+}
+
+// Match a single-line TOML string without treating an escaped quote as its end.
+func kimiStringAssignment(key string) *regexp.Regexp {
+	return regexp.MustCompile(`^(\s*` + regexp.QuoteMeta(key) + `\s*=\s*)("(?:[^"\\]|\\.)*"|'[^']*')(\s*(?:#.*)?)$`)
+}
+
+func patchKimiRegistrySource(lines []string, keyLiteral string) ([]string, bool) {
+	start, end := -1, len(lines)
+	for i, line := range lines {
+		match := tomlSection.FindStringSubmatch(line)
+		if match == nil {
+			continue
+		}
+		if start >= 0 {
+			end = i
+			break
+		}
+		section := strings.ReplaceAll(strings.ReplaceAll(match[1], `"`, ""), "'", "")
+		if section == "providers.openrouter.source" {
+			start = i
+		}
+	}
+	changed := false
+	if start < 0 {
+		lines = append(lines, "", "[providers.openrouter.source]")
+		start, end = len(lines)-1, len(lines)
+		changed = true
+	}
+	for _, field := range []struct{ name, value string }{
+		{"kind", `"apiJson"`}, {"url", strconv.Quote(proxyRegistryURL)}, {"apiKey", keyLiteral},
+	} {
+		pattern := kimiStringAssignment(field.name)
+		found := false
+		for i := start + 1; i < end; i++ {
+			parts := pattern.FindStringSubmatch(lines[i])
+			if parts == nil {
+				continue
+			}
+			found = true
+			if parts[2] != field.value {
+				lines[i] = parts[1] + field.value + parts[3]
+				changed = true
+			}
+			break
+		}
+		if !found {
+			lines = append(lines[:end], append([]string{field.name + " = " + field.value}, lines[end:]...)...)
+			end++
+			changed = true
+		}
+	}
+	return lines, changed
 }
 
 func writeIntegratedFile(path string, original, updated []byte) error {

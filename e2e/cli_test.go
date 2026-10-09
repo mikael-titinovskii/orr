@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/mikael-titinovskii/orr/internal/app"
 )
 
 func TestVersionCommand(t *testing.T) {
@@ -16,8 +18,8 @@ func TestVersionCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("orr version: %v\n%s", err, output)
 	}
-	if got := strings.TrimSpace(string(output)); got != "orr 0.2.0" {
-		t.Fatalf("version output = %q, want %q", got, "orr 0.2.0")
+	if got := strings.TrimSpace(string(output)); got != "orr "+app.Version {
+		t.Fatalf("version output = %q, want %q", got, "orr "+app.Version)
 	}
 }
 

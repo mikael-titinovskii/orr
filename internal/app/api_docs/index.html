@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>orr · Management API</title>
+<style>
+:root{color-scheme:light;--ink:#182b30;--muted:#57676b;--line:#dce4e3;--green:#126455}
+*{box-sizing:border-box}body{margin:0;background:#f7f9f8;color:var(--ink);font:16px/1.6 system-ui,sans-serif}main{max-width:1040px;margin:auto;padding:48px 24px 80px}nav{display:flex;justify-content:space-between;align-items:center;gap:20px}nav strong{font-size:26px;letter-spacing:-1px}a{color:var(--green)}.download{border:1px solid var(--line);border-radius:8px;padding:8px 14px;text-decoration:none;background:white}header{padding:50px 0 24px}h1{font-size:clamp(32px,6vw,52px);line-height:1.12;letter-spacing:-2px;margin:12px 0 20px}h2{margin-top:36px}p{max-width:760px}.eyebrow{color:var(--green);font-weight:650;font-size:13px;letter-spacing:1px}header p,.hint{color:var(--muted)}code,pre{font-family:ui-monospace,Consolas,monospace;font-size:13px}pre{background:#edf2f0;padding:16px;border-radius:8px;white-space:pre-wrap;overflow-wrap:anywhere}label{display:block;font-weight:600;margin:26px 0 8px}input{width:100%;padding:13px 15px;border:1px solid #bacbc7;border-radius:8px;background:white;font:inherit}details{background:white;border:1px solid var(--line);border-radius:10px;margin:12px 0;overflow:hidden}summary{display:flex;align-items:center;gap:16px;padding:18px;cursor:pointer;flex-wrap:wrap}summary:hover{background:#f0f6f3}summary:focus-visible,a:focus-visible{outline:3px solid #3b907b;outline-offset:3px}.method{font:700 12px ui-monospace,monospace;min-width:58px;color:var(--green)}.description{font-size:14px;color:var(--muted);margin-left:auto}.content{padding:0 20px 20px;border-top:1px solid var(--line)}.content h3{font-size:15px;margin:24px 0 8px}.response{font-size:14px}.badge{font-size:12px;background:#e2eee8;border-radius:4px;padding:3px 7px}footer{margin-top:40px;color:var(--muted);font-size:14px}@media(max-width:600px){main{padding:24px 16px}header{padding-top:32px}.description{width:100%;margin-left:0}summary{gap:10px}nav{align-items:flex-start}.download{font-size:13px}}
+</style>
+</head>
+<body><main>
+<nav aria-label="Documentation"><strong>orr<span style="color:#84968e"> / docs</span></strong><a class="download" href="/api/openapi.json" download="orr-openapi.json">Download OpenAPI JSON ↗</a></nav>
+<header><span class="eyebrow">REST API · V1</span><h1>Your proxy.<br>Your controls.</h1><p>Inspect live statistics, manage provider pins, and run refreshes or benchmarks. Available on the same listener as your proxy, with or without the terminal dashboard.</p></header>
+<section aria-labelledby="access"><h2 id="access">Local access</h2><p>Management requests require no authentication header. ORR reads <code>OPENROUTER_API_KEY</code> from its environment or dotenv configuration for upstream operations; clients do not resend it.</p><p>The API is accessible to anyone who can reach <code>ORR_LISTEN</code>. Keep the default loopback address for local use.</p><p class="hint">This page makes no billable requests. Import the schema into an OpenAPI-compatible client to use the API.</p></section>
+<section aria-labelledby="endpoints"><h2 id="endpoints">Endpoints <span class="badge">OpenAPI 3.1</span></h2><label for="filter">Find an endpoint</label><input id="filter" type="search" placeholder="Search stats, pins, jobs…" aria-controls="operations"><p id="status" class="hint" role="status">Loading API schema…</p><div id="operations"></div></section>
+<section><h2>Background jobs</h2><p>Refresh and benchmark submissions return <code>202</code> with a polling URL in <code>Location</code>. One management job runs at a time. Matching submissions share the running job; conflicting work returns <code>409</code>. The last 64 jobs remain available until restart.</p><p>Benchmarks make billable upstream requests and run for up to 10 seconds. Refresh requests have a 30-second timeout. Manual pins are preserved, and accepted jobs finish before shutdown saves final statistics.</p></section>
+<footer>OpenRouter traffic uses <code>/v1/*</code>. Management uses <code>/api/v1/*</code>. Missing measurements are returned as <code>null</code>.</footer>
+</main><script>
+'use strict';
+const operations=document.getElementById('operations'),status=document.getElementById('status'),filter=document.getElementById('filter');
+function el(tag,text){const node=document.createElement(tag);if(text!==undefined)node.textContent=text;return node}
+function block(parent,title,text){parent.append(el('h3',title),el('pre',text))}
+fetch('/api/openapi.json').then(response=>{if(!response.ok)throw new Error('schema unavailable');return response.json()}).then(spec=>{
+ const resolve=schema=>schema&&schema.$ref?spec.components.schemas[schema.$ref.split('/').pop()]:schema;
+ for(const [path,methods] of Object.entries(spec.paths))for(const [method,op] of Object.entries(methods)){
+  const item=el('details'),summary=el('summary'),verb=el('span',method.toUpperCase()),description=el('span',op.summary),content=el('div');verb.className='method';description.className='description';content.className='content';summary.append(verb,el('code',path),description);item.append(summary,content);
+  if(op.description)content.append(el('p',op.description));
+  if(op.parameters)block(content,'Parameters',op.parameters.map(p=>`${p.name} (${p.in}, required) — ${p.description||'Job identifier.'}`).join('\n'));
+  const body=op.requestBody?.content?.['application/json'];
+  if(body)block(content,'JSON request body',JSON.stringify(resolve(body.schema),null,2));
+  const target=path.replace('{id}','1')+(op.parameters?.some(p=>p.in==='query')?'?model=author%2Fmodel':'');
+  let curl=`curl -X ${method.toUpperCase()} '${location.origin}${target}'`;
+  if(body)curl+=` \\\n  -H 'Content-Type: application/json' \\\n  -d '${JSON.stringify(body.example)}'`;
+  block(content,'Example · POSIX shell',curl);
+  content.append(el('h3','Responses'));
+  for(const [code,response] of Object.entries(op.responses)){const row=el('p',`${code} — ${response.description}`);row.className='response';content.append(row);if(code==='200'||code==='202')block(content,'Response schema',JSON.stringify(resolve(response.content['application/json'].schema),null,2))}
+  item.dataset.search=`${method} ${path} ${op.summary}`.toLowerCase();operations.append(item);
+ }
+ const search=()=>{let count=0;for(const node of operations.children){node.hidden=!node.dataset.search.includes(filter.value.toLowerCase());if(!node.hidden)count++}status.textContent=`${count} operations`};filter.addEventListener('input',search);search();
+}).catch(()=>{status.textContent='Unable to load the schema. Reload this page or use the OpenAPI JSON link.'});
+</script></body></html>

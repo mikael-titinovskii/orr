@@ -427,6 +427,7 @@ func providerAPIErrorRates(records []requestRecord, model string, now time.Time)
 func (s *stats) beginRequest() {
 	s.mu.Lock()
 	s.inFlight++
+	s.mutations++
 	s.mu.Unlock()
 }
 
@@ -435,6 +436,8 @@ func (s *stats) endRequest() {
 	s.inFlight--
 	if s.inFlight < 0 {
 		s.inFlight = 0
+	} else {
+		s.mutations++
 	}
 	s.mu.Unlock()
 }

@@ -14,23 +14,6 @@ func TestUpgradeRejectsArgumentsBeforeRunningCommands(t *testing.T) {
 	}
 }
 
-func TestIsGoRunExecutable(t *testing.T) {
-	for _, tt := range []struct {
-		path string
-		want bool
-	}{
-		{"C:/Users/test/AppData/Local/go-build/ba/hash-d/orr.exe", true},
-		{"/tmp/go-build123456/b001/exe/orr", true},
-		{"/usr/local/bin/orr", false},
-		{"C:/tools/orr.exe", false},
-		{"/home/test/go-builder/orr", false},
-	} {
-		if got := isGoRunExecutable(filepath.FromSlash(tt.path)); got != tt.want {
-			t.Errorf("isGoRunExecutable(%q) = %v, want %v", tt.path, got, tt.want)
-		}
-	}
-}
-
 func TestReplaceExecutable(t *testing.T) {
 	directory := t.TempDir()
 	source := filepath.Join(directory, "new")

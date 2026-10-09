@@ -37,9 +37,20 @@ func serve(cfg config) error {
 	if err != nil {
 		return err
 	}
+	api := &managementAPI{p: p}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveAPIDocs(w, r) {
+			return
+		}
+		if r.URL.Path == "/api" || strings.HasPrefix(r.URL.Path, "/api/") {
+			api.ServeHTTP(w, r)
+			return
+		}
+		p.ServeHTTP(w, r)
+	})
 	server := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           p,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
@@ -50,10 +61,10 @@ func serve(cfg config) error {
 	go pollCredits(ctx, &http.Client{Timeout: 20 * time.Second}, cfg.Upstream, cfg.openRouterKey(), p.stats)
 	go prefetchEndpoints(ctx, p)
 
+	p.trackEndpoints = true
 	tuiEnabled := term.IsTerminal(int(os.Stdout.Fd())) && (cfg.TUI == nil || *cfg.TUI)
 	if tuiEnabled {
 		p.cfg.LogRequests = false
-		p.trackEndpoints = true
 	}
 	serverErrors := make(chan error, 1)
 	go func() {
@@ -87,12 +98,14 @@ func serve(cfg config) error {
 		}
 	}
 
+	api.stop()
 	cancel()
 	p.stopDailyBenchmarks()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	shutdownErr := server.Shutdown(shutdownCtx)
 	<-statsDone
+	api.wg.Wait()
 	p.routing.waitForRefreshes()
 	p.waitForDailyBenchmarks()
 	saveErr := p.stats.save(path)

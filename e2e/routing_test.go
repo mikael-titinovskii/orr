@@ -271,7 +271,7 @@ models:
 	}
 }
 
-func waitForPersistedOrder(t *testing.T, path string, providers ...string) {
+func waitForPersistedOrder(t *testing.T, path string, providers ...string) []byte {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	var last []byte
@@ -290,7 +290,7 @@ func waitForPersistedOrder(t *testing.T, path string, providers ...string) {
 				previous = index
 			}
 			if matches && !strings.Contains(string(data), "2000-01-01") {
-				return
+				return data
 			}
 		}
 		if time.Now().After(deadline) {

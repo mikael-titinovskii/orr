@@ -180,6 +180,8 @@ type endpointMeta struct {
 }
 
 type routingState struct {
+	// Serializes manual-pin changes with restoration after an override is removed.
+	pinActionsMu           sync.Mutex
 	mu                     sync.RWMutex
 	persistMu              sync.Mutex
 	refreshWG              sync.WaitGroup
@@ -316,6 +318,8 @@ func (r *routingState) ensureModel(model string) (bool, error) {
 }
 
 func (r *routingState) setManualPin(model, provider string) error {
+	r.pinActionsMu.Lock()
+	defer r.pinActionsMu.Unlock()
 	if !validModelID(model) {
 		return fmt.Errorf("model %q must use author/model format", model)
 	}
@@ -1130,9 +1134,9 @@ func (r *routingState) refreshEndpoints(model string, client *http.Client, upstr
 	r.resolvePendingPins(model)
 }
 
-func (r *routingState) refreshModelOrder(model string, client *http.Client, upstream, apiKey string, maxProviders int, cacheOnly bool) {
+func (r *routingState) refreshModelOrder(model string, client *http.Client, upstream, apiKey string, maxProviders int, cacheOnly bool) error {
 	if !validModelID(model) {
-		return
+		return errors.New("invalid model")
 	}
 	r.mu.RLock()
 	refreshRevision := r.modelRevisions[model]
@@ -1140,12 +1144,12 @@ func (r *routingState) refreshModelOrder(model string, client *http.Client, upst
 	result, err := fetchEndpoints(context.Background(), client, upstream, apiKey, model)
 	if err != nil {
 		log.Printf("refresh provider order for %s: %v", model, err)
-		return
+		return err
 	}
 	endpoints := compatibleEndpoints(result.Data.Endpoints)
 	endpoints = rankUpdateEndpoints(endpoints, cacheOnly)
 	if len(endpoints) == 0 {
-		return
+		return errors.New("no compatible endpoints")
 	}
 	ranked := make([]string, len(endpoints))
 	for i, endpoint := range endpoints {
@@ -1178,7 +1182,7 @@ func (r *routingState) refreshModelOrder(model string, client *http.Client, upst
 	r.mu.Lock()
 	if r.modelRevisions[model] != refreshRevision {
 		r.mu.Unlock()
-		return
+		return errors.New("model changed during refresh")
 	}
 	modelConfig := r.models[model]
 	modelConfig.Order = order
@@ -1201,8 +1205,10 @@ func (r *routingState) refreshModelOrder(model string, client *http.Client, upst
 	if r.providersPath != "" {
 		if err := writeProvidersFileAtomic(r.providersPath, snapshot); err != nil {
 			log.Printf("persist provider order for %s: %v", model, err)
+			return err
 		}
 	}
+	return nil
 }
 
 // providerTestResult is the measured outcome used to rank one provider after

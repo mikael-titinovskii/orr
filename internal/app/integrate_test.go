@@ -131,8 +131,12 @@ func TestPatchFreshClientConfigs(t *testing.T) {
 	}
 	for _, want := range []string{
 		`type = "openai"`,
-		`default_model = "moonshotai/kimi-k3"`,
-		`[models."moonshotai/kimi-k3"]`,
+		`default_model = "openrouter/moonshotai/kimi-k3"`,
+		`[models."openrouter/moonshotai/kimi-k3"]`,
+		`[providers.openrouter.source]`,
+		`kind = "apiJson"`,
+		`url = "` + proxyRegistryURL + `"`,
+		`apiKey = "fresh-key"`,
 		`provider = "openrouter"`,
 		`model = "moonshotai/kimi-k3"`,
 		`max_context_size = 1048576`,
@@ -257,7 +261,78 @@ func TestPatchKimiConfigMissingAndEmpty(t *testing.T) {
 		t.Fatalf("empty config: changed=%v err=%v", changed, err)
 	}
 	got, _ := os.ReadFile(path)
-	if !strings.Contains(string(got), `default_model = "moonshotai/kimi-k3"`) {
+	if !strings.Contains(string(got), `default_model = "openrouter/moonshotai/kimi-k3"`) {
 		t.Fatal("empty config did not receive a default model")
+	}
+}
+
+func TestPatchKimiRegistrySource(t *testing.T) {
+	for _, tc := range []struct{ name, source, key, wantKey string }{
+		{"add", "", "new-key", `"new-key"`},
+		{"existing-key", "", "", `'existing-key'`},
+		{"refresh", "\n[providers.'openrouter'.source]\nkind = 'apiJson' # kind\nurl = 'https://old.example/registry' # url\napiKey = 'old-key' # key\n", "new-key", `"new-key"`},
+		{"partial", "\n[providers.openrouter.source]\nkind = \"apiJson\"\n", "new-key", `"new-key"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			model := "\n[models.chosen]\nprovider = 'openrouter'\nmodel = 'some/model'\n"
+			original := "default_model = 'chosen'\n[providers.'openrouter']\ntype = 'openai'\nbase_url = '" + proxyBaseURL + "'\napi_key = 'existing-key'\n" + tc.source + model
+			original = strings.ReplaceAll(original, "\n", "\r\n")
+			if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if changed, err := patchKimiConfig(path, tc.key, false); err != nil || !changed {
+				t.Fatalf("changed=%v err=%v", changed, err)
+			}
+			data, _ := os.ReadFile(path)
+			got := string(data)
+			for _, want := range []string{`kind = "apiJson"`, `url = "` + proxyRegistryURL + `"`, "apiKey = " + tc.wantKey, "default_model = 'chosen'", strings.ReplaceAll(model, "\n", "\r\n")} {
+				if !strings.Contains(got, want) {
+					t.Errorf("missing %q", want)
+				}
+			}
+			if strings.Contains(strings.ReplaceAll(got, "\r\n", ""), "\n") {
+				t.Error("CRLF not preserved")
+			}
+			if tc.name == "refresh" {
+				for _, comment := range []string{"# kind", "# url", "# key"} {
+					if !strings.Contains(got, comment) {
+						t.Errorf("lost %s", comment)
+					}
+				}
+			}
+			backup, _ := os.ReadFile(path + ".orr-backup")
+			if string(backup) != original {
+				t.Fatal("backup differs")
+			}
+			if changed, err := patchKimiConfig(path, tc.key, false); err != nil || changed {
+				t.Fatalf("repeat changed=%v err=%v", changed, err)
+			}
+			backup, _ = os.ReadFile(path + ".orr-backup")
+			if string(backup) != original {
+				t.Fatal("repeat overwrote backup")
+			}
+		})
+	}
+}
+
+func TestPatchKimiRegistryDoesNotAttachToOtherIdentities(t *testing.T) {
+	for _, tc := range []struct{ name, protocol string }{
+		{"router", "openai"}, {"openrouter", "anthropic"}, {"openrouter", "openai_responses"}, {"openrouter", "kimi"},
+	} {
+		t.Run(tc.name+"/"+tc.protocol, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			original := "[providers." + tc.name + "]\ntype = \"" + tc.protocol + "\"\nbase_url = \"https://openrouter.ai/api/v1\"\n"
+			if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := patchKimiConfig(path, "key", false); err != nil {
+				t.Fatal(err)
+			}
+			got, _ := os.ReadFile(path)
+			if strings.Contains(string(got), ".source]") {
+				t.Fatal("registry would replace provider identity or protocol")
+			}
+		})
 	}
 }
