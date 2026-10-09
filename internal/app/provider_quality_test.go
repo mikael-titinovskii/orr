@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,6 +16,159 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
 )
+
+func TestQualityAdjustsAutomaticSelection(t *testing.T) {
+	const model = "author/model"
+	for _, metric := range []struct {
+		name    string
+		quality providerQuality
+	}{
+		{"gpqa", providerQuality{GPQA: floatPtr(1)}},
+		{"tau", providerQuality{Tau: floatPtr(1)}},
+		{"tool", providerQuality{ToolError: floatPtr(0)}},
+		{"json", providerQuality{StructuredError: floatPtr(0)}},
+	} {
+		t.Run(metric.name, func(t *testing.T) {
+			now := time.Now()
+			r := newRoutingState(map[string]providerConfig{model: {Order: []string{"cheap", "quality"}}}, time.Hour)
+			r.now = func() time.Time { return now }
+			r.endpointCache[model] = []endpointMeta{
+				{Tag: "cheap", Pricing: testPricing(1, 4, .1)},
+				{Tag: "quality", Pricing: testPricing(1.01, 4.04, .101)},
+			}
+			results := []providerTestResult{benchmarkResult("cheap", 200, 400*time.Millisecond), benchmarkResult("quality", 200, 400*time.Millisecond)}
+			r.qualityCache[model] = providerQualityCache{values: map[string]providerQuality{"quality": metric.quality}, fetchedAt: now}
+			best, _, err := r.applyProviderTestResultsAtRevision(model, results, benchmarkReferenceProfile, r.modelRevision(model), nil)
+			if err != nil || best != "quality" {
+				t.Fatalf("best=%q err=%v, want quality to justify the small premium", best, err)
+			}
+			if err := r.setManualPin(model, "cheap"); err != nil {
+				t.Fatal(err)
+			}
+			best, updated, err := r.applyProviderTestResultsAtRevision(model, results, benchmarkReferenceProfile, r.modelRevision(model), nil)
+			if pin, manual := r.pinInfo(model); err != nil || best != "quality" || updated || pin != "cheap" || !manual {
+				t.Fatalf("quality changed manual pin: best=%q updated=%v pin=%q manual=%v err=%v", best, updated, pin, manual, err)
+			}
+			if err := r.setManualPin(model, ""); err != nil {
+				t.Fatal(err)
+			}
+			// A recent API error remains disqualifying even with better quality.
+			best, _, err = r.applyProviderTestResultsAtRevision(model, results, benchmarkReferenceProfile, r.modelRevision(model), map[string]float64{"quality": .01})
+			if err != nil || best != "cheap" {
+				t.Fatalf("best=%q err=%v, want healthy cheap provider", best, err)
+			}
+			// Expired metadata cannot keep steering a new selection.
+			r.unpin(model)
+			now = now.Add(providerQualityTTL)
+			best, _, err = r.applyProviderTestResultsAtRevision(model, results, benchmarkReferenceProfile, r.modelRevision(model), nil)
+			if err != nil || best != "cheap" {
+				t.Fatalf("best=%q err=%v, want cheap after quality expires", best, err)
+			}
+		})
+	}
+}
+
+func TestQualityCannotOverrideLatencyTier(t *testing.T) {
+	results := []providerTestResult{
+		benchmarkResult("a", 200, 400*time.Millisecond),
+		benchmarkResult("b", 200, 400*time.Millisecond),
+		benchmarkResult("slow", 20, 8*time.Second),
+	}
+	meta := map[string]endpointMeta{}
+	for _, result := range results {
+		meta[result.provider] = endpointMeta{Pricing: testPricing(1, 4, .1)}
+	}
+	meta["slow"] = endpointMeta{Pricing: testPricing(.01, .04, .001)}
+	qualities := map[string]providerQuality{"slow": {GPQA: floatPtr(1), Tau: floatPtr(1), ToolError: floatPtr(0), StructuredError: floatPtr(0)}}
+	deals := rankProviderDeals(results, benchmarkReferenceProfile, meta, map[string]int{"a": 0, "b": 1, "slow": 2}, "", qualities)
+	if deals[0].result.provider == "slow" || deals[2].viable {
+		t.Fatal("quality bypassed latency ceiling")
+	}
+}
+
+func TestHeadlessQualityFetchHonorsBenchmarkDeadline(t *testing.T) {
+	p, err := newProxy(testConfig("https://openrouter.ai/api"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})
+	p.dailyTestProvider = func(context.Context, string, string, int) (providerTestSample, error) {
+		return providerTestSample{tps: 200, ttft: time.Millisecond}, nil
+	}
+	started := time.Now()
+	_, complete := p.benchmarkProviders("author/model", []string{"a"}, p.now().Add(20*time.Millisecond), true, 1)
+	if !complete || time.Since(started) > time.Second {
+		t.Fatal("optional quality fetch delayed the run past its bounded deadline")
+	}
+	if _, cached := p.routing.qualityCache["author/model"]; cached {
+		t.Fatal("cancelled quality fetch was cached as fresh")
+	}
+}
+
+func TestQualityAdjustmentBoundsAndMissingData(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		quality providerQuality
+		want    float64
+	}{
+		{"missing", providerQuality{}, 1},
+		{"invalid", providerQuality{GPQA: floatPtr(math.NaN()), Tau: floatPtr(2), ToolError: floatPtr(-1), StructuredError: floatPtr(math.Inf(1))}, 1},
+		{"best", providerQuality{GPQA: floatPtr(1), Tau: floatPtr(1), ToolError: floatPtr(0), StructuredError: floatPtr(0)}, .75},
+		{"worst", providerQuality{GPQA: floatPtr(0), Tau: floatPtr(0), ToolError: floatPtr(100), StructuredError: floatPtr(100)}, 1.25},
+		{"percentage units", providerQuality{ToolError: floatPtr(1)}, .93875},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := providerQualityMultiplier(tt.quality); math.Abs(got-tt.want) > 1e-10 {
+				t.Fatalf("multiplier=%v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHeadlessBenchmarksFetchAndCacheQuality(t *testing.T) {
+	const model = "author/model"
+	p, err := newProxy(testConfig("https://openrouter.ai/api"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.upstream, _ = url.Parse("https://openrouter.ai/api")
+	var calls atomic.Int32
+	p.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		if req.Header.Get("Authorization") != "Bearer "+p.cfg.openRouterKey() {
+			t.Error("missing configured key")
+		}
+		switch req.URL.Path {
+		case "/api/v1/models":
+			return response(200, `{"data":[{"id":"author/model","canonical_slug":"author/permanent"}]}`), nil
+		case "/api/frontend/v1/stats/endpoint":
+			return response(200, `{"data":[{"id":"a","provider_slug":"a","model_variant_slug":"author/model"}]}`), nil
+		case "/api/frontend/v1/stats/benchmark-scores":
+			return response(200, `{"data":{"scores":[{"endpoint_id":"a","benchmark_type":"gpqa_diamond","score":0.9}]}}`), nil
+		default:
+			return response(200, `{"data":[{"y":{"a":0}}]}`), nil
+		}
+	})
+	p.dailyTestProvider = func(context.Context, string, string, int) (providerTestSample, error) {
+		return providerTestSample{tps: 200, ttft: time.Millisecond}, nil
+	}
+	for range 2 {
+		_, complete := p.benchmarkProviders(model, []string{"a"}, p.now().Add(time.Second), true, 1)
+		if !complete {
+			t.Fatal("benchmark incomplete")
+		}
+	}
+	if calls.Load() != 5 {
+		t.Fatalf("quality requests=%d, want one cached fetch of 5", calls.Load())
+	}
+	quality := p.routing.qualityCache[model].values["a"]
+	if quality.GPQA == nil || *quality.GPQA != .9 || quality.ToolError == nil || *quality.ToolError != 0 {
+		t.Fatalf("missing headless quality: %+v", quality)
+	}
+}
 
 func TestProviderQualityMatchesExactEndpointsAndPreservesMissingValues(t *testing.T) {
 	const model = "author/model"
@@ -135,8 +289,8 @@ func TestDashboardQualityCacheScopesLateResultsAndClearsFailedRefresh(t *testing
 	routing.now = func() time.Time { return now }
 	dashboard := newDashboard(config{}, newStats(), routing)
 	dashboard.model = model
-	dashboard.fetchQuality = func(string) (map[string]providerQuality, error) {
-		return map[string]providerQuality{"provider": {GPQA: floatPtr(.9)}}, nil
+	dashboard.fetchQuality = func(string) (providerQualityCache, error) {
+		return providerQualityCache{values: map[string]providerQuality{"provider": {GPQA: floatPtr(.9)}}, fetchedAt: now}, nil
 	}
 	cmd := dashboard.refreshQualityCmd()
 	if cmd == nil || dashboard.refreshQualityCmd() != nil {
@@ -160,6 +314,13 @@ func TestDashboardQualityCacheScopesLateResultsAndClearsFailedRefresh(t *testing
 	dashboard = updated.(dashboardModel)
 	if len(dashboard.quality[model]) != 0 || dashboard.refreshQualityCmd() != nil {
 		t.Fatal("failed fetch retained stale data or retried immediately")
+	}
+	if !dashboard.qualityFetchedAt[model].IsZero() {
+		t.Fatal("failed fetch was marked fresh")
+	}
+	now = now.Add(providerQualityRetryDelay)
+	if dashboard.refreshQualityCmd() == nil {
+		t.Fatal("failed dashboard fetch did not retry after the short backoff")
 	}
 }
 

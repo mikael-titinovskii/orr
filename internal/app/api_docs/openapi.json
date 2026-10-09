@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "orr Management API",
-    "version": "1.0.1",
+    "version": "1.0.3",
     "description": "Manage the running orr proxy with or without its TUI. Local management requests require no authentication header. ORR reads OPENROUTER_API_KEY from environment/dotenv configuration for upstream operations. Anyone who can reach ORR_LISTEN can use the API; keep the default loopback address for local use. Responses are not cached. No prompts, keys, or request/response bodies are exposed. OpenRouter passthrough remains under /v1/*."
   },
   "servers": [

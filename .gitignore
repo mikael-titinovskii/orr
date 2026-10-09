@@ -1,6 +1,7 @@
 /orr
 /orr.exe
 /orr.exe~
+/dist/
 /.env
 /providers.yaml
 /.idea/

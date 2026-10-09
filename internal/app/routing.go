@@ -192,6 +192,9 @@ type routingState struct {
 	providersPath          string
 	endpointCache          map[string][]endpointMeta
 	endpointFetchedAt      map[string]time.Time
+	qualityCache           map[string]providerQualityCache
+	qualityLoading         map[string]chan struct{}
+	qualityGenerations     map[string]uint64
 	nameMap                map[string]map[string]string // ProviderName -> Tag per model
 	modelRevisions         map[string]uint64
 	modelOrderUpdating     map[string]bool
@@ -213,6 +216,9 @@ func newRoutingState(models map[string]providerConfig, pinTTL time.Duration) *ro
 		pinTTL:                 pinTTL,
 		endpointCache:          make(map[string][]endpointMeta),
 		endpointFetchedAt:      make(map[string]time.Time),
+		qualityCache:           make(map[string]providerQualityCache),
+		qualityLoading:         make(map[string]chan struct{}),
+		qualityGenerations:     make(map[string]uint64),
 		nameMap:                make(map[string]map[string]string),
 		modelRevisions:         make(map[string]uint64),
 		modelOrderUpdating:     make(map[string]bool),
@@ -1381,6 +1387,10 @@ func (r *routingState) applyProviderTestResultsAtRevision(model string, results 
 	}
 	previous := append([]string(nil), cfg.Order...)
 	now := r.now()
+	qualities := r.qualityCache[model].values
+	if now.Sub(r.qualityCache[model].fetchedAt) >= providerQualityTTL {
+		qualities = nil
+	}
 	blocked := blockedSet(cfg, now)
 	effectiveErrors := make(map[string]float64, len(apiErrors)+len(r.temporarilyUnavailable[model]))
 	for provider, rate := range apiErrors {
@@ -1435,7 +1445,7 @@ func (r *routingState) applyProviderTestResultsAtRevision(model string, results 
 			return "", false, nil
 		}
 	}
-	deals := rankProviderDeals(successful, profile, metaByTag, position, incumbent)
+	deals := rankProviderDeals(successful, profile, metaByTag, position, incumbent, qualities)
 
 	// Providers with recent API errors cannot become the next automatic
 	// selection, however well they benchmarked: the deal
@@ -1523,13 +1533,9 @@ func (r *routingState) applyProviderTestResultsAtRevision(model string, results 
 }
 
 // providerDeal is one provider priced and timed against the reference request.
-// score is the cost-delay product: dollars per request multiplied by seconds
-// per request. Lower is a better deal, and because both factors are relative,
-// a provider only wins on price when the discount is proportionally larger than
-// the speed it gives up, and only wins on speed when the time it saves is
-// proportionally larger than the premium it charges. That is what keeps a
-// marginally faster provider from being selected at any price, and what lets a
-// slightly slower provider win on a real discount.
+// score is the cost-delay product multiplied by a bounded quality adjustment.
+// Lower is a better deal. Published GPQA, Tau, tool and JSON metrics can justify
+// a modest premium without allowing quality to bypass health or latency tiers.
 type providerDeal struct {
 	result   providerTestResult
 	cost     float64
@@ -1563,7 +1569,7 @@ type providerDeal struct {
 // measurement, or a duration past the ceiling rank behind the ones without
 // those problems rather than being dropped: they are still working providers
 // and remain available as fallbacks.
-func rankProviderDeals(results []providerTestResult, profile requestProfile, metaByTag map[string]endpointMeta, position map[string]int, incumbent string) []providerDeal {
+func rankProviderDeals(results []providerTestResult, profile requestProfile, metaByTag map[string]endpointMeta, position map[string]int, incumbent string, qualities map[string]providerQuality) []providerDeal {
 	deals := make([]providerDeal, 0, len(results))
 	durations := make([]float64, 0, len(results))
 	for _, result := range results {
@@ -1571,7 +1577,7 @@ func rankProviderDeals(results []providerTestResult, profile requestProfile, met
 		deal.cost, deal.priced = profile.cost(metaByTag[result.provider].Pricing)
 		deal.seconds, deal.timed = profile.seconds(result)
 		if deal.seconds > 0 {
-			deal.score = deal.cost * math.Pow(deal.seconds, benchmarkTimeWeight)
+			deal.score = deal.cost * math.Pow(deal.seconds, benchmarkTimeWeight) * providerQualityMultiplier(qualities[result.provider])
 			durations = append(durations, deal.seconds)
 		}
 		deals = append(deals, deal)

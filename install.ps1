@@ -3,20 +3,52 @@ $ErrorActionPreference = "Stop"
 $RepositoryUrl = if ($env:ORR_REPOSITORY_URL) { $env:ORR_REPOSITORY_URL } else { "https://github.com/mikael-titinovskii/orr.git" }
 $MinimumGo = [Version]"1.23"
 
+function Test-NativeCommand {
+    param([string]$Name, [string[]]$Arguments)
+    # Windows PowerShell turns redirected native stderr into terminating errors under "Stop".
+    $PreviousPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $Name @Arguments *> $null
+        return $LASTEXITCODE -eq 0
+    } finally {
+        $ErrorActionPreference = $PreviousPreference
+    }
+}
+
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     throw "Git is required. Install Git and run this script again."
 }
-if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
-    throw "Go 1.23 or newer is required. Download it from https://go.dev/dl/."
-}
 
-$GoVersionText = (& go env GOVERSION).Trim()
-if ($GoVersionText -notmatch '^go(\d+\.\d+)(?:\.\d+)?') {
-    throw "Could not understand installed Go version: $GoVersionText"
+$Builder = $null
+$GoProblem = "Go 1.23 or newer was not found."
+if (Get-Command go -ErrorAction SilentlyContinue) {
+    $GoVersionText = (& go env GOVERSION).Trim()
+    if ($GoVersionText -notmatch '^go(\d+\.\d+)(?:\.\d+)?') {
+        $GoProblem = "Could not understand installed Go version: $GoVersionText."
+    } elseif ([Version]$Matches[1] -lt $MinimumGo) {
+        $GoProblem = "Go 1.23 or newer is required; found $GoVersionText."
+    } else {
+        $Builder = "go"
+    }
 }
-$GoVersion = [Version]$Matches[1]
-if ($GoVersion -lt $MinimumGo) {
-    throw "Go 1.23 or newer is required; found $GoVersionText. Download it from https://go.dev/dl/."
+if (-not $Builder) {
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        throw "$GoProblem Install Go 1.23 or newer from https://go.dev/dl/, or install Docker to build orr in a container."
+    }
+    if (-not (Test-NativeCommand docker @("info"))) {
+        throw "$GoProblem Docker is installed but not reachable; start Docker or install Go 1.23 or newer from https://go.dev/dl/."
+    }
+    if (-not (Test-NativeCommand docker @("buildx", "version"))) {
+        throw "$GoProblem Building with Docker requires Docker Buildx; install it, or install Go 1.23 or newer from https://go.dev/dl/."
+    }
+    $Architecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    $TargetArch = switch ($Architecture) {
+        "AMD64" { "amd64" }
+        "ARM64" { "arm64" }
+        default { throw "$GoProblem Building with Docker supports amd64 and arm64 only; install Go 1.23 or newer from https://go.dev/dl/." }
+    }
+    $Builder = "docker"
 }
 
 $OpenRouterKeyPattern = '^sk-or-v1-[0-9a-f]{64}$'
@@ -46,6 +78,7 @@ $ConfigDir = Join-Path ([Environment]::GetFolderPath('ApplicationData')) "orr"
 $BinDir = Join-Path $env:LOCALAPPDATA "Programs\orr"
 $SourceDir = $null
 $TempDir = $null
+$StageDir = $null
 
 if ($PSScriptRoot -and
     (Test-Path -LiteralPath (Join-Path $PSScriptRoot "go.mod")) -and
@@ -80,13 +113,21 @@ try {
     if (-not $FoundKey) { $UpdatedLines += "OPENROUTER_API_KEY=$OpenRouterKey" }
     [IO.File]::WriteAllLines($EnvPath, [string[]]$UpdatedLines, [Text.UTF8Encoding]::new($false))
 
-    Write-Host "Building orr with $GoVersionText..."
-    Push-Location $SourceDir
-    try {
-        & go build -trimpath -o (Join-Path $BinDir "orr.exe") ./cmd/orr
+    if ($Builder -eq "go") {
+        Write-Host "Building orr with $GoVersionText..."
+        Push-Location $SourceDir
+        try {
+            & go build -trimpath -o (Join-Path $BinDir "orr.exe") ./cmd/orr
+            if ($LASTEXITCODE -ne 0) { throw "The orr build failed." }
+        } finally {
+            Pop-Location
+        }
+    } else {
+        Write-Host "Building orr for windows/$TargetArch with Docker..."
+        $StageDir = Join-Path $BinDir (".orr-build-" + [guid]::NewGuid())
+        & docker build --platform "windows/$TargetArch" --output "type=local,dest=$StageDir" $SourceDir
         if ($LASTEXITCODE -ne 0) { throw "The orr build failed." }
-    } finally {
-        Pop-Location
+        Move-Item -LiteralPath (Join-Path $StageDir "orr.exe") -Destination (Join-Path $BinDir "orr.exe") -Force
     }
 
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -106,6 +147,9 @@ try {
     Write-Host "Start it with: orr serve"
     Write-Host "Tab completion: run 'orr completion' for setup instructions."
 } finally {
+    if ($StageDir -and (Test-Path -LiteralPath $StageDir)) {
+        Remove-Item -LiteralPath $StageDir -Recurse -Force
+    }
     if ($TempDir -and (Test-Path -LiteralPath $TempDir)) {
         Remove-Item -LiteralPath $TempDir -Recurse -Force
     }
