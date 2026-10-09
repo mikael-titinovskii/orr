@@ -5,7 +5,7 @@
 - `cmd/orr`: the executable entry point; keep it thin.
 - `internal/app`: CLI commands, configuration, proxy, metrics, routing state, and TUI.
 - `e2e`: end-to-end proxy, lifecycle, routing, and CLI tests.
-- Repository root: user documentation, the dotenv example, installers, and Go module files.
+- Repository root: user documentation, the dotenv example, installers, the Docker build file, and Go module files.
 
 ## Working conventions
 
@@ -20,6 +20,7 @@
 - Do not add migration or backward-compatibility behavior unless explicitly requested; reject unsupported persisted formats.
 - Assume a valid OpenRouter API key is always configured for supported runtime use. The application does not support keyless operation; do not add unauthenticated fallbacks.
 - Maintain macOS, Linux, and Windows compatibility; do not depend on Unix-only terminal handling.
+- The installers and `orr upgrade` build with Docker when Go is unavailable. Keep `.dockerignore` an allowlist so `.env`, `providers.yaml`, and `.git` never enter the build context.
 - Leave missing data blank in dashboards and CLI tables. Do not use `0`, `0%`, `0.0%`, `-`, or `—` as no-data placeholders; an empty cell is fine. Keep zero API/tool error rates blank as well.
 
 ## Documentation

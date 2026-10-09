@@ -11,18 +11,41 @@ fail() {
 }
 
 command -v git >/dev/null 2>&1 || fail "Git is required. Install Git and run this command again."
-command -v go >/dev/null 2>&1 || fail "Go 1.23 or newer is required: https://go.dev/dl/"
 
-go_version=$(go env GOVERSION 2>/dev/null || true)
-go_numbers=${go_version#go}
-go_major=${go_numbers%%.*}
-go_rest=${go_numbers#*.}
-go_minor=${go_rest%%.*}
-case "$go_major.$go_minor" in
-  *[!0-9.]*) fail "Could not understand installed Go version: $go_version" ;;
-esac
-if [ "$go_major" -lt "$MIN_GO_MAJOR" ] || { [ "$go_major" -eq "$MIN_GO_MAJOR" ] && [ "$go_minor" -lt "$MIN_GO_MINOR" ]; }; then
-  fail "Go 1.23 or newer is required; found $go_version. Download it from https://go.dev/dl/."
+builder=
+go_problem="Go 1.23 or newer was not found."
+if command -v go >/dev/null 2>&1; then
+  go_version=$(go env GOVERSION 2>/dev/null || true)
+  go_numbers=${go_version#go}
+  go_major=${go_numbers%%.*}
+  go_rest=${go_numbers#*.}
+  go_minor=${go_rest%%.*}
+  case "$go_major.$go_minor" in
+    .* | *. | *[!0-9.]*) go_problem="Could not understand installed Go version: $go_version." ;;
+    *)
+      if [ "$go_major" -gt "$MIN_GO_MAJOR" ] || { [ "$go_major" -eq "$MIN_GO_MAJOR" ] && [ "$go_minor" -ge "$MIN_GO_MINOR" ]; }; then
+        builder=go
+      else
+        go_problem="Go 1.23 or newer is required; found $go_version."
+      fi
+      ;;
+  esac
+fi
+if [ -z "$builder" ]; then
+  command -v docker >/dev/null 2>&1 || fail "$go_problem Install Go 1.23 or newer from https://go.dev/dl/, or install Docker to build orr in a container."
+  docker info >/dev/null 2>&1 || fail "$go_problem Docker is installed but not reachable; start Docker or install Go 1.23 or newer from https://go.dev/dl/."
+  docker buildx version >/dev/null 2>&1 || fail "$go_problem Building with Docker requires Docker Buildx; install it, or install Go 1.23 or newer from https://go.dev/dl/."
+  case "$(uname -s)" in
+    Darwin) target_os=darwin ;;
+    Linux) target_os=linux ;;
+    *) fail "$go_problem Building with Docker supports macOS and Linux only; install Go 1.23 or newer from https://go.dev/dl/." ;;
+  esac
+  case "$(uname -m)" in
+    x86_64 | amd64) target_arch=amd64 ;;
+    arm64 | aarch64) target_arch=arm64 ;;
+    *) fail "$go_problem Building with Docker supports amd64 and arm64 only; install Go 1.23 or newer from https://go.dev/dl/." ;;
+  esac
+  builder=docker
 fi
 
 key_format_message="OPENROUTER_API_KEY must be 'sk-or-v1-' followed by exactly 64 lowercase hexadecimal characters."
@@ -72,8 +95,12 @@ config_dir="$config_root/orr"
 bin_dir=${XDG_BIN_HOME:-"$HOME/.local/bin"}
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t orr-install)
+stage_dir=
 cleanup() {
   rm -rf "$tmp_dir"
+  if [ -n "$stage_dir" ]; then
+    rm -rf "$stage_dir"
+  fi
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -107,8 +134,15 @@ fi
 mv "$env_tmp" "$config_dir/.env"
 chmod 600 "$config_dir/.env"
 
-printf 'Building orr with %s...\n' "$go_version"
-(cd "$source_dir" && go build -trimpath -o "$bin_dir/orr" ./cmd/orr)
+if [ "$builder" = go ]; then
+  printf 'Building orr with %s...\n' "$go_version"
+  (cd "$source_dir" && go build -trimpath -o "$bin_dir/orr" ./cmd/orr)
+else
+  printf 'Building orr for %s/%s with Docker...\n' "$target_os" "$target_arch"
+  stage_dir=$(mktemp -d "$bin_dir/.orr-build.XXXXXX")
+  docker build --platform "$target_os/$target_arch" --output "type=local,dest=$stage_dir" "$source_dir"
+  mv -f "$stage_dir/orr" "$bin_dir/orr"
+fi
 chmod 755 "$bin_dir/orr"
 
 printf 'Checking Kimi Code and OpenCode configuration...\n'

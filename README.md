@@ -10,7 +10,8 @@ a terminal dashboard without recording prompts or API keys.
 
 ## Quick start
 
-Install from the public repository (Git and Go 1.23+ are required):
+Install from the public repository (Git is required, plus Go 1.23+ or Docker
+with Buildx):
 
 ```sh
 git clone https://github.com/mikael-titinovskii/orr.git
@@ -32,6 +33,10 @@ The installer asks for `OPENROUTER_API_KEY`, builds `orr`, and adds it to
 `PATH` where needed. Set `ORR_OPENROUTER_API_KEY` beforehand for unattended
 installs. It also configures installed Kimi Code and OpenCode clients when it
 finds them.
+
+Without Go 1.23+, the installer builds `orr` for your platform with Docker and
+the repository's `Dockerfile`. Docker is used only for building; `orr` still
+runs directly on your machine.
 
 Point any OpenAI-compatible client to:
 
@@ -79,7 +84,7 @@ Keep `ORR_LISTEN` on `127.0.0.1` unless you deliberately want network access.
 | `orr update` | Refresh provider orders for every known model. |
 | `orr update --cache-only` | Keep only providers with prompt caching. |
 | `orr reset` | Remove generated provider and stats state; preserves `.env`. |
-| `orr upgrade` | Pull or download the latest source and rebuild the running binary. |
+| `orr upgrade` | Pull or download the latest source and rebuild the running binary with Go, or Docker when no usable Go toolchain is installed. |
 | `orr completion <shell>` | Print completion setup for bash, zsh, fish, or PowerShell. |
 
 Before tagging a release, update `Version` in `internal/app/main.go` to match
@@ -170,13 +175,41 @@ again after `r`. Missing data stays blank, and zero error rates stay blank.
 Scores are matched to exact provider endpoints; ambiguous deployments stay
 blank. The data comes from OpenRouter's website API, which can change separately
 from its documented API. Fetch failures leave unavailable fields blank. The
-metrics are displayed in memory and do not change provider rankings or pins.
+metrics stay in memory and influence automatic benchmark selection as described below.
 See [OpenRouter's Auto Exacto documentation](https://openrouter.ai/docs/guides/routing/auto-exacto)
 for how the benchmarks and tool-call errors are measured.
 
 Manual pins stay until removed. Automatic pins select the best measured
 provider, expire after `ORR_PIN_TTL` (one hour by default), and can fail over
 after provider-specific 429s or an unavailable endpoint.
+
+Auto selection balances cost, speed, and quality. It estimates the cost and
+duration of a typical request from recent traffic (or a reference request of
+2,000 uncached input, 18,000 cached input, and 1,000 output tokens). Duration is
+time to first token plus output tokens divided by measured tokens per second.
+Providers within 1.5 times the field's median duration rank first, followed by
+providers with complete prices and trustworthy first-token measurements.
+Within these tiers, the lowest quality-adjusted cost-times-duration score wins.
+
+GPQA, Tau, tool-call success, and JSON success contribute equally to quality.
+GPQA and Tau are fractions; success is one minus the published error percentage
+divided by 100. Missing or invalid metrics contribute a neutral 0.5. Their
+average, `quality`, adjusts the score as
+`cost * duration * (1.25 - 0.5 * quality)`, bounded to a 25% discount or penalty
+on the cost-speed score. With all quality data missing, the multiplier is 1.
+Quality cannot bypass latency tiers or provider health exclusions. A current
+eligible automatic pin stays until a challenger improves the adjusted score
+by at least 5%. Manual pins remain authoritative.
+
+Quality data loads alongside provider benchmarks even without the dashboard,
+shares a 15-minute cache with the dashboard, and uses the benchmark's remaining
+deadline (at most 10 seconds). Automatic provider tests stop at 70% completion
+or the three-second gate; quality fetching may use the rest of that gate before
+selection. Unavailable or expired quality data uses the neutral adjustment.
+Failed or cancelled fetches do not start a new cache lifetime: the next benchmark
+can retry immediately, and the dashboard retries after 30 seconds. The dashboard
+uses the shared data's original fetch timestamp. Pressing `r` invalidates quality
+data, including results from fetches already in flight.
 
 ## Integrations
 
@@ -303,3 +336,24 @@ go vet ./...
 
 The end-to-end suite uses local mock upstreams and does not need a real OpenRouter
 key or network access.
+
+Build a binary for any supported platform without a local Go toolchain:
+
+```sh
+docker build --platform darwin/arm64 --output dist .
+```
+
+The result is `dist/orr` (`dist/orr.exe` for `windows/*` platforms).
+
+Run the deterministic auto-selection snapshot tests with:
+
+```sh
+go test ./internal/app -run TestAutoSelectionSnapshots -v
+```
+
+Fixtures in `internal/app/testdata/auto_selection*_snapshots.json` declare
+provider prices, measured speed and TTFT, quality metrics, pin state, and the
+expected winner. Each scenario checks multiple provider listing orders and
+repeated selection. The Kimi K3 screenshot fixture preserves missing measured
+data; separate hypothetical cases explicitly assume benchmarks reproduce the
+published throughput with 500 ms TTFT.

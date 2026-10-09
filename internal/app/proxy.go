@@ -750,7 +750,8 @@ func benchmarkCompletionTarget(providers int, stopAtSeventyPercent bool) int {
 // benchmarkProviders runs up to maxConcurrency provider tests at once.
 // Automatic runs may stop at 70% completion; manual runs target every
 // provider. Both modes stop at deadline, canceling in-flight and not-yet-started
-// requests.
+// requests. Optional quality metadata loads concurrently and may use the rest
+// of the deadline (up to ten seconds) after provider tests finish.
 func (p *proxy) benchmarkProviders(model string, providers []string, deadline time.Time, stopAtSeventyPercent bool, maxConcurrency int) ([]providerTestResult, bool) {
 	if len(providers) == 0 || !p.now().Before(deadline) {
 		return nil, false
@@ -790,6 +791,24 @@ func (p *proxy) benchmarkProviders(model string, providers []string, deadline ti
 	// clock do not accidentally compare two different time domains.
 	ctx, cancel := context.WithTimeout(context.Background(), remaining)
 	defer cancel()
+	// Quality fetches run alongside the measurements, including without a TUI.
+	// They share the run's deadline but not its early worker cancellation, so
+	// reaching 70% does not throw away almost-complete quality metadata.
+	if p.upstream != nil && p.upstream.Scheme == "https" && p.upstream.Host == "openrouter.ai" {
+		qualityCtx, qualityCancel := context.WithTimeout(context.Background(), min(remaining, 10*time.Second))
+		qualityDone := make(chan struct{})
+		client := *p.client
+		client.Timeout = 10 * time.Second
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		go func() {
+			defer close(qualityDone)
+			_, _ = p.routing.refreshProviderQuality(qualityCtx, &client, "https://openrouter.ai", p.cfg.openRouterKey(), model)
+		}()
+		defer func() {
+			<-qualityDone
+			qualityCancel()
+		}()
+	}
 	testProvider := p.testProviderContext
 	if p.dailyTestProvider != nil {
 		testProvider = p.dailyTestProvider

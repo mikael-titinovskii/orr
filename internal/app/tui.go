@@ -27,9 +27,11 @@ type releaseUpdateResultMsg struct {
 }
 
 type providerQualityMsg struct {
-	model  string
-	values map[string]providerQuality
-	err    error
+	model      string
+	values     map[string]providerQuality
+	err        error
+	fetchedAt  time.Time
+	generation uint64
 }
 
 // providerTestMsg carries the outcome of a 't' ping-pong test against one
@@ -93,9 +95,10 @@ type dashboardModel struct {
 	stopwatch        *stopwatchState
 	releaseUpdate    string
 	checkRelease     func() (string, error)
-	fetchQuality     func(model string) (map[string]providerQuality, error)
+	fetchQuality     func(model string) (providerQualityCache, error)
 	quality          map[string]map[string]providerQuality
 	qualityFetchedAt map[string]time.Time
+	qualityRetryAt   map[string]time.Time
 	qualityLoading   map[string]bool
 }
 
@@ -185,14 +188,15 @@ func newDashboard(cfg config, stats *stats, routing *routingState) dashboardMode
 		checkRelease:     checkForReleaseUpdate,
 		quality:          make(map[string]map[string]providerQuality),
 		qualityFetchedAt: make(map[string]time.Time),
+		qualityRetryAt:   make(map[string]time.Time),
 		qualityLoading:   make(map[string]bool),
 	}
 	if upstream, err := url.Parse(cfg.Upstream); err == nil && upstream.Scheme == "https" && upstream.Host == "openrouter.ai" {
 		client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-		m.fetchQuality = func(model string) (map[string]providerQuality, error) {
+		m.fetchQuality = func(model string) (providerQualityCache, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			return fetchProviderQuality(ctx, client, "https://openrouter.ai", cfg.openRouterKey(), model)
+			return routing.refreshProviderQuality(ctx, client, "https://openrouter.ai", cfg.openRouterKey(), model)
 		}
 	}
 	return m
@@ -205,11 +209,14 @@ func (m *dashboardModel) refreshQualityCmd() tea.Cmd {
 	if last, ok := m.qualityFetchedAt[m.model]; ok && m.routing.now().Sub(last) < providerQualityTTL {
 		return nil
 	}
+	if m.routing.now().Before(m.qualityRetryAt[m.model]) {
+		return nil
+	}
 	model, fetch := m.model, m.fetchQuality
 	m.qualityLoading[model] = true
 	return func() tea.Msg {
-		values, err := fetch(model)
-		return providerQualityMsg{model: model, values: values, err: err}
+		cached, err := fetch(model)
+		return providerQualityMsg{model: model, values: cached.values, fetchedAt: cached.fetchedAt, generation: cached.generation, err: err}
 	}
 }
 
@@ -266,11 +273,21 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tickDashboard()
 	case providerQualityMsg:
 		delete(m.qualityLoading, msg.model)
-		m.qualityFetchedAt[msg.model] = m.routing.now()
+		m.routing.mu.RLock()
+		generation := m.routing.qualityGenerations[msg.model]
+		m.routing.mu.RUnlock()
+		if msg.generation != generation {
+			break
+		}
+		delete(m.qualityFetchedAt, msg.model)
+		delete(m.qualityRetryAt, msg.model)
 		// Expired data must not survive a failed refresh as if it were current.
 		delete(m.quality, msg.model)
 		if msg.err == nil {
 			m.quality[msg.model] = msg.values
+			m.qualityFetchedAt[msg.model] = msg.fetchedAt
+		} else {
+			m.qualityRetryAt[msg.model] = m.routing.now().Add(providerQualityRetryDelay)
 		}
 	case serverErrorMsg:
 		m.serverErr = msg.err
@@ -430,6 +447,9 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "r":
 			delete(m.qualityFetchedAt, m.model)
+			delete(m.qualityRetryAt, m.model)
+			delete(m.quality, m.model)
+			m.routing.invalidateProviderQuality(m.model)
 			if m.refresh != nil && m.model != "" {
 				// Re-reading the catalog is when a user who just changed a
 				// guardrail expects orr to find out, so forget the recorded

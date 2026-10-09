@@ -1061,7 +1061,7 @@ func TestSelectionBoundaryContracts(t *testing.T) {
 			{provider: "median-b", tps: 1, samples: benchmarkMinLatencySamples},
 			{provider: "boundary", tps: 2.0 / 3.0, samples: benchmarkMinLatencySamples},
 		}
-		deals := rankProviderDeals(results, profile, nil, map[string]int{"median-a": 0, "median-b": 1, "boundary": 2}, "")
+		deals := rankProviderDeals(results, profile, nil, map[string]int{"median-a": 0, "median-b": 1, "boundary": 2}, "", nil)
 		byProvider := make(map[string]providerDeal, len(deals))
 		for _, deal := range deals {
 			byProvider[deal.result.provider] = deal
@@ -1071,7 +1071,7 @@ func TestSelectionBoundaryContracts(t *testing.T) {
 		}
 
 		results[2].tps = 0.666666
-		deals = rankProviderDeals(results, profile, nil, map[string]int{"median-a": 0, "median-b": 1, "boundary": 2}, "")
+		deals = rankProviderDeals(results, profile, nil, map[string]int{"median-a": 0, "median-b": 1, "boundary": 2}, "", nil)
 		for _, deal := range deals {
 			if deal.result.provider == "boundary" && deal.viable {
 				t.Fatal("provider beyond 1.5x the median remained viable")

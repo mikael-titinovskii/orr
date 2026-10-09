@@ -15,6 +15,97 @@ import (
 )
 
 const providerQualityTTL = 15 * time.Minute
+const providerQualityRetryDelay = 30 * time.Second
+
+type providerQualityCache struct {
+	values     map[string]providerQuality
+	fetchedAt  time.Time
+	generation uint64
+}
+
+// Each metric contributes equally. Unknown metrics contribute the neutral
+// midpoint rather than a fabricated zero. Quality adjusts the cost-delay score
+// by at most 25% in either direction; it cannot bypass health or latency tiers.
+func providerQualityMultiplier(quality providerQuality) float64 {
+	total := 0.0
+	for _, metric := range []struct {
+		value     *float64
+		maximum   float64
+		errorRate bool
+	}{
+		{quality.GPQA, 1, false},
+		{quality.Tau, 1, false},
+		{quality.ToolError, 100, true},
+		{quality.StructuredError, 100, true},
+	} {
+		value := 0.5
+		if validQualityValue(metric.value, metric.maximum) {
+			value = *metric.value / metric.maximum
+			if metric.errorRate {
+				value = 1 - value
+			}
+		}
+		total += value
+	}
+	return 1.25 - 0.5*(total/4)
+}
+
+// Dashboard and benchmark fetches share a per-model cache and in-flight work.
+// Only completed successful fetches get a freshness timestamp. Invalidation
+// advances a generation so superseded fetches cannot repopulate the cache.
+func (r *routingState) refreshProviderQuality(ctx context.Context, client *http.Client, origin, apiKey, model string) (providerQualityCache, error) {
+	for {
+		r.mu.Lock()
+		generation := r.qualityGenerations[model]
+		if err := ctx.Err(); err != nil {
+			r.mu.Unlock()
+			return providerQualityCache{generation: generation}, err
+		}
+		if cached, ok := r.qualityCache[model]; ok && r.now().Sub(cached.fetchedAt) < providerQualityTTL {
+			r.mu.Unlock()
+			return cached, nil
+		}
+		if done, ok := r.qualityLoading[model]; ok {
+			r.mu.Unlock()
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return providerQualityCache{generation: generation}, ctx.Err()
+			}
+		}
+		done := make(chan struct{})
+		r.qualityLoading[model] = done
+		r.mu.Unlock()
+		values, err := fetchProviderQuality(ctx, client, origin, apiKey, model)
+		r.mu.Lock()
+		delete(r.qualityLoading, model)
+		close(done)
+		if generation != r.qualityGenerations[model] {
+			r.mu.Unlock()
+			continue
+		}
+		cached := providerQualityCache{generation: generation}
+		if err == nil && ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		if err == nil {
+			cached.values, cached.fetchedAt = values, r.now()
+			r.qualityCache[model] = cached
+		} else {
+			delete(r.qualityCache, model)
+		}
+		r.mu.Unlock()
+		return cached, err
+	}
+}
+
+func (r *routingState) invalidateProviderQuality(model string) {
+	r.mu.Lock()
+	delete(r.qualityCache, model)
+	r.qualityGenerations[model]++
+	r.mu.Unlock()
+}
 
 // These are OpenRouter's published scores, independent of local request stats.
 // Benchmark scores are fractions; chart error rates are already percentages.
@@ -42,7 +133,7 @@ type qualityChartPoint struct {
 }
 
 // The website API is not part of OpenRouter's stable /api/v1 contract. Fetches
-// are bounded, optional, and used only by the dashboard, never the proxy path.
+// are bounded and optional, shared by the dashboard and provider benchmarks.
 func fetchProviderQuality(ctx context.Context, client *http.Client, origin, apiKey, model string) (map[string]providerQuality, error) {
 	var catalog struct {
 		Data []struct {
