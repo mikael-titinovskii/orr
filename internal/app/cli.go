@@ -60,6 +60,7 @@ func addEnvFlags(cmd *cobra.Command, envPath *string, preferEnvFile *bool) {
 
 func newServeCommand() *cobra.Command {
 	var (
+		noTUI         bool
 		envPath       string
 		preferEnvFile bool
 	)
@@ -72,10 +73,15 @@ func newServeCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if noTUI {
+				disabled := false
+				cfg.TUI = &disabled
+			}
 			return serve(cfg)
 		},
 	}
 	addEnvFlags(cmd, &envPath, &preferEnvFile)
+	cmd.Flags().BoolVar(&noTUI, "no-tui", false, "disable the terminal dashboard")
 	return cmd
 }
 

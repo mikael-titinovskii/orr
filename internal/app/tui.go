@@ -654,53 +654,7 @@ func (m *dashboardModel) selectActiveProvider(snap statsSnapshot) {
 // the first routable provider in the current ranked order. Removing a manual
 // override must never leave automatic routing active but visually unpinned.
 func (m *dashboardModel) restoreAutomaticPin(model string) {
-	if pin, ok := m.stats.providerPinsSnapshot()[model]; ok {
-		m.routing.restorePins(map[string]persistedPin{model: pin})
-		if provider, manual := m.routing.pinInfo(model); provider != "" && !manual {
-			return
-		}
-		m.stats.clearAutoPin(model)
-		// Do not let an unresolved saved pin replace the fallback selected below
-		// if endpoint discovery completes later.
-		m.routing.unpin(model)
-	}
-
-	cfg, ok := m.routing.modelConfig(model)
-	if !ok {
-		return
-	}
-	providers := cfg.Order
-	if len(providers) == 0 {
-		providers = cfg.Only
-	}
-	pool := m.stats.benchmarkPool(model)
-	now := m.routing.now()
-	cutoff := now.Add(-m.routing.pinTTL)
-	blocked := m.routing.blockedProviders(model)
-	apiErrors := providerAPIErrorRates(m.currentSnap().Records, model, now)
-	for _, provider := range providers {
-		if _, refused := blocked[provider]; refused || apiErrors[provider] > 0 {
-			continue
-		}
-		var measuredAt time.Time
-		for _, sample := range pool[provider] {
-			if sample.TPS > 0 && !sample.Time.Before(cutoff) && sample.Time.After(measuredAt) {
-				measuredAt = sample.Time
-			}
-		}
-		if measuredAt.IsZero() {
-			continue
-		}
-		pin := persistedPin{Provider: provider, PinnedAt: measuredAt}
-		m.stats.setAutoPinAt(model, provider, measuredAt)
-		m.routing.restorePins(map[string]persistedPin{model: pin})
-		return
-	}
-
-	provider := m.routing.active(model, m.currentSnap().Observed[model])
-	if m.routing.ensureAutoPin(model, provider) {
-		m.stats.setAutoPin(model, provider)
-	}
+	restoreAutomaticPin(m.routing, m.stats, model)
 }
 
 func indexOfString(values []string, target string) int {

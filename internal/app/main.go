@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 )
 
-const Version = "0.2.0"
+const Version = "1.0.1"
 
 // defaultEnvPath keeps repository-local development unchanged while allowing a
 // system-installed binary to find the configuration created by the installer.

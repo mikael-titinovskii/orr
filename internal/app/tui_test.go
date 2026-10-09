@@ -662,6 +662,27 @@ func TestDashboardShowsReleaseUpdateInLogTitle(t *testing.T) {
 	}
 }
 
+func TestDashboardLogSpinnerTracksInFlightRequests(t *testing.T) {
+	stats := newStats()
+	dashboard := newDashboard(config{}, stats, newRoutingState(nil, time.Hour))
+	dashboard.width, dashboard.height = 120, 40
+	dashboard.currentSnap() // Cache the idle snapshot before request activity.
+
+	stats.beginRequest()
+	updated, _ := dashboard.Update(tickMsg(time.Now()))
+	dashboard = updated.(dashboardModel)
+	if dashboard.currentSnap().InFlight != 1 || !strings.Contains(ansi.Strip(dashboard.View()), "Log \\") {
+		t.Fatal("Log spinner did not start for an in-flight request")
+	}
+
+	stats.endRequest()
+	updated, _ = dashboard.Update(tickMsg(time.Now()))
+	dashboard = updated.(dashboardModel)
+	if dashboard.currentSnap().InFlight != 0 || !strings.Contains(ansi.Strip(dashboard.View()), "Log ─") {
+		t.Fatal("Log spinner did not stop after the request")
+	}
+}
+
 func TestDashboardStartsReleaseCheckOnInit(t *testing.T) {
 	dashboard := newDashboard(config{}, newStats(), newRoutingState(nil, time.Hour))
 	dashboard.checkRelease = func() (string, error) { return "v0.3.0", nil }

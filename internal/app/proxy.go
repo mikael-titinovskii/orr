@@ -34,6 +34,7 @@ type proxy struct {
 	client         *http.Client
 	stats          *stats
 	routing        *routingState
+	registry       *modelRegistry
 	trackEndpoints bool
 	dailyMu        sync.Mutex
 	dailyReady     map[string]chan struct{}
@@ -80,6 +81,7 @@ func newProxy(cfg config) (*proxy, error) {
 		upstream:       u,
 		stats:          newStats(),
 		routing:        routing,
+		registry:       newModelRegistry(&http.Client{Timeout: 20 * time.Second}, cfg.Upstream, cfg.openRouterKey(), cfg.Listen, registryTTL),
 		dailyReady:     make(map[string]chan struct{}),
 		recoveryLast:   make(map[string]time.Time),
 		recoveryWanted: make(map[string]bool),
@@ -111,6 +113,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/health" {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"status":"ok"}`)
+		return
+	}
+	if r.URL.Path == "/registry.json" {
+		p.registry.ServeJSON(w, r)
 		return
 	}
 	if !strings.HasPrefix(r.URL.Path, "/v1/") {
@@ -859,7 +865,7 @@ func (p *proxy) stopDailyBenchmarks() {
 	p.dailyMu.Unlock()
 }
 
-func (p *proxy) applyProviderTestResults(model string, results []providerTestResult, revision uint64) {
+func (p *proxy) applyProviderTestResults(model string, results []providerTestResult, revision uint64) error {
 	snap := p.stats.snapshot()
 	providers := p.routing.providers(model, snap.Observed[model])
 	now := p.now()
@@ -869,7 +875,7 @@ func (p *proxy) applyProviderTestResults(model string, results []providerTestRes
 	best, autoUpdated, err := p.routing.applyProviderTestResultsAtRevision(model, results, profile, revision, apiErrs)
 	if err != nil {
 		log.Printf("apply provider benchmarks for %s: %v", model, err)
-		return
+		return err
 	}
 	if best != "" {
 		// A manual pin may currently override this winner. Persist it anyway so
@@ -885,6 +891,7 @@ func (p *proxy) applyProviderTestResults(model string, results []providerTestRes
 	if best != "" || autoUpdated {
 		syncPersistedAutomaticPin(p.routing, p.stats, model)
 	}
+	return nil
 }
 
 // syncPersistedAutomaticPin makes the stats copy follow the final serialized
