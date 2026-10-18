@@ -171,6 +171,32 @@ type registryCatalogEntry struct {
 	} `json:"reasoning"`
 }
 
+// catalogModel is one searchable entry of the upstream model catalog: the id a
+// request names and the display name the catalog publishes for it.
+type catalogModel struct {
+	ID   string
+	Name string
+}
+
+// fetchCatalogModels lists the upstream catalog's models for the dashboard's
+// `k` picker, so a model nothing has requested yet is still findable.
+func fetchCatalogModels(ctx context.Context, client *http.Client, upstream, apiKey string) ([]catalogModel, error) {
+	var catalog struct {
+		Data []registryCatalogEntry `json:"data"`
+	}
+	if err := fetchQualityJSON(ctx, client, strings.TrimRight(upstream, "/")+"/models", apiKey, &catalog); err != nil {
+		return nil, err
+	}
+	models := make([]catalogModel, 0, len(catalog.Data))
+	for _, entry := range catalog.Data {
+		if strings.TrimSpace(entry.ID) == "" {
+			continue
+		}
+		models = append(models, catalogModel{ID: entry.ID, Name: entry.Name})
+	}
+	return models, nil
+}
+
 // toRegistryModel maps one catalog entry to kimi-code's model schema. It returns
 // false when the entry has no usable id.
 func toRegistryModel(entry registryCatalogEntry) (map[string]any, bool) {

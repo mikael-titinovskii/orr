@@ -46,17 +46,30 @@ const benchmarkMinProfileRequests = 2
 // score. At 1.0 the score is the plain cost-delay product, which accepts a
 // price cut only when it is proportionally larger than the speed it costs, and
 // refuses a premium that buys proportionally less speed than it costs. Raise it
-// to buy speed more aggressively; lower it to favor price.
-const benchmarkTimeWeight = 1.0
+// to buy speed more aggressively; lower it to favor price, and at 0.0 seconds
+// drop out of the score entirely, leaving price alone.
+//
+// The constants below are the whole scale the dashboard offers: price, balanced,
+// performance. The exponent stays a float because the score is arithmetic, but
+// the control has nothing between those stops — a decimal weight is not a choice
+// anyone makes, and three named trades are what the score can be explained by.
+const defaultBenchmarkTimeWeight = 1.0
+const benchmarkTimeWeightMin = 0.0
+const benchmarkTimeWeightMax = 2.0
+const benchmarkTimeWeightStep = 1.0
 
 // benchmarkReferenceProfile prices and times providers before a model has real
-// traffic to measure. It is deliberately agent-shaped — a large, mostly cached
-// prompt and a moderate answer — because that is what a coding client sends.
-// Observed traffic replaces it as soon as there is any.
+// traffic to measure. It is deliberately shaped like a coding agent's day: a
+// large prompt, almost all of it served from the cache, and a short answer. That
+// shape is what decides a cold-start pin, so it has to match where the money
+// actually goes — the cache-read price, not the answer price. With a long answer
+// and a smaller cached prompt the answer dominates, and a provider charging
+// fifteen times more for cache reads can win the pin on a cheap output price.
+// Observed traffic replaces it as soon as a model has any.
 var benchmarkReferenceProfile = requestProfile{
 	promptTokens:     2_000,
-	cachedTokens:     18_000,
-	completionTokens: 1_000,
+	cachedTokens:     30_000,
+	completionTokens: 200,
 }
 
 // requestProfile is one representative request for a model: the token counts
@@ -201,8 +214,12 @@ type routingState struct {
 	modelOrderDone         map[string]chan struct{}
 	pendingPins            map[string]persistedPin
 	temporarilyUnavailable map[string]map[string]time.Time
-	revision               uint64
-	now                    func() time.Time
+	timeWeight             float64
+	// degradation is the live watchdog switch. It is read on the request path
+	// before any vitals work, so turning it off skips the scan entirely.
+	degradation bool
+	revision    uint64
+	now         func() time.Time
 }
 
 func newRoutingState(models map[string]providerConfig, pinTTL time.Duration) *routingState {
@@ -225,6 +242,8 @@ func newRoutingState(models map[string]providerConfig, pinTTL time.Duration) *ro
 		modelOrderDone:         make(map[string]chan struct{}),
 		pendingPins:            make(map[string]persistedPin),
 		temporarilyUnavailable: make(map[string]map[string]time.Time),
+		timeWeight:             defaultBenchmarkTimeWeight,
+		degradation:            true,
 		now:                    time.Now,
 	}
 	for model, provider := range copied {
@@ -251,6 +270,52 @@ func (r *routingState) setProvidersPath(path string) {
 	r.mu.Lock()
 	r.providersPath = path
 	r.mu.Unlock()
+}
+
+// currentTimeWeight is the live speed/price exponent. It is read on every
+// ranking, so a slider move reaches the next selection without restarting
+// anything.
+func (r *routingState) currentTimeWeight() float64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.timeWeight
+}
+
+func (r *routingState) setTimeWeight(weight float64) {
+	r.mu.Lock()
+	r.timeWeight = clampTimeWeight(weight)
+	r.mu.Unlock()
+}
+
+// degradationEnabled is the live watchdog switch, read on the request path and
+// by the dashboard.
+func (r *routingState) degradationEnabled() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.degradation
+}
+
+func (r *routingState) setDegradation(enabled bool) {
+	r.mu.Lock()
+	r.degradation = enabled
+	r.mu.Unlock()
+}
+
+// clampTimeWeight keeps the exponent on one of the control's three stops, so a
+// hand-edited persisted value cannot land the pane somewhere it cannot be moved
+// back from.
+func clampTimeWeight(weight float64) float64 {
+	if math.IsNaN(weight) {
+		return defaultBenchmarkTimeWeight
+	}
+	if weight < benchmarkTimeWeightMin {
+		weight = benchmarkTimeWeightMin
+	}
+	if weight > benchmarkTimeWeightMax {
+		weight = benchmarkTimeWeightMax
+	}
+	steps := math.Round((weight - benchmarkTimeWeightMin) / benchmarkTimeWeightStep)
+	return benchmarkTimeWeightMin + steps*benchmarkTimeWeightStep
 }
 
 func (r *routingState) modelConfig(model string) (providerConfig, bool) {
@@ -1408,30 +1473,35 @@ func (r *routingState) applyProviderTestResultsAtRevision(model string, results 
 	if pin, ok := r.pins[model]; ok && !pin.manual && now.Sub(pin.pinnedAt) <= r.pinTTL {
 		incumbent = pin.provider
 	}
+	timeWeight := r.timeWeight
 	r.mu.Unlock()
 
 	position := make(map[string]int, len(previous))
 	for i, provider := range previous {
 		position[provider] = i
 	}
-	successful := make([]providerTestResult, 0, len(results))
-	seen := make(map[string]bool, len(results))
-	for _, result := range results {
-		if result.provider == "" || result.err != nil || result.tps <= 0 || math.IsNaN(result.tps) || math.IsInf(result.tps, 0) || seen[result.provider] {
-			continue
-		}
-		// A blocked provider can still carry pooled measurements from before
-		// it was refused, and those measurements are real — it was genuinely
-		// that fast, last week. Ranking on them would hand the pin to a
-		// provider no request can reach, so the refusal disqualifies it here
-		// regardless of how good its numbers look.
-		if _, isBlocked := blocked[result.provider]; isBlocked {
-			continue
-		}
-		seen[result.provider] = true
-		successful = append(successful, result)
+	ranked, failing := rankSelectableProviders(results, profile, metaByTag, position, incumbent, qualities, apiErrors, blocked, timeWeight)
+	// Say why a provider is not in the running. Without this the only visible
+	// trace of an exclusion is a pin that went to a provider nobody expected,
+	// which reads as a bug in the ranking rather than a verdict about errors.
+	if len(failing) > 0 {
+		log.Printf("automatic selection for %s skipped %s: recent client API errors", model, strings.Join(failing, ", "))
 	}
-	if len(successful) == 0 {
+	if len(ranked) > 0 {
+		viable, ceilingSkipped := 0, make([]string, 0, len(ranked))
+		for _, deal := range ranked {
+			if deal.viable {
+				viable++
+				continue
+			}
+			ceilingSkipped = append(ceilingSkipped, deal.result.provider)
+		}
+		if len(ceilingSkipped) > 0 {
+			log.Printf("automatic selection for %s: %d viable of %d measured; past the duration ceiling: %s",
+				model, viable, len(ranked), strings.Join(ceilingSkipped, ", "))
+		}
+	}
+	if len(ranked) == 0 && len(failing) == 0 {
 		hasRecentErrors := false
 		for _, rate := range apiErrors {
 			if rate > 0 {
@@ -1444,22 +1514,6 @@ func (r *routingState) applyProviderTestResultsAtRevision(model string, results 
 			// provider health. Preserve the current order and automatic pin.
 			return "", false, nil
 		}
-	}
-	deals := rankProviderDeals(successful, profile, metaByTag, position, incumbent, qualities)
-
-	// Providers with recent API errors cannot become the next automatic
-	// selection, however well they benchmarked: the deal
-	// ranking never sees their failures, so they are taken out of the ranking
-	// here and re-appended at the tail, where they remain as fallbacks.
-	// demoteFailing after this catches anything the disqualification missed.
-	ranked := make([]providerDeal, 0, len(deals))
-	var failing []string
-	for _, deal := range deals {
-		if apiErrors[deal.result.provider] > 0 {
-			failing = append(failing, deal.result.provider)
-			continue
-		}
-		ranked = append(ranked, deal)
 	}
 
 	order := make([]string, 0, len(previous))
@@ -1569,7 +1623,7 @@ type providerDeal struct {
 // measurement, or a duration past the ceiling rank behind the ones without
 // those problems rather than being dropped: they are still working providers
 // and remain available as fallbacks.
-func rankProviderDeals(results []providerTestResult, profile requestProfile, metaByTag map[string]endpointMeta, position map[string]int, incumbent string, qualities map[string]providerQuality) []providerDeal {
+func rankProviderDeals(results []providerTestResult, profile requestProfile, metaByTag map[string]endpointMeta, position map[string]int, incumbent string, qualities map[string]providerQuality, timeWeight float64) []providerDeal {
 	deals := make([]providerDeal, 0, len(results))
 	durations := make([]float64, 0, len(results))
 	for _, result := range results {
@@ -1577,7 +1631,7 @@ func rankProviderDeals(results []providerTestResult, profile requestProfile, met
 		deal.cost, deal.priced = profile.cost(metaByTag[result.provider].Pricing)
 		deal.seconds, deal.timed = profile.seconds(result)
 		if deal.seconds > 0 {
-			deal.score = deal.cost * math.Pow(deal.seconds, benchmarkTimeWeight) * providerQualityMultiplier(qualities[result.provider])
+			deal.score = deal.cost * math.Pow(deal.seconds, timeWeight) * providerQualityMultiplier(qualities[result.provider])
 			durations = append(durations, deal.seconds)
 		}
 		deals = append(deals, deal)
@@ -1596,6 +1650,112 @@ func rankProviderDeals(results []providerTestResult, profile requestProfile, met
 		return deals[i].better(deals[j])
 	})
 	return applyChurnMargin(deals, incumbent)
+}
+
+// rankSelectableProviders is the selection step shared by the benchmark path
+// and the dashboard's live weight slider. It drops measurements that cannot
+// describe a selectable provider, ranks the survivors by the deal each offers
+// under timeWeight, and separates out the providers that failed recently.
+//
+// Providers with recent API errors cannot become the next automatic selection,
+// however well they benchmarked: the deal ranking never sees their failures, so
+// they are taken out of the ranking here and returned as failing, to be
+// re-appended at the tail where they remain as fallbacks. demoteFailing after
+// this catches anything the disqualification missed.
+func rankSelectableProviders(results []providerTestResult, profile requestProfile, metaByTag map[string]endpointMeta, position map[string]int, incumbent string, qualities map[string]providerQuality, apiErrors map[string]float64, blocked map[string]blockedProvider, timeWeight float64) (ranked []providerDeal, failing []string) {
+	successful := make([]providerTestResult, 0, len(results))
+	seen := make(map[string]bool, len(results))
+	for _, result := range results {
+		if result.provider == "" || result.err != nil || result.tps <= 0 || math.IsNaN(result.tps) || math.IsInf(result.tps, 0) || seen[result.provider] {
+			continue
+		}
+		// A blocked provider can still carry pooled measurements from before
+		// it was refused, and those measurements are real — it was genuinely
+		// that fast, last week. Ranking on them would hand the pin to a
+		// provider no request can reach, so the refusal disqualifies it here
+		// regardless of how good its numbers look.
+		if _, isBlocked := blocked[result.provider]; isBlocked {
+			continue
+		}
+		seen[result.provider] = true
+		successful = append(successful, result)
+	}
+	deals := rankProviderDeals(successful, profile, metaByTag, position, incumbent, qualities, timeWeight)
+	ranked = make([]providerDeal, 0, len(deals))
+	for _, deal := range deals {
+		if apiErrors[deal.result.provider] > 0 {
+			failing = append(failing, deal.result.provider)
+			continue
+		}
+		ranked = append(ranked, deal)
+	}
+	return ranked, failing
+}
+
+// rerankAutomaticPin re-selects the automatic pin from measurements already
+// held, under the current speed/price weight. It is what the dashboard's
+// slider drives, so it deliberately does less than a benchmark: no provider
+// order is written to providers.yaml and no model revision is advanced. A
+// slider is dialed keystroke by keystroke, and no intermediate position may
+// rewrite the file or cancel a benchmark already in flight. The persisted order
+// catches up on the next benchmark run, while the pin — the provider requests
+// actually follow — moves immediately.
+//
+// Apart from that, the decision is the benchmark's decision: the churn margin
+// applies, so a slider move does not hand the pin to a provider a benchmark run
+// would have refused at the same weight. A manual pin is left alone, as on every
+// other automatic path, and an empty measurement set preserves the existing pin
+// rather than clearing it, matching a fully cancelled benchmark run.
+func (r *routingState) rerankAutomaticPin(model string, results []providerTestResult, profile requestProfile, apiErrors map[string]float64) (string, bool) {
+	if !validModelID(model) || len(results) == 0 {
+		return "", false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cfg, ok := r.models[model]
+	if !ok || cfg.ManualPin != "" {
+		return "", false
+	}
+	metaByTag := make(map[string]endpointMeta, len(r.endpointCache[model]))
+	for _, ep := range r.endpointCache[model] {
+		metaByTag[ep.Tag] = ep
+	}
+	now := r.now()
+	qualities := r.qualityCache[model].values
+	if now.Sub(r.qualityCache[model].fetchedAt) >= providerQualityTTL {
+		qualities = nil
+	}
+	// The provider already holding the automatic pin gets the churn margin, so
+	// an equally good challenger does not take it — the same threshold the
+	// benchmark path applies.
+	incumbent := ""
+	if pin, ok := r.pins[model]; ok && !pin.manual && now.Sub(pin.pinnedAt) <= r.pinTTL {
+		incumbent = pin.provider
+	}
+	position := make(map[string]int, len(cfg.Order))
+	for i, provider := range cfg.Order {
+		position[provider] = i
+	}
+	ranked, _ := rankSelectableProviders(results, profile, metaByTag, position, incumbent, qualities, apiErrors, blockedSet(cfg, now), r.timeWeight)
+	best := ""
+	for _, deal := range ranked {
+		if isBlockedLocked(cfg, deal.result.provider, now) {
+			continue
+		}
+		best = deal.result.provider
+		break
+	}
+	if best == "" {
+		return "", false
+	}
+	if pin, pinned := r.pins[model]; pinned && !pin.manual && pin.provider == best {
+		// Already holding the winner: leave the pin's age alone so repeated
+		// slider stops do not keep re-arming its TTL.
+		return best, false
+	}
+	delete(r.pendingPins, model)
+	r.pins[model] = pinnedProvider{provider: best, pinnedAt: now}
+	return best, true
 }
 
 // better reports whether this deal outranks other. The tiers ahead of the

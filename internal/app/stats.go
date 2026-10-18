@@ -197,6 +197,14 @@ type persistedStats struct {
 	BudgetReset   string                  `json:"budget_reset,omitempty"`
 	ProviderPins  map[string]persistedPin `json:"provider_pins,omitempty"`
 	BenchmarkRuns map[string]time.Time    `json:"benchmark_runs,omitempty"`
+	// TimeWeight is the speed/price exponent the dashboard's slider was left
+	// at. It is a pointer so the meaningful value 0.0 — price alone — is not
+	// dropped by omitempty and silently restored as the default on restart.
+	TimeWeight *float64 `json:"time_weight,omitempty"`
+	// Degradation is the watchdog switch the dashboard's `d` key left behind.
+	// It is a pointer so a deliberate "off" is not dropped by omitempty and
+	// silently restored as the default on restart.
+	Degradation *bool `json:"degradation,omitempty"`
 	// BenchmarkSamples is keyed by model, then by provider. It is persisted so
 	// the pool survives a restart; without that, every restart would put
 	// selection back to judging providers on a single run's measurement.
@@ -221,6 +229,12 @@ type stats struct {
 	budgetReset      string
 	providerPins     map[string]persistedPin
 	benchmarkRuns    map[string]time.Time
+	timeWeight       float64
+	// degradation is the persisted watchdog switch. degradationSaved records
+	// whether the stats file carried a value, so the .env default only seeds a
+	// state the user has never toggled.
+	degradation      bool
+	degradationSaved bool
 	inFlight         int
 	mutations        uint64
 	now              func() time.Time
@@ -257,8 +271,49 @@ func newStats() *stats {
 		providerPins:     make(map[string]persistedPin),
 		benchmarkRuns:    make(map[string]time.Time),
 		benchmarkSamples: make(map[string]map[string][]benchmarkSample),
+		timeWeight:       defaultBenchmarkTimeWeight,
+		degradation:      true,
 		now:              time.Now,
 	}
+}
+
+// currentTimeWeight is the persisted speed/price exponent, which seeds the live
+// value routing selects with on startup.
+func (s *stats) currentTimeWeight() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.timeWeight
+}
+
+func (s *stats) setTimeWeight(weight float64) {
+	s.mu.Lock()
+	s.timeWeight = clampTimeWeight(weight)
+	s.mu.Unlock()
+}
+
+// degradationEnabled is the saved watchdog switch.
+func (s *stats) degradationEnabled() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.degradation
+}
+
+func (s *stats) setDegradation(enabled bool) {
+	s.mu.Lock()
+	s.degradation = enabled
+	s.degradationSaved = true
+	s.mu.Unlock()
+}
+
+// seedDegradation applies the configured default only while the stats file has
+// never recorded a toggle. A switch the user pressed is the last word, which is
+// the same rule the speed/price stop follows.
+func (s *stats) seedDegradation(value bool) {
+	s.mu.Lock()
+	if !s.degradationSaved {
+		s.degradation = value
+	}
+	s.mu.Unlock()
 }
 
 // addBenchmarkSampleLocked appends one round's measurement to the model and
@@ -360,8 +415,12 @@ func (s *stats) record(record requestRecord) {
 	if record.CompletionTokens > 0 {
 		s.dailyTokens[day] += int64(record.CompletionTokens)
 	}
-	s.requestCount++
-	s.sessionCount++
+	// Benchmark pings are orr's own probes, not client requests: they count in
+	// spend and tokens, but the request counters describe what the client sent.
+	if !record.Benchmark {
+		s.requestCount++
+		s.sessionCount++
+	}
 	s.mutations++
 	if record.Model != "" && record.Provider != "" {
 		providers := s.observed[record.Model]
@@ -387,26 +446,34 @@ func pruneRecords(records []requestRecord, cutoff time.Time, cap int) []requestR
 	return kept
 }
 
-// providerAPIErrorRates reports each provider's recent API error share for
-// model, keyed by provider tag, over the same window the dashboard's
-// performance table shows. Records carry whatever attribution orr has —
-// client requests, benchmark rounds, tests — because the question is not who
-// sent the request but whether the provider answered it. The verdict drives
-// automatic selection, so it has to be the same one the user reads.
+// providerAPIErrorRates reports each provider's recent client-traffic API error
+// share for model, keyed by provider tag, over the same window the dashboard's
+// performance table shows.
+//
+// Benchmark rounds are excluded, not because a failed ping is uninformative but
+// because it is already spent: a round that answers with an error fails its own
+// run, where the result is an error and the pooled history is cleared, so the
+// provider cannot hold the pin from that measurement. Counting the same round in
+// this window only extends that verdict: one bad probe would veto every later
+// run for half an hour even after the provider answered its pings cleanly, which
+// is how the cheapest fast provider loses the pin to a provider that merely
+// probes well. A run that still reaches its two-of-three quorum with one failed
+// round is treated the same way: the quorum exists to tolerate one straggling
+// round — a 429 or a timeout while probing is not a verdict about the provider's
+// health — so a partial failure ranks the answered rounds and leaves the client
+// error window alone.
 //
 // Account-policy refusals are excluded because they are routing restrictions,
 // not provider health failures; the separate blocked-provider state handles
 // them. Only answered records count, on either side of the ratio: a request with no
 // response status was cancelled by orr itself — the benchmark gate's
 // deadline, a client disconnect — and says nothing about the provider.
-// Convicting a provider for rounds orr aborted would demote and blank the
-// providers that were simply still working when the gate closed.
 func providerAPIErrorRates(records []requestRecord, model string, now time.Time) map[string]float64 {
 	cutoff := now.Add(-measuredMetricsTTL)
 	totals := make(map[string]int)
 	errs := make(map[string]int)
 	for _, r := range records {
-		if r.Model != model || r.Provider == "" || r.Time.Before(cutoff) || r.Status == 0 || r.Blocked {
+		if r.Model != model || r.Provider == "" || r.Time.Before(cutoff) || r.Status == 0 || r.Blocked || r.Benchmark {
 			continue
 		}
 		totals[r.Provider]++
@@ -544,6 +611,14 @@ func (s *stats) save(path string) error {
 	defer s.saveMu.Unlock()
 
 	s.mu.RLock()
+	timeWeight := s.timeWeight
+	// Only a switch the user actually toggled is saved. Writing the seeded value
+	// on every save would freeze it in the stats file on the first run and make
+	// ORR_DEGRADATION unchangeable from then on.
+	var degradation *bool
+	if s.degradationSaved {
+		degradation = &s.degradation
+	}
 	data, err := json.MarshalIndent(persistedStats{
 		Version:          statsFileVersion,
 		DailyCosts:       s.dailyCosts,
@@ -556,6 +631,8 @@ func (s *stats) save(path string) error {
 		ProviderPins:     s.providerPins,
 		BenchmarkRuns:    s.benchmarkRuns,
 		BenchmarkSamples: s.benchmarkSamples,
+		TimeWeight:       &timeWeight,
+		Degradation:      degradation,
 	}, "", "  ")
 	s.mu.RUnlock()
 	if err != nil {
@@ -667,6 +744,16 @@ func (s *stats) load(path string) error {
 			s.benchmarkSamples[model][provider] = kept
 		}
 	}
+	// An absent field keeps the default; a present one is clamped into the
+	// slider's range, so a hand-edited file cannot land the control on a value
+	// it cannot be moved back from.
+	if saved.TimeWeight != nil {
+		s.timeWeight = clampTimeWeight(*saved.TimeWeight)
+	}
+	if saved.Degradation != nil {
+		s.degradation = *saved.Degradation
+		s.degradationSaved = true
+	}
 	return nil
 }
 
@@ -707,6 +794,23 @@ func (s *stats) benchmarkRanToday(model string, now time.Time) bool {
 	return !last.IsZero() && last.Local().Format(time.DateOnly) == now.Local().Format(time.DateOnly)
 }
 
+// benchmarkedWithin reports whether model was benchmarked inside window. It is
+// what the startup warm-up asks: a fresh process holds no measurements of its
+// own, so a run minutes before the restart still leaves the routing pane and the
+// pin resting on data this process has never seen. A latch ahead of the wall
+// clock — a stats file written before the clock was stepped back — is stale, not
+// fresh: its negative age would otherwise sit inside every window until the
+// clock caught up.
+func (s *stats) benchmarkedWithin(model string, now time.Time, window time.Duration) bool {
+	if model == "" || window <= 0 {
+		return false
+	}
+	s.mu.RLock()
+	last := s.benchmarkRuns[model]
+	s.mu.RUnlock()
+	return !last.IsZero() && !last.After(now) && now.Sub(last) < window
+}
+
 func (s *stats) markBenchmarkRun(model string, now time.Time) {
 	if model == "" || now.IsZero() {
 		return
@@ -727,13 +831,28 @@ func (s *stats) providerPinsSnapshot() map[string]persistedPin {
 	return pins
 }
 
-func (s *stats) updateKeyInfo(usageMonthly, budget float64, reset string) {
+// updateKeyInfo applies one key poll. usagePolled says whether the response
+// carried usage_monthly: the cap updates either way, but spend keeps its last
+// polled value only while the billing cycle it was polled in still stands. A
+// payload that names a different reset starts a new cycle, so the old figure
+// belongs to the old cycle and is dropped in favour of the local fallback; an
+// answer that omits usage then cannot present a zero the key never reported.
+func (s *stats) updateKeyInfo(usageMonthly float64, usagePolled bool, budget float64, reset string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	cycleChanged := reset != "" && reset != s.budgetReset
+	if reset != "" {
+		s.budgetReset = reset
+	}
 	s.budget = budget
-	s.budgetReset = reset
-	s.creditSpend = usageMonthly
-	s.creditMonth = creditMonthFor(reset, s.now())
+	switch {
+	case usagePolled:
+		s.creditSpend = usageMonthly
+		s.creditMonth = creditMonthFor(reset, s.now())
+	case cycleChanged:
+		s.creditSpend = 0
+		s.creditMonth = ""
+	}
 	s.mutations++
 }
 

@@ -17,6 +17,7 @@
 - Keep the shareable providers schema versioned; use `providersFileVersion` as the source of truth.
 - Provider-order updates must preserve `manual_pin` and retain that provider in the model's refreshed `order`.
 - Provider failure recovery applies only to automatic pins. Keep the 429 threshold configurable, immediately retry an attributable pre-stream 404 when a single selected endpoint no longer serves the model, and coalesce recovery benchmarks per model.
+- Degradation recovery also applies only to automatic pins. Compare a provider with its own earlier client traffic — never benchmark pings, never the field — and run only the bounded refresh+benchmark path, with a cooldown separate from provider failure recovery. The `d` toggle persists in the platform stats file; `.env` only seeds it.
 - Do not add migration or backward-compatibility behavior unless explicitly requested; reject unsupported persisted formats.
 - Assume a valid OpenRouter API key is always configured for supported runtime use. The application does not support keyless operation; do not add unauthenticated fallbacks.
 - Maintain macOS, Linux, and Windows compatibility; do not depend on Unix-only terminal handling.

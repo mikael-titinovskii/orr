@@ -6,6 +6,8 @@ and applies provider preferences from `providers.yaml` to generation requests.
 It gives you provider routing, manual pins, live performance and spend data, and
 a terminal dashboard without recording prompts or API keys.
 
+![orr dashboard](docs/assets/dashboard.png)
+
 > A valid OpenRouter API key is required. `orr` does not support keyless use.
 
 ## Quick start
@@ -135,35 +137,80 @@ An interactive terminal opens the dashboard; redirected output uses plain logs.
 Set `ORR_TUI=false` or pass `orr serve --no-tui` to always use plain logs.
 The indicator beside Log spins while requests are in flight.
 
-![orr dashboard](docs/assets/dashboard.png)
-
 The useful controls are:
 
 | Key | Action |
 | --- | --- |
 | `↑` / `↓` | Select a provider. |
 | `Enter` | Toggle a manual pin for the selected provider. |
+| `←` / `→` | Move the speed/price control between its stops. |
+| `d` | Turn degradation recovery on or off. |
+| `p` | Change the day the `Prediction` line prices: 10m to 200m tokens in steps of ten million. |
 | `Tab` | Switch between recently used models. |
+| `k` | Search the model catalog and open the highlighted model in a tab. |
+| `x` | Close the current model tab. |
 | `r` | Refresh and rank providers for the current model. |
+| `o` | Change the provider table's display order: routing order, then each metric column. |
 | `t` | Benchmark the selected provider. |
 | `a` | Benchmark every listed provider. |
 | `s` | Start or stop the spend stopwatch. |
 | `q` / `Ctrl+C` | Stop the proxy cleanly. |
+
+`o` reorders the rows on screen only: the routing order, the pin, and
+`providers.yaml` stay as they are, so requests keep following the same route.
+The `Order` field in the routing pane names the active column, the column's own
+name is highlighted in the table, and each press of `o` moves to the next column
+before returning to `Default`. Prices sort cheapest first, `Tp`/`mTp`, `GPQA`, and
+`Tau` fastest or highest first, latencies lowest first, and the error columns
+cleanest first; a provider with a blank cell for the active column sorts below
+every provider that reports one.
+
+`k` opens a search box over the dashboard. It lists the models the dashboard
+already knows and, once the OpenRouter catalog arrives, every model the catalog
+publishes, matched by id or display name; ↑/↓ moves the cursor and `Enter` opens
+the highlighted model. The model joins the tab list even if nothing has
+requested it yet, and its `providers.yaml` entry is created so its compatible
+providers can be listed and pinned. `x` closes the displayed tab and moves to
+the next one; a request that completes for the closed model afterwards brings it
+back, so closing a tab whose traffic is still in flight is temporary.
+
+The `Prediction` line under the header projects what the highlighted provider
+would cost over the next hour, the next eight hours, and the next 20 working
+days. It prices one day of tokens — 20 million unless `p` changes it — split the
+way auto selection's reference request splits it (2,000 uncached input, 30,000
+cached input, and 200 output tokens), against that provider's published
+prices; the label names the day it prices and the key that changes it. Pressing
+`p` cycles 10m to 200m tokens per day in steps of ten million, cycling back to
+10m. The label quotes the day and the 20-working-day month it adds up to, so the
+volume is never an abstract number: `20m/d 400m/m`. The workload never
+follows live traffic, so the figures change only when you change the day, move
+the selection to another provider, or that provider reprices; the chosen day
+stays in memory and resets with the process. The 20-day value assumes an
+eight-hour working day at today's prices. The line stays out when the provider
+is blocked for the account, when its catalog entry is missing a price the
+projection needs, or when the pane is too narrow for all three horizons.
 
 The provider table includes OpenRouter's published `GPQA` Diamond and `Tau`
 Airline benchmark scores, plus `Tool` and `Json` error rates. Benchmark
 scores use OpenRouter's rolling 32-day window; error rates match the website's
 one-week average of available daily percentages. `mApi` and `mTool`
 continue to show errors observed by this proxy.
-The legend above the table identifies token rates, latency in milliseconds, OpenRouter benchmarks, and
+The legend above the table identifies token rates, first-token latency in milliseconds, OpenRouter benchmarks, and
 weekly average OpenRouter tool/JSON error rates, and measured API/tool error rates.
-`Ts` and `Lat` show OpenRouter's throughput and latency; `mTs` and `mLat`
-show measurements from this proxy.
-The columns after `TTFT` are `GPQA`, `Tau`, `Tool`, `Json`, `mApi`, and
+`Tp` (throughput) and `Lat` show OpenRouter's published throughput and
+latency; `mTp` and `mLat` show measurements from this proxy. Latency is
+time to first token in both cases, matching OpenRouter's definition.
+The columns after `mLat` are `GPQA`, `Tau`, `Tool`, `Json`, `mApi`, and
 `mTool`. `GPQA` and `Tau` percentages are colored on the
 same red–green–teal scale as throughput: higher scores are better, relative to
 the listed providers for that model. The provider table shows the cache-read
 price in `Cache`; cache-hit percentages are shown in the request log.
+The request log's own columns are `In`, `Uncached`, and `Out` for input,
+uncached-input, and output tokens, `CR` and `CW` for cache reads and writes,
+and `C%` for the cached share of the input.
+Every other column of the request log carries a subtle background shade so
+values stay distinguishable across the table's full width; failed requests keep
+the error red across the whole row.
 The table scrolls with provider selection to keep the selected provider's
 metrics visible within the pane.
 `mApi`, `mTool`, `Tool`, and `Json` use pale red for the lowest nonzero rates, increasing
@@ -183,13 +230,93 @@ Manual pins stay until removed. Automatic pins select the best measured
 provider, expire after `ORR_PIN_TTL` (one hour by default), and can fail over
 after provider-specific 429s or an unavailable endpoint.
 
+Measurement follows the models clients ask for. A request for a model whose last
+measurement is more than five minutes old starts one catalog refresh and one
+provider benchmark for that model, in the background while the request itself
+rides the stored pin; a model nobody asks for is never measured. The pings get
+their own three-second gate after that model's refresh completes, so a slow
+catalog never spends the budget the measurements need, and every provider is
+measured until the gate runs out rather than stopping at a share of the field.
+
 Auto selection balances cost, speed, and quality. It estimates the cost and
 duration of a typical request from recent traffic (or a reference request of
-2,000 uncached input, 18,000 cached input, and 1,000 output tokens). Duration is
+2,000 uncached input, 30,000 cached input, and 200 output tokens, the shape a
+coding client's day actually has). Duration is
 time to first token plus output tokens divided by measured tokens per second.
 Providers within 1.5 times the field's median duration rank first, followed by
 providers with complete prices and trustworthy first-token measurements.
 Within these tiers, the lowest quality-adjusted cost-times-duration score wins.
+
+The score's speed/price exponent has three settings, and the Routing pane draws
+them as a control just below the key hint:
+
+```
+Speed/price  price · balanced · performance  (←/→)
+```
+
+The current stop is lit. `←` and `→` move between them: `price` drops duration
+out of the score entirely, `balanced` scores the plain `cost * duration`
+product, and `performance` buys speed aggressively. The exponents in between are
+arithmetic the score still accepts, not settings the pane offers: a decimal
+weight is not a decision anyone makes. Like the degradation line below it, the
+control carries its own keys so it still says how to move after the key hint has
+truncated: a pane too narrow for all three names shows the current stop with the
+keys, then the keys alone, and only then truncates the line.
+Every keypress re-picks the automatic pin from the measurements already held, so
+the pane answers immediately instead of waiting for the next benchmark. The
+decision rules are the benchmark's, including the 5% switch threshold, so a move
+cannot hand the pin to a provider a benchmark run would have refused at that
+weight. The provider order in `providers.yaml` is left alone — only the pin moves — and
+catches up on the next benchmark run. The chosen stop is saved in the platform
+stats file, so it survives a restart. A manual pin remains authoritative and is
+never overridden by the control.
+
+### Degradation recovery
+
+The speed/price control decides who *should* serve the next request from
+measurements orr already holds. Degradation recovery covers the other failure
+mode: the chosen provider still answers, but far worse than it did for the same
+client minutes ago. It applies only to automatic pins — a manual pin is an
+explicit instruction and is never second-guessed.
+
+It compares one provider against itself. For the active route it takes the
+answered requests from the last `ORR_DEGRADATION_WINDOW` and the same provider's
+successful client requests from the previous 30 minutes, then scores three
+ratios, each clamped at 1 so a burst of speed cannot average away a collapse
+elsewhere:
+
+```
+throughput     recent tokens/sec     / baseline tokens/sec
+responsiveness baseline first token  / recent first token
+reliability    recent answering share
+```
+
+The score is their geometric mean: 1.0 is unchanged, and `ORR_DEGRADATION_THRESHOLD`
+(default `0.6`) is the line. One vital at 21% of baseline trips it, two vitals at
+46% each trip it, and all three at 60% each trip it — a single wobble does not
+spend a benchmark, but a real sag in more than one vital does. A provider needs
+`ORR_DEGRADATION_MIN_SAMPLES` answered requests in the window before it is judged
+at all, and a provider with no earlier traffic has no baseline, so nothing
+happens. Benchmark pings never enter the comparison: they are a fixed 16-token
+round whose throughput and latency describe the benchmark, not the client.
+
+A trip runs one bounded catalog refresh and benchmark — the same path provider
+failure recovery uses, spending real OpenRouter requests. `ORR_DEGRADATION_COOLDOWN`
+(default `10m`) is the minimum gap between attempts for one model, and
+`ORR_DEGRADATION_TIMEOUT` (default `10s`) bounds how long that attempt may take.
+The convicted provider's pooled benchmark rounds are dropped before that run, so
+ranking weighs what it does now instead of a week of healthy pings that no longer
+describe it. Ranking still decides the winner under the current speed/price stop,
+including its 5% switch threshold, so a benchmark that finds nothing better
+leaves the pin alone.
+
+Press `d` to turn degradation recovery on or off; the Routing pane shows the
+switch under the speed/price control, with its threshold and window while it is
+on. `ORR_DEGRADATION` seeds the state on every start until you press `d`; from
+then on the saved switch wins, the same rule the speed/price stop follows. Until
+it has been toggled it is not written to the stats file at all, so the variable
+keeps working on installs that never press the key. On a fresh state degradation
+recovery starts on.
 
 GPQA, Tau, tool-call success, and JSON success contribute equally to quality.
 GPQA and Tau are fractions; success is one minus the published error percentage
@@ -201,15 +328,15 @@ Quality cannot bypass latency tiers or provider health exclusions. A current
 eligible automatic pin stays until a challenger improves the adjusted score
 by at least 5%. Manual pins remain authoritative.
 
-Quality data loads alongside provider benchmarks even without the dashboard,
-shares a 15-minute cache with the dashboard, and uses the benchmark's remaining
-deadline (at most 10 seconds). Automatic provider tests stop at 70% completion
-or the three-second gate; quality fetching may use the rest of that gate before
-selection. Unavailable or expired quality data uses the neutral adjustment.
-Failed or cancelled fetches do not start a new cache lifetime: the next benchmark
-can retry immediately, and the dashboard retries after 30 seconds. The dashboard
-uses the shared data's original fetch timestamp. Pressing `r` invalidates quality
-data, including results from fetches already in flight.
+Quality data loads alongside provider benchmarks even without the dashboard and
+shares a 15-minute cache with the dashboard. It is not on the selection path:
+the ranking applies the measurements as soon as the pings finish, so a slow
+quality fetch cannot delay the pin. Unavailable or expired quality data uses the
+neutral adjustment. Failed or cancelled fetches do not start a new cache
+lifetime: the next benchmark can retry immediately, and the dashboard retries
+after 30 seconds. The dashboard uses the shared data's original fetch timestamp.
+Pressing `r` invalidates quality data, including results from fetches already in
+flight.
 
 ## Integrations
 
@@ -312,6 +439,12 @@ imported into `~/.kimi-code/config.toml`; the provider's `api_key` comes from
 | `ORR_LOG_REQUESTS` | `true` | Emit completed request lines in plain-log mode. |
 | `ORR_UPDATE_MAX_PROVIDERS` | `20` | Maximum providers kept after a refresh. |
 | `ORR_UPDATE_CACHE_ONLY` | `false` | Prefer only prompt-cache-capable providers. |
+| `ORR_DEGRADATION` | `true` | Seed the degradation recovery switch; the last `d` press wins over it. |
+| `ORR_DEGRADATION_THRESHOLD` | `0.6` | Share of a provider's own baseline vitals that still counts as healthy. |
+| `ORR_DEGRADATION_WINDOW` | `2m` | How long the drop must hold; positive and shorter than the 30m baseline. |
+| `ORR_DEGRADATION_MIN_SAMPLES` | `3` | Answered requests required in the window before vitals are judged. |
+| `ORR_DEGRADATION_COOLDOWN` | `10m` | Minimum gap between recovery benchmarks for one model; must be positive. |
+| `ORR_DEGRADATION_TIMEOUT` | `10s` | How long one recovery refresh and benchmark may take. |
 
 `OPENROUTER_API_KEY` also enables benchmarks, usage tracking, and account
 metrics. Client requests still use the client’s own authorization header.

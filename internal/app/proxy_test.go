@@ -764,10 +764,11 @@ func TestProxyTestProviderMeasuresTPSAndLatency(t *testing.T) {
 	if sample.samples != 2 {
 		t.Fatalf("samples = %d, want 2", sample.samples)
 	}
-	// Test rounds are billed requests: they must be recorded into stats.
+	// Test rounds are billed requests: they must be recorded into stats, while
+	// staying out of the client request counters.
 	snap := p.stats.snapshot()
-	if snap.RequestCount != 2 || len(snap.Records) != 2 {
-		t.Fatalf("stats request count = %d, records = %d, want 2 each", snap.RequestCount, len(snap.Records))
+	if len(snap.Records) != 2 || snap.RequestCount != 0 {
+		t.Fatalf("stats records = %d request count = %d, want 2 recorded rounds and no client requests", len(snap.Records), snap.RequestCount)
 	}
 	for _, record := range snap.Records {
 		if record.Model != "moonshotai/kimi-k2.5" || record.Provider != "fireworks" {
@@ -1613,7 +1614,11 @@ func TestRateLimitRecoveryCoalescedWithDailyRunStartsCooldown(t *testing.T) {
 	}
 }
 
-func TestDailyBenchmarkReleasesAtSeventyPercentAndCancelsRemainder(t *testing.T) {
+// A daily run ends at its deadline, not at a completion share: it waits for
+// every provider the budget allows and cancels whoever is still running. The
+// providers that answered are ranked; the ones that were canceled contribute
+// nothing but their own missing row.
+func TestDailyBenchmarkWaitsForTheDeadlineAndCancelsTheRest(t *testing.T) {
 	const model = "author/model"
 	providers := []string{"p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"}
 	cfg := testConfig("https://upstream.test/api/v1")
@@ -1623,6 +1628,7 @@ func TestDailyBenchmarkReleasesAtSeventyPercentAndCancelsRemainder(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	p.dailyGate = 300 * time.Millisecond
 	blocked := make(chan struct{})
 	scores := map[string]float64{"p0": 1, "p1": 2, "p2": 3, "p3": 4, "p4": 5, "p5": 6, "p6": 7, "p7": 8, "p8": 9, "p9": 10}
 	p.dailyTestProvider = func(ctx context.Context, _, provider string, _ int) (providerTestSample, error) {
@@ -1640,6 +1646,7 @@ func TestDailyBenchmarkReleasesAtSeventyPercentAndCancelsRemainder(t *testing.T)
 	close(refreshDone)
 	ready := make(chan struct{})
 	done := make(chan struct{})
+	started := time.Now()
 	p.dailyWG.Add(1)
 	go func() {
 		p.runDailyBenchmark(model, refreshDone, ready)
@@ -1648,8 +1655,11 @@ func TestDailyBenchmarkReleasesAtSeventyPercentAndCancelsRemainder(t *testing.T)
 
 	select {
 	case <-ready:
-	case <-time.After(time.Second):
-		t.Fatal("daily gate did not release after 70% completed")
+	case <-time.After(2 * time.Second):
+		t.Fatal("daily gate never released")
+	}
+	if elapsed := time.Since(started); elapsed < p.dailyGate {
+		t.Fatalf("run finished after %v, before its %v deadline: a completion share ended it", elapsed, p.dailyGate)
 	}
 	select {
 	case <-done:
@@ -1660,12 +1670,6 @@ func TestDailyBenchmarkReleasesAtSeventyPercentAndCancelsRemainder(t *testing.T)
 	if partial.Order[0] != "p6" {
 		t.Fatalf("partial best = %q, want p6", partial.Order[0])
 	}
-
-	close(blocked)
-	final, _ := p.routing.modelConfig(model)
-	if final.Order[0] != "p6" {
-		t.Fatalf("final best = %q, want p6 from completed results", final.Order[0])
-	}
 	if provider, manual := p.routing.pinInfo(model); provider != "p6" || manual {
 		t.Fatalf("daily benchmark pin = %q manual=%v, want automatic p6 pin", provider, manual)
 	}
@@ -1674,23 +1678,7 @@ func TestDailyBenchmarkReleasesAtSeventyPercentAndCancelsRemainder(t *testing.T)
 	}
 }
 
-func TestAutomaticBenchmarkCompletionTargetsRoundUpToSeventyPercent(t *testing.T) {
-	tests := []struct {
-		providers int
-		want      int
-	}{
-		{0, 0}, {1, 1}, {2, 2}, {3, 3}, {4, 3}, {7, 5}, {10, 7}, {20, 14},
-	}
-	for _, tt := range tests {
-		t.Run(fmt.Sprintf("providers_%d", tt.providers), func(t *testing.T) {
-			if got := benchmarkCompletionTarget(tt.providers, true); got != tt.want {
-				t.Fatalf("automatic target = %d, want %d", got, tt.want)
-			}
-			if got := benchmarkCompletionTarget(tt.providers, false); got != tt.providers {
-				t.Fatalf("manual target = %d, want all %d", got, tt.providers)
-			}
-		})
-	}
+func TestDailyBenchmarkGateStaysThreeSeconds(t *testing.T) {
 	if dailyBenchmarkGate != 3*time.Second {
 		t.Fatalf("production daily benchmark gate = %v, want exactly 3s", dailyBenchmarkGate)
 	}
@@ -1880,7 +1868,7 @@ func TestAutomaticProviderBenchmarkStartsAllAndCancelsWorkers(t *testing.T) {
 	providers := []string{"p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"}
 	results, reachedThreshold := p.benchmarkProviders("author/model", providers, time.Now().Add(25*time.Millisecond), true, len(providers))
 	if reachedThreshold {
-		t.Fatal("benchmark reported 70% completion after every worker was canceled")
+		t.Fatal("benchmark reported full completion after every worker was canceled")
 	}
 	if len(results) != 0 {
 		t.Fatalf("canceled benchmark returned results: %v", results)
@@ -1941,7 +1929,7 @@ func TestStopDailyBenchmarksPreventsNewWork(t *testing.T) {
 	p.waitForDailyBenchmarks()
 }
 
-func TestManualProviderBenchmarkTargetsEveryProvider(t *testing.T) {
+func TestProviderBenchmarkTargetsEveryProvider(t *testing.T) {
 	p, err := newProxy(testConfig("https://upstream.test/api/v1"))
 	if err != nil {
 		t.Fatal(err)
@@ -1951,13 +1939,98 @@ func TestManualProviderBenchmarkTargetsEveryProvider(t *testing.T) {
 	}
 	providers := []string{"p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"}
 
+	// Automatic and manual runs share one rule now: measure the whole field or
+	// run out of budget.
 	automatic, reachedTarget := p.benchmarkProviders("author/model", providers, time.Now().Add(time.Second), true, len(providers))
-	if !reachedTarget || len(automatic) != 7 {
-		t.Fatalf("automatic results = %d target=%v, want 7 at 70%%", len(automatic), reachedTarget)
+	if !reachedTarget || len(automatic) != len(providers) {
+		t.Fatalf("automatic results = %d target=%v, want all %d", len(automatic), reachedTarget, len(providers))
 	}
 	manual, reachedTarget := p.benchmarkProviders("author/model", providers, time.Now().Add(time.Second), false, len(providers))
 	if !reachedTarget || len(manual) != len(providers) {
 		t.Fatalf("manual results = %d target=%v, want all %d", len(manual), reachedTarget, len(providers))
+	}
+}
+
+// Measurement follows the models requests name, and a stale run is what asks for
+// a new one: a model whose last run is older than the freshness window is
+// measured on the request path, a model measured moments ago is not, and no
+// other model is touched either way.
+func TestRequestMeasuresAModelWhoseRunIsStale(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.OpenRouterAPIKey = "sk-test"
+	cfg.Models = map[string]providerConfig{model: {Order: []string{"provider"}, UpdatedAt: time.Now()}}
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.client.Transport = degradationCatalogTransport("provider")
+	var benchmarks atomic.Int32
+	p.dailyTestProvider = func(context.Context, string, string, int) (providerTestSample, error) {
+		benchmarks.Add(1)
+		return pingSample(100, time.Millisecond), nil
+	}
+	p.stats.markBenchmarkRun(model, p.now().Add(-time.Hour))
+
+	ready := p.prepareDailyModel(model)
+	if ready == nil {
+		t.Fatal("a request for a model whose measurement is an hour old did not start a run")
+	}
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run never finished")
+	}
+	p.waitForDailyBenchmarks()
+	if got := benchmarks.Load(); got == 0 {
+		t.Fatal("the run measured nothing")
+	}
+	if !p.stats.benchmarkedWithin(model, p.now(), benchmarkFreshness) {
+		t.Fatal("the run did not record its benchmark")
+	}
+	if again := p.prepareDailyModel(model); again != nil {
+		p.waitForDailyBenchmarks()
+		t.Fatal("the next request started a second run for a model just measured")
+	}
+}
+
+// A refresh that outlives the gate must not consume the budget the pings need:
+// the run refreshes, then measures on a fresh clock. Otherwise a model whose
+// catalog is slow keeps its refreshed order and is never measured at all.
+func TestSlowRefreshStillBenchmarksProviders(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.OpenRouterAPIKey = "sk-test"
+	cfg.Models = map[string]providerConfig{model: {Order: []string{"slow-catalog"}, UpdatedAt: time.Now()}}
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.dailyGate = 100 * time.Millisecond
+	var benchmarks atomic.Int32
+	p.dailyTestProvider = func(context.Context, string, string, int) (providerTestSample, error) {
+		benchmarks.Add(1)
+		return pingSample(100, 100*time.Millisecond), nil
+	}
+	refreshDone := make(chan struct{})
+	ready := make(chan struct{})
+	slowRefresh := make(chan struct{})
+	go func() {
+		defer close(slowRefresh)
+		time.Sleep(250 * time.Millisecond)
+		close(refreshDone)
+	}()
+	p.dailyWG.Add(1)
+	go p.runDailyBenchmark(model, refreshDone, ready)
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("gate was never released behind a slow refresh")
+	}
+	<-slowRefresh
+	p.waitForDailyBenchmarks()
+	if got := benchmarks.Load(); got == 0 {
+		t.Fatal("a refresh slower than the gate left the providers unmeasured")
 	}
 }
 
@@ -2113,9 +2186,11 @@ func TestProxyTestProviderToleratesOneFailedRound(t *testing.T) {
 	if sample.tps <= 0 || sample.ttft <= 0 {
 		t.Fatalf("sample = %+v, want usable measurements", sample)
 	}
-	// Every round is a billed request, failures included.
-	if snap := p.stats.snapshot(); snap.RequestCount != 3 {
-		t.Fatalf("recorded requests = %d, want 3", snap.RequestCount)
+	// Every round is a recorded, billed request, failures included — but a ping
+	// is orr's own probe, so it stays out of the client request counters.
+	snap := p.stats.snapshot()
+	if len(snap.Records) != 3 || snap.RequestCount != 0 {
+		t.Fatalf("records = %d request count = %d, want 3 recorded rounds and no client requests", len(snap.Records), snap.RequestCount)
 	}
 }
 

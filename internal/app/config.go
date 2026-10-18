@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -26,11 +27,28 @@ type config struct {
 	UpdateMaxProviders         int
 	UpdateCacheOnly            bool
 	RateLimitFailoverThreshold int
+	Degradation                *bool
+	DegradationThreshold       float64
+	DegradationWindow          time.Duration
+	DegradationMinSamples      int
+	DegradationCooldown        time.Duration
+	DegradationTimeout         time.Duration
 	providersPath              string
 	preferEnvFile              bool
 }
 
 const defaultRateLimitFailoverThreshold = 2
+
+// Degradation recovery ships on: it only ever acts on an automatic pin, and
+// its cooldown bounds how often it may spend a benchmark. The threshold is the
+// share of a provider's own baseline vitals that still counts as healthy.
+const (
+	defaultDegradationThreshold  = 0.6
+	defaultDegradationWindow     = 2 * time.Minute
+	defaultDegradationMinSamples = 3
+	defaultDegradationCooldown   = 10 * time.Minute
+	defaultDegradationTimeout    = 10 * time.Second
+)
 
 type providersFile struct {
 	Version int                       `yaml:"version"`
@@ -74,6 +92,11 @@ func loadConfigWithOptions(envPath string, preferEnvFile bool) (config, error) {
 		UpdateMaxProviders:         20,
 		UpdateCacheOnly:            false,
 		RateLimitFailoverThreshold: defaultRateLimitFailoverThreshold,
+		DegradationThreshold:       defaultDegradationThreshold,
+		DegradationWindow:          defaultDegradationWindow,
+		DegradationMinSamples:      defaultDegradationMinSamples,
+		DegradationCooldown:        defaultDegradationCooldown,
+		DegradationTimeout:         defaultDegradationTimeout,
 		preferEnvFile:              preferEnvFile,
 	}
 
@@ -129,6 +152,48 @@ func loadConfigWithOptions(envPath string, preferEnvFile bool) (config, error) {
 			return config{}, fmt.Errorf("parse ORR_429_FAILOVER_THRESHOLD: must be a positive integer")
 		}
 		cfg.RateLimitFailoverThreshold = parsed
+	}
+	if raw := value("ORR_DEGRADATION"); raw != "" {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			return config{}, fmt.Errorf("parse ORR_DEGRADATION: %w", err)
+		}
+		cfg.Degradation = &parsed
+	}
+	if raw := value("ORR_DEGRADATION_THRESHOLD"); raw != "" {
+		parsed, err := strconv.ParseFloat(raw, 64)
+		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed <= 0 || parsed > 1 {
+			return config{}, fmt.Errorf("parse ORR_DEGRADATION_THRESHOLD: must be a fraction above 0 and at most 1")
+		}
+		cfg.DegradationThreshold = parsed
+	}
+	if raw := value("ORR_DEGRADATION_WINDOW"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return config{}, fmt.Errorf("parse ORR_DEGRADATION_WINDOW: %w", err)
+		}
+		cfg.DegradationWindow = parsed
+	}
+	if raw := value("ORR_DEGRADATION_MIN_SAMPLES"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 {
+			return config{}, fmt.Errorf("parse ORR_DEGRADATION_MIN_SAMPLES: must be a positive integer")
+		}
+		cfg.DegradationMinSamples = parsed
+	}
+	if raw := value("ORR_DEGRADATION_COOLDOWN"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return config{}, fmt.Errorf("parse ORR_DEGRADATION_COOLDOWN: %w", err)
+		}
+		cfg.DegradationCooldown = parsed
+	}
+	if raw := value("ORR_DEGRADATION_TIMEOUT"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return config{}, fmt.Errorf("parse ORR_DEGRADATION_TIMEOUT: %w", err)
+		}
+		cfg.DegradationTimeout = parsed
 	}
 	cfg.OpenRouterAPIKey = value("OPENROUTER_API_KEY")
 
@@ -278,6 +343,16 @@ func (c config) openRouterKey() string {
 	return strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY"))
 }
 
+// degradationDefault is the state degradation recovery starts in before any dashboard
+// keystroke has been saved. ORR_DEGRADATION seeds it; an unset variable leaves
+// the feature on.
+func (c config) degradationDefault() bool {
+	if c.Degradation != nil {
+		return *c.Degradation
+	}
+	return true
+}
+
 func (c config) validate() error {
 	if strings.TrimSpace(c.Listen) == "" {
 		return fmt.Errorf("listen cannot be empty")
@@ -294,6 +369,21 @@ func (c config) validate() error {
 	}
 	if c.RateLimitFailoverThreshold < 1 {
 		return fmt.Errorf("ORR_429_FAILOVER_THRESHOLD must be at least 1")
+	}
+	if c.DegradationThreshold <= 0 || c.DegradationThreshold > 1 {
+		return fmt.Errorf("ORR_DEGRADATION_THRESHOLD must be above 0 and at most 1")
+	}
+	if c.DegradationWindow <= 0 || c.DegradationWindow >= degradationBaselineWindow {
+		return fmt.Errorf("ORR_DEGRADATION_WINDOW must be positive and shorter than the %s baseline window", degradationBaselineWindow)
+	}
+	if c.DegradationMinSamples < 1 {
+		return fmt.Errorf("ORR_DEGRADATION_MIN_SAMPLES must be at least 1")
+	}
+	if c.DegradationCooldown <= 0 {
+		return fmt.Errorf("ORR_DEGRADATION_COOLDOWN must be positive")
+	}
+	if c.DegradationTimeout <= 0 {
+		return fmt.Errorf("ORR_DEGRADATION_TIMEOUT must be positive")
 	}
 	for model, provider := range c.Models {
 		parts := strings.SplitN(model, "/", 2)

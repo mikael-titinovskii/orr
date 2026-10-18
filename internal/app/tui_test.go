@@ -99,23 +99,35 @@ func TestComputeScoresSevenProviderPriceDistribution(t *testing.T) {
 	}
 }
 
-func TestDisplayMonthSpendNeverFallsBelowLocalSpend(t *testing.T) {
+func TestDisplayMonthSpendPrefersPolledKeySpend(t *testing.T) {
 	now := time.Date(2026, time.August, 29, 12, 0, 0, 0, time.UTC)
 	snap := statsSnapshot{
 		DailyCosts:  map[string]float64{"2026-08-29": 1.9},
 		CreditSpend: .7,
 		CreditMonth: "2026-08",
 	}
-	if got := displayMonthSpend(snap, now); got != 1.9 {
-		t.Fatalf("display month spend = %v, want 1.9", got)
+	if got := displayMonthSpend(snap, now); got != .7 {
+		t.Fatalf("polled key spend = %v, want .7", got)
 	}
 	snap.CreditSpend = 2.1
 	if got := displayMonthSpend(snap, now); got != 2.1 {
-		t.Fatalf("exact month spend = %v, want 2.1", got)
+		t.Fatalf("polled key spend = %v, want 2.1", got)
 	}
 	snap.CreditMonth = "2026-07"
 	if got := displayMonthSpend(snap, now); got != 1.9 {
 		t.Fatalf("stale credit spend = %v, want local spend 1.9", got)
+	}
+	snap.CreditMonth = "2026-08"
+	snap.CreditSpend = 0
+	// A poll answers with this month even when the key has spent nothing since
+	// the billing reset; that zero is the cap's own figure, not a missing poll.
+	if got := displayMonthSpend(snap, now); got != 0 {
+		t.Fatalf("polled zero spend = %v, want the polled 0", got)
+	}
+	// With no poll for this month the proxy's own accounting is the fallback.
+	snap.CreditMonth = ""
+	if got := displayMonthSpend(snap, now); got != 1.9 {
+		t.Fatalf("unpolled key = %v, want local spend 1.9", got)
 	}
 }
 
@@ -177,6 +189,26 @@ func TestRenderHistoryPerDayShowsRecentPersistedDays(t *testing.T) {
 	}
 	if strings.Contains(got, "History per day") {
 		t.Fatalf("history title was not renamed:\n%s", got)
+	}
+}
+
+// Token counts stay in millions until a thousand of them would be printed, at
+// which point billions read better than "1478.16m".
+func TestFormatDailyTokensSwitchesToBillions(t *testing.T) {
+	for _, test := range []struct {
+		tokens int64
+		want   string
+	}{
+		{0, ""},
+		{250_000, "0.25m"},
+		{999_000_000, "999.00m"},
+		{999_994_999, "999.99m"},
+		{999_995_000, "1.00b"},
+		{1_478_160_000, "1.48b"},
+	} {
+		if got := formatDailyTokens(test.tokens); got != test.want {
+			t.Fatalf("formatDailyTokens(%d) = %q, want %q", test.tokens, got, test.want)
+		}
 	}
 }
 
@@ -526,7 +558,7 @@ func TestRenderLogTableAlignsColumnsAndTruncatesCells(t *testing.T) {
 	now := time.Date(2026, time.August, 29, 12, 0, 0, 0, time.UTC)
 	record := requestRecord{
 		Time: now, Model: "very/long/model/name/with/a/long/suffix", Provider: "provider", Status: 200,
-		Duration: 1250 * time.Millisecond, PromptTokens: 1200, CachedTokens: 600, CompletionTokens: 3456,
+		Duration: 1250 * time.Millisecond, TTFT: 420 * time.Millisecond, PromptTokens: 1200, CachedTokens: 600, CompletionTokens: 3456,
 		Cost: 0.0123,
 	}
 	width := logTableMinWidth
@@ -538,10 +570,36 @@ func TestRenderLogTableAlignsColumnsAndTruncatesCells(t *testing.T) {
 	if !strings.Contains(row, "very/lon") || !strings.Contains(row, "…") {
 		t.Fatalf("long model was not truncated:\n%s", row)
 	}
-	for _, want := range []string{"Duration", "Tokens in", "Tokens in u", "Tokens out", "Think%", "Tok/s", "Cache read", "Cache write", "Cache%", "Reason"} {
+	if !strings.Contains(row, "420") {
+		t.Fatalf("latency (time to first token) was not rendered as milliseconds:\n%s", row)
+	}
+	for _, want := range []string{"Duration", "In", "Uncached", "Out", "Think%", "Tp", "Lat", "CR", "CW", "C%", "Reason"} {
 		if !strings.Contains(header, want) {
 			t.Fatalf("missing table header %q:\n%s", want, header)
 		}
+	}
+	// Every label has to fit its column, or the header renders an ellipsis.
+	if strings.Contains(header, "…") {
+		t.Fatalf("table header was truncated:\n%s", header)
+	}
+}
+
+func TestRenderLogTableFitsRequestedWidth(t *testing.T) {
+	record := requestRecord{Time: time.Date(2026, time.September, 21, 16, 22, 17, 0, time.UTC), Model: "model", Provider: "provider", Status: 200}
+	// Past the width at which the model and provider columns hit their caps the
+	// table is narrower than the pane, but it must never be wider than it.
+	for width := logTableMinWidth; width <= 260; width++ {
+		if got := lipgloss.Width(renderLogRows([]requestRecord{record}, width)); got > width {
+			t.Fatalf("row width at %d = %d, overflows the pane", width, got)
+		}
+		if got := lipgloss.Width(renderLogTableHeader(width)); got > width {
+			t.Fatalf("header width at %d = %d, overflows the pane", width, got)
+		}
+	}
+	// At the threshold both variable columns are still growing, so the table has
+	// to fill the pane exactly.
+	if got := lipgloss.Width(renderLogRows([]requestRecord{record}, logTableMinWidth)); got != logTableMinWidth {
+		t.Fatalf("row width at the threshold = %d, want %d", got, logTableMinWidth)
 	}
 }
 
@@ -563,19 +621,115 @@ func TestRenderLogTableNarrowFallbackAndErrorStyling(t *testing.T) {
 	}
 }
 
+func TestRenderLogTableRowShadesAlternatingColumns(t *testing.T) {
+	previous := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(previous)
+
+	_, shaded := logCellStyles(nil)
+	got := renderLogTableRow([]string{"a", "b", "c", "d"}, []int{2, 2, 2, 2}, nil)
+	if want := "a  b  c  d "; ansi.Strip(got) != want {
+		t.Fatalf("visible text = %q, want %q", ansi.Strip(got), want)
+	}
+	// The shading starts on the leading column and then alternates down the row.
+	if !strings.HasPrefix(got, shaded.Render("a ")) {
+		t.Fatalf("first column is not shaded:\n%q", got)
+	}
+	for _, cell := range []string{"b ", "d "} {
+		if strings.Contains(got, shaded.Render(cell)) {
+			t.Fatalf("column %q is shaded, want it plain:\n%q", cell, got)
+		}
+	}
+	if !strings.Contains(got, shaded.Render("c ")) {
+		t.Fatalf("column %q is not shaded:\n%q", "c ", got)
+	}
+}
+
+func TestPadCenter(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		width int
+		want  string
+	}{
+		{"2.8s", 9, "  2.8s   "},
+		{"73", 9, "   73    "},
+		{"Uncached", 9, "Uncached "},
+		{"abc", 3, "abc"},
+		{"abcd", 3, "abcd"},
+	} {
+		if got := padCenter(tc.value, tc.width); got != tc.want {
+			t.Fatalf("padCenter(%q, %d) = %q, want %q", tc.value, tc.width, got, tc.want)
+		}
+	}
+}
+
+func TestRenderLogTableRowCentersMetricColumns(t *testing.T) {
+	// Text columns keep their left alignment; Duration and everything after it
+	// are centered in their column.
+	want := "t" + strings.Repeat(" ", 3+1) + // right-padded to 4, then the separator
+		"m p r c" + strings.Repeat(" ", 1+2) + // separator, then 2 cells of centering
+		"2.8s" + strings.Repeat(" ", 3+1+3) + // 3 trailing, separator, 3 leading
+		"73" + strings.Repeat(" ", 4)
+	if got := ansi.Strip(renderLogTableRow(
+		[]string{"t", "m", "p", "r", "c", "2.8s", "73"},
+		[]int{4, 1, 1, 1, 1, 9, 9},
+		nil,
+	)); got != want {
+		t.Fatalf("visible text = %q, want %q", got, want)
+	}
+}
+
+func TestRenderLogTableShadesHeaderAndFailedRows(t *testing.T) {
+	previous := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(previous)
+
+	widths := logTableColumns(logTableMinWidth)
+	headerPlain, headerShaded := logCellStyles(dimStyle.GetForeground())
+	header := renderLogTableHeader(logTableMinWidth)
+	if want := headerShaded.Render(padRight("Time", widths[0])); !strings.HasPrefix(header, want) {
+		t.Fatalf("header first column is not shaded:\n%q", header)
+	}
+	if want := headerPlain.Render(padRight("Model", widths[1])); !strings.Contains(header, want) {
+		t.Fatalf("header second column is shaded, want it plain:\n%q", header)
+	}
+
+	// Same record either way, so any difference between the two rows is styling.
+	ok := requestRecord{Time: time.Now(), Model: "model", Provider: "provider", Status: 200}
+	failed := ok
+	failed.Err = true
+	errorRow := renderLogRows([]requestRecord{failed}, logTableMinWidth)
+	okRow := renderLogRows([]requestRecord{ok}, logTableMinWidth)
+	if ansi.Strip(errorRow) != ansi.Strip(okRow) {
+		t.Fatalf("styling changed visible text:\n%q\n%q", errorRow, okRow)
+	}
+	if n := strings.Count(errorRow, "38;5;203"); n != len(widths) {
+		t.Fatalf("red cell count = %d, want one per column:\n%q", n, errorRow)
+	}
+	// Half the columns are shaded; termenv folds the row's foreground and the
+	// stripe background into a single escape, so match on the color alone.
+	stripe := fmt.Sprintf("48;5;%s", logStripeColor)
+	if n := strings.Count(errorRow, stripe); n != len(widths)/2 {
+		t.Fatalf("shaded column count = %d, want %d:\n%q", n, len(widths)/2, errorRow)
+	}
+	if strings.Contains(okRow, "38;5;203") {
+		t.Fatalf("successful row is styled as an error:\n%q", okRow)
+	}
+}
+
 func TestLogCellFormatsPlainTokensAndSecondsDuration(t *testing.T) {
-	if got := logTokenValue(36000); got != "36000" {
-		t.Fatalf("logTokenValue = %q, want 36000", got)
+	if got := logTokenValue(36000); got != "36 000" {
+		t.Fatalf("logTokenValue = %q, want 36 000", got)
 	}
 	if got := logTokenValue(0); got != "" {
 		t.Fatalf("logTokenValue(0) = %q, want blank", got)
 	}
 	record := requestRecord{CachedTokens: 36000, CacheWriteTokens: 5000}
-	if got := logCacheReadText(record); got != "36000" {
-		t.Fatalf("logCacheReadText = %q, want 36000", got)
+	if got := logCacheReadText(record); got != "36 000" {
+		t.Fatalf("logCacheReadText = %q, want 36 000", got)
 	}
-	if got := logCacheWriteText(record); got != "5000" {
-		t.Fatalf("logCacheWriteText = %q, want 5000", got)
+	if got := logCacheWriteText(record); got != "5 000" {
+		t.Fatalf("logCacheWriteText = %q, want 5 000", got)
 	}
 	if got := logDurationText(2427 * time.Millisecond); got != "2.4s" {
 		t.Fatalf("logDurationText = %q, want 2.4s", got)
@@ -583,20 +737,50 @@ func TestLogCellFormatsPlainTokensAndSecondsDuration(t *testing.T) {
 	if got := logDurationText(0); got != "" {
 		t.Fatalf("logDurationText(0) = %q, want blank", got)
 	}
+	if got := logLatencyText(requestRecord{TTFT: 420 * time.Millisecond}); got != "420" {
+		t.Fatalf("logLatencyText = %q, want 420", got)
+	}
+	if got := logLatencyText(requestRecord{}); got != "" {
+		t.Fatalf("logLatencyText(0) = %q, want blank", got)
+	}
 }
 
 func TestLogUncachedText(t *testing.T) {
 	if got := logUncachedText(requestRecord{PromptTokens: 1200, CachedTokens: 600}); got != "600" {
 		t.Fatalf("logUncachedText = %q, want 600", got)
 	}
-	if got := logUncachedText(requestRecord{PromptTokens: 1200}); got != "1200" {
-		t.Fatalf("logUncachedText without cache = %q, want 1200", got)
+	if got := logUncachedText(requestRecord{PromptTokens: 1200}); got != "1 200" {
+		t.Fatalf("logUncachedText without cache = %q, want 1 200", got)
 	}
 	if got := logUncachedText(requestRecord{PromptTokens: 600, CachedTokens: 600}); got != "" {
 		t.Fatalf("fully cached input should render as blank, got %q", got)
 	}
 	if got := logUncachedText(requestRecord{}); got != "" {
 		t.Fatalf("no tokens should render as blank, got %q", got)
+	}
+}
+
+func TestGroupDigits(t *testing.T) {
+	cases := map[int]string{
+		0: "0", 7: "7", 999: "999", 1000: "1 000", 1243: "1 243",
+		12345: "12 345", 6591173: "6 591 173", 1000000: "1 000 000",
+		-1234: "-1 234",
+	}
+	for value, want := range cases {
+		if got := groupDigits(value); got != want {
+			t.Fatalf("groupDigits(%d) = %q, want %q", value, got, want)
+		}
+	}
+}
+
+func TestLogThroughputText(t *testing.T) {
+	record := requestRecord{Duration: 2 * time.Second, TTFT: 250 * time.Millisecond, CompletionTokens: 1750}
+	// 1750 tokens over the 1.75s generation window = 1000 tok/s.
+	if got := logThroughputText(record); got != "1 000" {
+		t.Fatalf("logThroughputText = %q, want 1 000", got)
+	}
+	if got := logThroughputText(requestRecord{}); got != "0" {
+		t.Fatalf("logThroughputText with no generation = %q, want 0", got)
 	}
 }
 
@@ -1182,7 +1366,7 @@ func TestKeyTTestsSelectedProviderAndShowsResult(t *testing.T) {
 	if errorStyle.Render("x") != "x" {
 		var found bool
 		for _, line := range strings.Split(result.renderRouting(result.stats.snapshot(), 60, 20), "\n") {
-			if strings.Contains(line, "mTs") && strings.Contains(line, "120") {
+			if strings.Contains(line, "mTp") && strings.Contains(line, "120") {
 				found = true
 				if !strings.Contains(line, "\x1b[") {
 					t.Fatalf("test result cell is not color-coded:\n%q", line)
@@ -1574,20 +1758,164 @@ func TestRoutingViewDistinguishesDefaultFromPin(t *testing.T) {
 	routing.setCurrentModel(model)
 	dashboard := newDashboard(config{}, newStats(), routing)
 	dashboard.syncModel()
-	unpinned := dashboard.renderRouting(dashboard.stats.snapshot(), 40, 14)
+	unpinned := dashboard.renderRouting(dashboard.stats.snapshot(), 40, 15)
 	if !strings.Contains(unpinned, "Pin    \n") || strings.Contains(unpinned, "◆") {
 		t.Fatalf("default routing appears pinned:\n%s", unpinned)
 	}
 	routing.pin(model, "fireworks")
-	pinned := dashboard.renderRouting(dashboard.stats.snapshot(), 40, 14)
+	pinned := dashboard.renderRouting(dashboard.stats.snapshot(), 40, 15)
 	if !strings.Contains(pinned, "Pin    fireworks (manual)") || !strings.Contains(pinned, "◆") {
 		t.Fatalf("manual pin is not visible:\n%s", pinned)
 	}
 	routing.unpin(model)
 	routing.autoPin(model, "fireworks")
-	auto := dashboard.renderRouting(dashboard.stats.snapshot(), 40, 14)
+	auto := dashboard.renderRouting(dashboard.stats.snapshot(), 40, 15)
 	if !strings.Contains(auto, "Pin    fireworks (auto") || !strings.Contains(auto, "◈") {
 		t.Fatalf("auto pin is not visible:\n%s", auto)
+	}
+}
+
+func TestRoutingPaneProjectsSelectedProviderSpend(t *testing.T) {
+	const model = "moonshotai/kimi-k3"
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"fast", "cheap"}}}, time.Hour)
+	routing.setCurrentModel(model)
+	routing.endpointCache[model] = []endpointMeta{
+		{Tag: "fast", Pricing: endpointPricing{Prompt: 0.000001, Completion: 0.000004, InputCacheRead: 0.0000002}},
+		{Tag: "cheap", Pricing: endpointPricing{Prompt: 0.0000005, Completion: 0.000003, InputCacheRead: 0.0000001}},
+	}
+	stats := newStats()
+	now := time.Now()
+	stats.record(requestRecord{
+		Time: now.Add(-time.Minute), Model: model, Provider: "fast", Status: 200,
+		PromptTokens: 2000, CachedTokens: 1000, CompletionTokens: 1000,
+	})
+	// The whole 20M reference day is this model's: 2.5M tokens per active hour,
+	// split evenly across uncached input, cache reads, and output.
+	dashboard := newDashboard(config{}, stats, routing)
+	dashboard.syncModel()
+
+	header := func(width int) string {
+		t.Helper()
+		for _, line := range strings.Split(ansi.Strip(dashboard.renderRouting(stats.snapshot(), width, 24)), "\n") {
+			if strings.Contains(line, "Prediction") {
+				return line
+			}
+		}
+		return ""
+	}
+	dashboard.selection = 0
+	if got, want := header(190), "Prediction (p) 20m/d 400m/m  1h $0.68  8h $5.47  20d $109"; got != want {
+		t.Fatalf("routing pane projection = %q, want %q", got, want)
+	}
+	lines := strings.Split(ansi.Strip(dashboard.renderRouting(stats.snapshot(), 190, 24)), "\n")
+	for i, line := range lines {
+		if strings.Contains(line, "Order ") && strings.Contains(line, "Prediction") {
+			t.Fatalf("prediction shares the pin's line:\n%s", line)
+		}
+		if strings.Contains(line, "Prediction") && i > 0 && !strings.Contains(lines[i-1], "Degradation") {
+			t.Fatalf("prediction does not follow the degradation line:\n%s\n%s", lines[i-1], line)
+		}
+	}
+	dashboard.selection = 1
+	if got, want := header(190), "Prediction (p) 20m/d 400m/m  1h $0.36  8h $2.86  20d $57.14"; got != want {
+		t.Fatalf("projection after moving the selection = %q, want %q", got, want)
+	}
+	// A burst of traffic with a different token mix must not move the figure: the
+	// workload is fixed, so only the provider's prices can.
+	for i := 0; i < 20; i++ {
+		stats.record(requestRecord{
+			Time: now.Add(-time.Duration(i) * time.Second), Model: model, Provider: "cheap", Status: 200,
+			PromptTokens: 60_000, CachedTokens: 120_000, CompletionTokens: 300,
+		})
+	}
+	if got, want := header(190), "Prediction (p) 20m/d 400m/m  1h $0.36  8h $2.86  20d $57.14"; got != want {
+		t.Fatalf("projection drifted with traffic: %q, want %q", got, want)
+	}
+	if got := header(30); got != "" {
+		t.Fatalf("narrow pane kept a projection there is no room for:\n%s", got)
+	}
+
+	// A provider the account cannot route to publishes prices that are not on
+	// offer, so it gets no projection at all.
+	blocked := newRoutingState(map[string]providerConfig{model: {
+		Order:   []string{"fast", "cheap"},
+		Blocked: []blockedProvider{{Provider: "cheap", Reason: "guardrail", DetectedAt: now}},
+	}}, time.Hour)
+	blocked.setCurrentModel(model)
+	blocked.endpointCache[model] = routing.endpointCache[model]
+	dashboard = newDashboard(config{}, stats, blocked)
+	dashboard.syncModel()
+	dashboard.selection = 1
+	if got := header(190); got != "" {
+		t.Fatalf("routing header projected spend at a blocked provider:\n%s", got)
+	}
+}
+
+// A freshly started proxy has no traffic to take the split from, so the
+// projection comes from the reference request rather than waiting for the first
+// request to land.
+func TestRoutingPanePredictsBeforeAnyTraffic(t *testing.T) {
+	const model = "moonshotai/kimi-k3"
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"fast"}}}, time.Hour)
+	routing.setCurrentModel(model)
+	routing.endpointCache[model] = []endpointMeta{
+		{Tag: "fast", Pricing: endpointPricing{Prompt: 0.000001, Completion: 0.000004, InputCacheRead: 0.0000002}},
+	}
+	stats := newStats()
+	dashboard := newDashboard(config{}, stats, routing)
+	dashboard.syncModel()
+
+	// 2.5M tokens per active hour, split 2/21 uncached, 18/21 cached, and 1/21
+	// output by the reference request.
+	view := ansi.Strip(dashboard.renderRouting(stats.snapshot(), 190, 24))
+	if want := "Prediction (p) 20m/d 400m/m  1h $0.68  8h $5.47  20d $109"; !strings.Contains(view, want) {
+		t.Fatalf("routing pane has no cold-start projection %q:\n%s", want, view)
+	}
+}
+
+// 'p' walks the day the projection prices from 10m to 200m tokens in steps of
+// ten million, then wraps. The label and the prices move together, and the
+// choice is view state rather than settings, so nothing is persisted.
+func TestPredictionKeyCyclesWorkload(t *testing.T) {
+	const model = "moonshotai/kimi-k3"
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"fast"}}}, time.Hour)
+	routing.setCurrentModel(model)
+	routing.endpointCache[model] = []endpointMeta{
+		{Tag: "fast", Pricing: endpointPricing{Prompt: 0.000001, Completion: 0.000004, InputCacheRead: 0.0000002}},
+	}
+	dashboard := newDashboard(config{}, newStats(), routing)
+	dashboard.syncModel()
+
+	line := func() string {
+		t.Helper()
+		view := ansi.Strip(dashboard.renderRouting(dashboard.stats.snapshot(), 190, 24))
+		for _, candidate := range strings.Split(view, "\n") {
+			if strings.Contains(candidate, "Prediction") {
+				return candidate
+			}
+		}
+		return ""
+	}
+	if got, want := line(), "Prediction (p) 20m/d 400m/m  1h $0.68  8h $5.47  20d $109"; got != want {
+		t.Fatalf("initial projection = %q, want %q", got, want)
+	}
+	updated, _ := dashboard.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	dashboard = updated.(dashboardModel)
+	if got, want := line(), "Prediction (p) 30m/d 600m/m  1h $1.02  8h $8.20  20d $164"; got != want {
+		t.Fatalf("projection after one press = %q, want %q", got, want)
+	}
+	// The last stop is 200m, and one more press wraps back to the default.
+	for range predictionWorkloadSteps[2 : len(predictionWorkloadSteps)-1] {
+		updated, _ := dashboard.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+		dashboard = updated.(dashboardModel)
+	}
+	if got, want := line(), "Prediction (p) 200m/d 4b/m  1h $6.83  8h $54.66  20d $1093"; got != want {
+		t.Fatalf("projection at the last stop = %q, want %q", got, want)
+	}
+	updated, _ = dashboard.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	dashboard = updated.(dashboardModel)
+	if got, want := line(), "Prediction (p) 10m/d 200m/m  1h $0.34  8h $2.73  20d $54.66"; got != want {
+		t.Fatalf("projection after wrapping = %q, want %q", got, want)
 	}
 }
 
@@ -1629,8 +1957,8 @@ func TestRoutingViewCombinesSelectionAndProviderMetrics(t *testing.T) {
 	dashboard.selection = 1
 	routing.pin(model, "cheap")
 
-	got := dashboard.renderRouting(dashboard.stats.snapshot(), 140, 20)
-	for _, want := range []string{"Routing", "Provider", "Ts", "Lat", "mTs", "mLat", "TTFT", "mApi", "mTool", "◆ cheap", "100", "250", "Ts/mTs tok/s • Lat/mLat ms (m = measured) • GPQA/Tau OR benchmarks • Tool/Json OR weekly avg errors • mApi/mTool measured errors", "API P50: last 30m • website P50: 1 week"} {
+	got := dashboard.renderRouting(dashboard.stats.snapshot(), 170, 20)
+	for _, want := range []string{"Routing", "Provider", "Tp", "Lat", "mTp", "mLat", "mApi", "mTool", "◆ cheap", "100", "250"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("combined routing table missing %q:\n%s", want, got)
 		}
@@ -1659,17 +1987,335 @@ func TestRoutingViewCombinesSelectionAndProviderMetrics(t *testing.T) {
 	if !strings.Contains(medium, "Provider metrics") {
 		t.Fatalf("68-cell routing view did not use the compact layout:\n%s", medium)
 	}
-	for _, want := range []string{"Provider", "Cache", "Ts", "mTs", "Lat", "mLat", "TTFT", "mApi", "mTool"} {
+	for _, want := range []string{"Provider", "Cache", "Tp", "mTp", "Lat", "mLat", "mApi", "mTool"} {
 		if !strings.Contains(medium, want) {
 			t.Fatalf("68-cell routing table is missing %q:\n%s", want, medium)
 		}
 	}
 
 	narrow := dashboard.renderRouting(dashboard.stats.snapshot(), 36, 32)
-	for _, want := range []string{"mTs", "mLat", "Ts", "Lat", "TTFT", "mApi", "mTool", "100", "1250"} {
+	for _, want := range []string{"mTp", "mLat", "Tp", "Lat", "mApi", "mTool", "100", "250"} {
 		if !strings.Contains(ansi.Strip(narrow), want) {
 			t.Fatalf("narrow routing view missing %q:\n%s", want, narrow)
 		}
+	}
+}
+
+func TestProviderTableOrderKeyCyclesColumns(t *testing.T) {
+	const model = "moonshotai/kimi-k3"
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"fast", "cheap"}}}, time.Hour)
+	routing.setCurrentModel(model)
+	stats := newStats()
+	dashboard := newDashboard(config{}, stats, routing)
+	dashboard.syncModel()
+
+	header := func() string {
+		t.Helper()
+		for _, line := range strings.Split(ansi.Strip(dashboard.renderRouting(stats.snapshot(), 170, 20)), "\n") {
+			if strings.Contains(line, "Order ") {
+				return line
+			}
+		}
+		return ""
+	}
+	if got := header(); !strings.Contains(got, "Order Default (o)") {
+		t.Fatalf("routing header does not name the routing order:\n%s", got)
+	}
+	want := []providerSortColumn{
+		providerSortInput, providerSortOutput, providerSortCache, providerSortThroughput,
+		providerSortMeasuredThroughput, providerSortLatency, providerSortMeasuredLatency,
+		providerSortGPQA, providerSortTau, providerSortToolError, providerSortJSONError,
+		providerSortAPIError, providerSortMeasuredToolError, providerSortRoute,
+	}
+	for _, column := range want {
+		updated, _ := dashboard.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+		dashboard = updated.(dashboardModel)
+		if dashboard.providerSort != column {
+			t.Fatalf("after o: sort = %d, want %d", dashboard.providerSort, column)
+		}
+		if got := header(); !strings.Contains(got, "Order "+column.label()+" (o)") {
+			t.Fatalf("routing header does not name %q:\n%s", column.label(), got)
+		}
+	}
+}
+
+func TestProviderTableOrderSortsRowsWithoutTouchingRouting(t *testing.T) {
+	const model = "moonshotai/kimi-k3"
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"fast", "cheap"}}}, time.Hour)
+	routing.setCurrentModel(model)
+	routing.endpointCache[model] = []endpointMeta{
+		{
+			Tag:        "fast",
+			Pricing:    endpointPricing{Prompt: 0.000002, Completion: 0.000008, InputCacheRead: 0.0000004},
+			Throughput: 120,
+			Latency:    300,
+		},
+		{
+			Tag:        "cheap",
+			Pricing:    endpointPricing{Prompt: 0.0000005, Completion: 0.000002, InputCacheRead: 0.0000001},
+			Throughput: 60,
+			Latency:    500,
+		},
+	}
+	stats := newStats()
+	dashboard := newDashboard(config{}, stats, routing)
+	dashboard.syncModel()
+
+	press := func(key string) {
+		t.Helper()
+		updated, _ := dashboard.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+		dashboard = updated.(dashboardModel)
+	}
+	// wide renders the full metric table; compact renders one block per provider.
+	firstRow := func(width int) string {
+		t.Helper()
+		plain := ansi.Strip(dashboard.renderRouting(stats.snapshot(), width, 40))
+		fast, cheap := strings.Index(plain, "fast"), strings.Index(plain, "cheap")
+		switch {
+		case fast < 0 || cheap < 0:
+			t.Fatalf("routing table lost a provider at width %d:\n%s", width, plain)
+			return ""
+		case fast < cheap:
+			return "fast"
+		default:
+			return "cheap"
+		}
+	}
+	check := func(column providerSortColumn, want string) {
+		t.Helper()
+		if dashboard.providerSort != column {
+			t.Fatalf("sort = %d, want %d", dashboard.providerSort, column)
+		}
+		for _, width := range []int{170, 84} {
+			if got := firstRow(width); got != want {
+				t.Fatalf("%s order at width %d starts with %q, want %q:\n%s",
+					column.label(), width, got, want, ansi.Strip(dashboard.renderRouting(stats.snapshot(), width, 20)))
+			}
+		}
+		displayed := dashboard.providers()
+		if len(displayed) != 2 || displayed[0] != want {
+			t.Fatalf("%s order navigates %v, want %q first", column.label(), displayed, want)
+		}
+	}
+
+	check(providerSortRoute, "fast")
+	press("o") // In: the cheaper prompt price leads.
+	check(providerSortInput, "cheap")
+	press("o") // Out
+	check(providerSortOutput, "cheap")
+	press("o") // Cache
+	check(providerSortCache, "cheap")
+	press("o") // Tp: the higher catalog throughput leads.
+	check(providerSortThroughput, "fast")
+	press("o") // mTp: nothing measured yet, so the routing order still decides.
+	check(providerSortMeasuredThroughput, "fast")
+	press("o") // Lat: the lower catalog latency leads.
+	check(providerSortLatency, "fast")
+
+	if order := routing.providers(model, nil); len(order) != 2 || order[0] != "fast" {
+		t.Fatalf("display ordering rewrote the routing order: %v", order)
+	}
+	if pinned, _ := routing.pinInfo(model); pinned != "" {
+		t.Fatalf("display ordering pinned %q", pinned)
+	}
+}
+
+func TestProviderTableOrderKeepsSelectionOnProvider(t *testing.T) {
+	const model = "moonshotai/kimi-k3"
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"fast", "cheap"}}}, time.Hour)
+	routing.setCurrentModel(model)
+	routing.endpointCache[model] = []endpointMeta{
+		{Tag: "fast", Pricing: endpointPricing{Prompt: 0.000002}, Throughput: 120, Latency: 300},
+		{Tag: "cheap", Pricing: endpointPricing{Prompt: 0.0000005}, Throughput: 60, Latency: 500},
+	}
+	dashboard := newDashboard(config{}, newStats(), routing)
+	dashboard.syncModel()
+	dashboard.selection = 0
+
+	updated, _ := dashboard.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	dashboard = updated.(dashboardModel)
+	if dashboard.selection != 1 {
+		t.Fatalf("selection = %d after reordering, want the row now holding fast", dashboard.selection)
+	}
+	// The selection-bound keys follow the displayed rows: Enter pins the row
+	// under the cursor, not the routing order's index.
+	updated, _ = dashboard.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	dashboard = updated.(dashboardModel)
+	if pinned, manual := routing.pinInfo(model); pinned != "fast" || !manual {
+		t.Fatalf("Enter pinned %q (manual=%v), want fast", pinned, manual)
+	}
+}
+
+func TestProviderTableHighlightsSortedColumnName(t *testing.T) {
+	previous := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(previous)
+
+	const model = "moonshotai/kimi-k3"
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"fast", "cheap"}}}, time.Hour)
+	routing.setCurrentModel(model)
+	routing.endpointCache[model] = []endpointMeta{
+		{Tag: "fast", Pricing: endpointPricing{Prompt: 0.000002, Completion: 0.000008}, Throughput: 120, Latency: 300},
+		{Tag: "cheap", Pricing: endpointPricing{Prompt: 0.0000005, Completion: 0.000002}, Throughput: 60, Latency: 500},
+	}
+	dashboard := newDashboard(config{}, newStats(), routing)
+	dashboard.syncModel()
+
+	// The wide layout heads the table once, so the mark sits on the header cell.
+	tableHeader := func() string {
+		t.Helper()
+		for _, line := range strings.Split(dashboard.renderRouting(dashboard.stats.snapshot(), 170, 40), "\n") {
+			if strings.HasPrefix(ansi.Strip(line), "Provider") {
+				return line
+			}
+		}
+		t.Fatal("wide provider table header not found")
+		return ""
+	}
+	// styledCell returns the text style wraps on line, or "" when the line holds
+	// no span in that style.
+	styledCell := func(line string, style lipgloss.Style) string {
+		prefix, suffix := stylePrefixSuffix(style)
+		start := strings.Index(line, prefix)
+		if start < 0 {
+			return ""
+		}
+		rest := line[start+len(prefix):]
+		end := strings.Index(rest, suffix)
+		if end < 0 {
+			return ""
+		}
+		return strings.TrimSpace(rest[:end])
+	}
+	if line := tableHeader(); styledCell(line, keyHintStyle) != "" {
+		t.Fatalf("unsorted table marks %q:\n%q", styledCell(line, keyHintStyle), ansi.Strip(line))
+	} else if got := styledCell(line, dimStyle); got != "Provider" {
+		t.Fatalf("header label is %q, want the dim Provider:\n%q", got, ansi.Strip(line))
+	}
+
+	updated, _ := dashboard.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	dashboard = updated.(dashboardModel)
+	line := tableHeader()
+	if got := styledCell(line, keyHintStyle); got != "In" {
+		t.Fatalf("sorted column name is %q, want In:\n%q", got, ansi.Strip(line))
+	}
+
+	// The compact layout has no single header row, so each metric line heads
+	// itself and marks its own label.
+	marked, dimmed := false, false
+	for _, line := range strings.Split(dashboard.renderRouting(dashboard.stats.snapshot(), 68, 40), "\n") {
+		switch {
+		case strings.Contains(ansi.Strip(line), "Cache ") && styledCell(line, keyHintStyle) == "In":
+			marked = true
+		case strings.Contains(ansi.Strip(line), "Cache ") && styledCell(line, dimStyle) == "In":
+			dimmed = true
+		}
+	}
+	if !marked {
+		t.Fatal("compact layout does not highlight the sorted column")
+	}
+	if dimmed {
+		t.Fatal("compact layout dims the sorted column's label")
+	}
+}
+
+func TestKeyHintsUsePanelBorderColor(t *testing.T) {
+	previous := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(previous)
+
+	if got, want := keyHintStyle.GetForeground(), panelStyle.GetBorderTopForeground(); got != want {
+		t.Fatalf("key hint foreground = %v, want the panel border colour %v", got, want)
+	}
+
+	const model = "moonshotai/kimi-k3"
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"fast"}}}, time.Hour)
+	routing.setCurrentModel(model)
+	dashboard := newDashboard(config{}, newStats(), routing)
+	dashboard.syncModel()
+	view := dashboard.renderRouting(dashboard.stats.snapshot(), 120, 24)
+	prefix, _ := stylePrefixSuffix(keyHintStyle)
+	for _, hint := range []string{"  (←/→)", "  (d)", " (o)"} {
+		if !strings.Contains(ansi.Strip(view), hint) {
+			t.Fatalf("routing pane lost the %q hint:\n%s", hint, ansi.Strip(view))
+		}
+		if !strings.Contains(view, prefix+hint) {
+			t.Fatalf("routing pane does not colour %q like the panel border", hint)
+		}
+	}
+
+	// The hint lines that spell out the keys carry the same colour, but only on
+	// the key and its own parentheses; the explanation stays dim.
+	dashboard.width, dashboard.height = 120, 40
+	dashboard.resize()
+	whole := dashboard.View()
+	for _, hint := range []struct{ plain, styled, description string }{
+		{"(↑/↓) select", "(↑/↓)", "select"},
+		{"(PgUp/PgDn) scroll • (q) quit", "(PgUp/PgDn)", "scroll"},
+		{"(s) start/stop", "(s)", "start/stop"},
+	} {
+		if !strings.Contains(ansi.Strip(whole), hint.plain) {
+			t.Fatalf("dashboard lost the %q hint:\n%s", hint.plain, ansi.Strip(whole))
+		}
+		if !strings.Contains(whole, prefix+hint.styled) {
+			t.Fatalf("dashboard does not colour %q like the panel border", hint.styled)
+		}
+		if strings.Contains(whole, prefix+hint.description) {
+			t.Fatalf("dashboard paints the %q description with the key", hint.description)
+		}
+	}
+}
+
+func TestRoutingHeaderKeepsOrderIndicatorInsidePane(t *testing.T) {
+	const model, otherModel = "deepseek/deepseek-v4.1-flash", "moonshotai/kimi-k3"
+	stats := newStats()
+	stats.record(requestRecord{Time: time.Now(), Model: model, Provider: "cheap"})
+	stats.record(requestRecord{Time: time.Now().Add(-time.Minute), Model: otherModel, Provider: "p2"})
+	routing := newRoutingState(map[string]providerConfig{
+		model:      {Order: []string{"fast", "cheap"}},
+		otherModel: {Order: []string{"p2"}},
+	}, time.Hour)
+	routing.setCurrentModel(model)
+	routing.pin(model, "cheap")
+	dashboard := newDashboard(config{}, stats, routing)
+	dashboard.syncModel()
+	updated, _ := dashboard.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	dashboard = updated.(dashboardModel)
+
+	header := func(width int) string {
+		t.Helper()
+		for _, line := range strings.Split(ansi.Strip(dashboard.renderRouting(dashboard.stats.snapshot(), width, 24)), "\n") {
+			if strings.Contains(line, "Pin    ") {
+				return line
+			}
+		}
+		t.Fatalf("routing view at width %d has no pin line", width)
+		return ""
+	}
+	for _, width := range []int{36, 40, 48, 60, 80, 120} {
+		line := header(width)
+		if got := lipgloss.Width(line); got > width {
+			t.Fatalf("routing header is %d cells wide at width %d:\n%q", got, width, line)
+		}
+	}
+	// The counter, the order indicator, the model, and the pin appear in that
+	// order, so the two states read before the name they qualify.
+	wide := header(120)
+	positions := []string{"[1/2 Tab]", "Order In (o)", "Model  " + model, "Pin    cheap (manual)"}
+	previous := -1
+	for _, segment := range positions {
+		at := strings.Index(wide, segment)
+		if at < 0 {
+			t.Fatalf("wide routing header is missing %q:\n%q", segment, wide)
+		}
+		if at < previous {
+			t.Fatalf("routing header puts %q out of order:\n%q", segment, wide)
+		}
+		previous = at
+	}
+	// A narrow pane keeps the model and the pin, dropping the indicator first.
+	if line := header(40); strings.Contains(line, "Order ") || !strings.Contains(line, "Pin    cheap (manual)") {
+		t.Fatalf("narrow routing header kept the wrong labels:\n%q", line)
 	}
 }
 
@@ -1703,7 +2349,6 @@ func TestProviderTableScopesObservedMetricsToProvider(t *testing.T) {
 		for _, want := range []string{
 			errorStyle.Render("100.0%"),
 			lipgloss.NewStyle().Foreground(gradientColor(1)).Render("200"),
-			lipgloss.NewStyle().Foreground(gradientColor(0)).Render("1000"),
 		} {
 			if !strings.Contains(colored, want) {
 				t.Fatalf("missing colored metric %q at width %d: %q", want, width, colored)
@@ -1732,13 +2377,10 @@ func TestProviderTableScopesObservedMetricsToProvider(t *testing.T) {
 		t.Fatalf("expired API/tool error leaked into healthy row: %q", rows["healthy"])
 	}
 	if !strings.Contains(rows["healthy"], "200") {
-		t.Fatalf("healthy TTFT missing from its row: %q", rows["healthy"])
+		t.Fatalf("healthy mLat missing from its row: %q", rows["healthy"])
 	}
 	if got := strings.Count(rows["failing"], "100.0%"); got != 2 {
 		t.Fatalf("failing API/tool rates = %q, want two 100.0%% values:\n%s", rows["failing"], view)
-	}
-	if !strings.Contains(rows["failing"], "1000") {
-		t.Fatalf("failing TTFT missing from its row: %q", rows["failing"])
 	}
 	for _, field := range strings.Fields(rows["failing"]) {
 		if field == "0%" {
@@ -1749,10 +2391,10 @@ func TestProviderTableScopesObservedMetricsToProvider(t *testing.T) {
 
 func TestProviderTableUsesMetricSpecificWidths(t *testing.T) {
 	rows := [][]string{
-		{"Provider", "In", "Out", "Cache", "Ts", "mTs", "Lat", "mLat"},
+		{"Provider", "In", "Out", "Cache", "Tp", "mTp", "Lat", "mLat"},
 		{"  siliconflow/fp8", "0.15", "0.60", "0.020", "119", "138", "1040", "4623"},
 	}
-	const width = 68
+	const width = 100
 	columnWidths := providerTableColumnWidths(rows, width)
 	header := renderProviderTableRow(rows[0], columnWidths, width)
 	values := renderProviderTableRow(rows[1], columnWidths, width)
@@ -1779,10 +2421,10 @@ func TestProviderTableUsesMetricSpecificWidths(t *testing.T) {
 
 func TestExpandedProviderTableFitsAllConsolidatedMetrics(t *testing.T) {
 	rows := [][]string{
-		{"Provider", "In", "Out", "Cache", "Ts", "mTs", "Lat", "mLat", "TTFT", "mApi", "mTool"},
-		{"  provider", "0.15", "0.60", "0.020", "119", "138", "1040", "4623", "250", "100.0%", "100.0%"},
+		{"Provider", "In", "Out", "Cache", "Tp", "mTp", "Lat", "mLat", "mApi", "mTool"},
+		{"  provider", "0.15", "0.60", "0.020", "119", "138", "1040", "4623", "100.0%", "100.0%"},
 	}
-	const width = 85
+	const width = 140
 	columnWidths := providerTableColumnWidths(rows, width)
 	header := renderProviderTableRow(rows[0], columnWidths, width)
 	values := renderProviderTableRow(rows[1], columnWidths, width)
@@ -1921,8 +2563,8 @@ func TestProviderMeasuredMetricsRespectsTTL(t *testing.T) {
 	if tps != 75 { // Interpolated P50 of 50 and 100.
 		t.Fatalf("measured TPS = %v, want 75", tps)
 	}
-	if lat != 1300 { // Interpolated P50 of 1200ms and 1400ms.
-		t.Fatalf("measured Lat = %v, want 1300", lat)
+	if lat != 300 { // Interpolated P50 time to first token of 200ms and 400ms.
+		t.Fatalf("measured Lat = %v, want 300", lat)
 	}
 
 	tpsCheap, latCheap := providerMeasuredMetrics(records, model, "cheap", now)
@@ -1938,6 +2580,9 @@ func TestActiveModelsOrdersByRecencyWithinWindow(t *testing.T) {
 		{Time: now.Add(-30 * time.Second), Model: "c/d"},
 		{Time: now.Add(-11 * time.Minute), Model: "e/f"},
 		{Time: now.Add(-time.Minute), Model: "a/b"},
+		// A startup benchmark ping is not a request the user sent, so it must
+		// not open a tab for the model it measured.
+		{Time: now.Add(-10 * time.Second), Model: "g/h", Provider: "p", Status: 200, Benchmark: true},
 	}}
 	got := activeModels(snap, now)
 	want := []string{"c/d", "a/b"}
@@ -2046,7 +2691,7 @@ func TestRoutingShowsActiveModelCounter(t *testing.T) {
 	if !strings.Contains(got, "[1/2 Tab]") {
 		t.Fatalf("routing panel missing active model counter:\n%s", got)
 	}
-	if !strings.Contains(got, "Tab switch") {
+	if !strings.Contains(got, "(Tab) switch") {
 		t.Fatalf("routing panel missing Tab hint:\n%s", got)
 	}
 }
@@ -2103,9 +2748,9 @@ func TestRoutingTableKeepsMeasuredColumnsAlongsideRecentErrors(t *testing.T) {
 	now := time.Now()
 	for _, record := range []requestRecord{
 		// The provider answered, was rate-limited, and then recovered.
-		{Time: now.Add(-10 * time.Minute), Model: model, Provider: "failing", Status: 200, Duration: 2 * time.Second, CompletionTokens: 100},
+		{Time: now.Add(-10 * time.Minute), Model: model, Provider: "failing", Status: 200, TTFT: 2 * time.Second, Duration: 4 * time.Second, CompletionTokens: 100},
 		{Time: now.Add(-2 * time.Minute), Model: model, Provider: "failing", Status: 429, Err: true, Duration: 100 * time.Millisecond},
-		{Time: now.Add(-time.Minute), Model: model, Provider: "failing", Status: 200, Duration: 2 * time.Second, CompletionTokens: 100},
+		{Time: now.Add(-time.Minute), Model: model, Provider: "failing", Status: 200, TTFT: 2 * time.Second, Duration: 4 * time.Second, CompletionTokens: 100},
 		{Time: now.Add(-time.Minute), Model: model, Provider: "steady", Status: 200, Duration: 3 * time.Second, CompletionTokens: 150},
 	} {
 		stats.record(record)
@@ -2137,7 +2782,7 @@ func TestRoutingTableKeepsMeasuredColumnsAlongsideRecentErrors(t *testing.T) {
 		t.Fatalf("compact provider rows are missing:\n%s", compact)
 	}
 	failingBlock := compact[failingStart:steadyStart]
-	if !strings.Contains(failingBlock, "mTs 50") || !strings.Contains(failingBlock, "mLat 2000") {
+	if !strings.Contains(failingBlock, "mTp 50") || !strings.Contains(failingBlock, "mLat 2000") {
 		t.Fatalf("compact view erased successful measurements after a 429:\n%s", failingBlock)
 	}
 }
@@ -2166,5 +2811,710 @@ func TestCancelledRoundsAreNotAPIErrors(t *testing.T) {
 	api, _ := groupErrorRates(records)
 	if api != "33.3%" {
 		t.Fatalf("group API error rate = %q, want 33.3%% over the three answered requests, with the cancelled one ignored", api)
+	}
+}
+
+// The speed/price slider is the dashboard's live control over automatic
+// selection: each press re-picks the pin from measurements already held, and the
+// position is mirrored into stats so it outlives the process.
+func TestTimeWeightSliderMovesPinAndPersists(t *testing.T) {
+	previous := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(previous)
+
+	const model = "moonshotai/kimi-k3"
+	now := time.Now()
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"cheap", "fast"}}}, time.Hour)
+	routing.setCurrentModel(model)
+	routing.now = func() time.Time { return now }
+	routing.endpointCache[model] = []endpointMeta{
+		{Tag: "cheap", Pricing: testPricing(0.4, 1.6, 0.04)},
+		{Tag: "fast", Pricing: testPricing(1.5, 6, 0.15)},
+	}
+	stats := newStats()
+	stats.addBenchmarkSampleLocked(model, "cheap", benchmarkSample{Time: now, TPS: 200, TTFTms: 500})
+	stats.addBenchmarkSampleLocked(model, "fast", benchmarkSample{Time: now, TPS: 500, TTFTms: 150})
+	dashboard := newDashboard(config{}, stats, routing)
+	dashboard.syncModel()
+
+	press := func(key tea.KeyType, times int) {
+		t.Helper()
+		for range times {
+			updated, _ := dashboard.Update(tea.KeyMsg{Type: key})
+			dashboard = updated.(dashboardModel)
+		}
+	}
+	// The lit stop keeps the terminal's default foreground, like the model and
+	// pin labels, so the other names are the ones carrying the dim style.
+	dimPrefix, _ := stylePrefixSuffix(dimStyle)
+	assertLit := func(name string) {
+		t.Helper()
+		raw := dashboard.renderRouting(stats.snapshot(), 100, 24)
+		if !strings.Contains(ansi.Strip(raw), name) {
+			t.Fatalf("%q is missing from the control:\n%s", name, ansi.Strip(raw))
+		}
+		if strings.Contains(raw, dimPrefix+name) {
+			t.Fatalf("%q is dim, want the selected style:\n%s", name, ansi.Strip(raw))
+		}
+	}
+
+	// The control sits one blank line under the two key hint lines.
+	lines := strings.Split(ansi.Strip(dashboard.renderRouting(stats.snapshot(), 100, 24)), "\n")
+	hint, slider := -1, -1
+	for i, line := range lines {
+		if strings.Contains(line, "(↑/↓) select") {
+			hint = i
+		}
+		if strings.Contains(line, "Speed/price") {
+			slider = i
+		}
+	}
+	if hint < 0 || slider != hint+3 {
+		t.Fatalf("speed/price control is on line %d, want line %d, one blank line under the key hint lines:\n%s",
+			slider, hint+3, strings.Join(lines, "\n"))
+	}
+	if !strings.Contains(lines[slider], "price · balanced · performance") {
+		t.Fatalf("slider does not name its three stops: %q", lines[slider])
+	}
+	if !strings.Contains(lines[slider], "(←/→)") {
+		t.Fatalf("slider does not carry its own keys: %q", lines[slider])
+	}
+	// The hint no longer repeats the speed/price keys; the control line owns
+	// them, so they survive the hint truncating in a narrow pane.
+	if hintLine := ansi.Strip(lines[hint]); strings.Contains(hintLine, "speed/price") || strings.Contains(hintLine, "←/→") {
+		t.Fatalf("key hint still repeats the speed/price keys: %q", hintLine)
+	}
+	// The exponents are gone: the control offers named stops, and the current
+	// one is the only position the pane has to show.
+	assertLit("balanced")
+	// A pane too narrow for all three names keeps the current stop and its keys.
+	narrow := ansi.Strip(dashboard.renderRouting(stats.snapshot(), 28, 24))
+	if !strings.Contains(narrow, "balanced") || strings.Contains(narrow, " · ") || !strings.Contains(narrow, "(←/→)") {
+		t.Fatalf("narrow pane did not fall back to the current stop with its keys:\n%s", narrow)
+	}
+	for _, line := range strings.Split(narrow, "\n") {
+		if got := lipgloss.Width(line); got > 28 {
+			t.Fatalf("narrow routing pane line is %d cells wide, want at most 28: %q", got, line)
+		}
+	}
+
+	press(tea.KeyRight, 5)
+	if got := routing.currentTimeWeight(); got != benchmarkTimeWeightMax {
+		t.Fatalf("weight after 5 right presses = %v, want %v", got, benchmarkTimeWeightMax)
+	}
+	if got := stats.currentTimeWeight(); got != benchmarkTimeWeightMax {
+		t.Fatalf("persisted weight = %v, want %v", got, benchmarkTimeWeightMax)
+	}
+	if pin, manual := routing.pinInfo(model); pin != "fast" || manual {
+		t.Fatalf("pin at the speed end = %q manual=%t, want automatic fast", pin, manual)
+	}
+	assertLit("performance")
+
+	// The other end is price alone: the exponent drops duration out of the
+	// score, so the cheapest provider wins however slow it is.
+	press(tea.KeyLeft, 5)
+	if got := routing.currentTimeWeight(); got != benchmarkTimeWeightMin {
+		t.Fatalf("weight after 5 left presses = %v, want %v", got, benchmarkTimeWeightMin)
+	}
+	if got := stats.currentTimeWeight(); got != benchmarkTimeWeightMin {
+		t.Fatalf("persisted weight = %v, want %v", got, benchmarkTimeWeightMin)
+	}
+	if pin, manual := routing.pinInfo(model); pin != "cheap" || manual {
+		t.Fatalf("pin at the price end = %q manual=%t, want automatic cheap", pin, manual)
+	}
+	assertLit("price")
+
+	// Both ends hold: extra presses do not run past the control's range.
+	press(tea.KeyLeft, 5)
+	if got := routing.currentTimeWeight(); got != benchmarkTimeWeightMin {
+		t.Fatalf("weight ran past the price end: %v", got)
+	}
+	press(tea.KeyRight, 5)
+	if got := routing.currentTimeWeight(); got != benchmarkTimeWeightMax {
+		t.Fatalf("weight ran past the speed end: %v", got)
+	}
+}
+
+// A manual pin outranks the slider: the control still moves and persists, but
+// the user's chosen provider stays selected.
+func TestTimeWeightSliderLeavesManualPinAlone(t *testing.T) {
+	const model = "moonshotai/kimi-k3"
+	now := time.Now()
+	routing := newRoutingState(map[string]providerConfig{model: {
+		Order:     []string{"cheap", "fast"},
+		ManualPin: "fast",
+	}}, time.Hour)
+	routing.setCurrentModel(model)
+	routing.now = func() time.Time { return now }
+	routing.endpointCache[model] = []endpointMeta{
+		{Tag: "cheap", Pricing: testPricing(0.4, 1.6, 0.04)},
+		{Tag: "fast", Pricing: testPricing(1.5, 6, 0.15)},
+	}
+	stats := newStats()
+	stats.addBenchmarkSampleLocked(model, "cheap", benchmarkSample{Time: now, TPS: 200, TTFTms: 500})
+	stats.addBenchmarkSampleLocked(model, "fast", benchmarkSample{Time: now, TPS: 500, TTFTms: 150})
+	dashboard := newDashboard(config{}, stats, routing)
+	dashboard.syncModel()
+
+	for range 40 {
+		updated, _ := dashboard.Update(tea.KeyMsg{Type: tea.KeyLeft})
+		dashboard = updated.(dashboardModel)
+	}
+	if got := routing.currentTimeWeight(); got != benchmarkTimeWeightMin {
+		t.Fatalf("weight under a manual pin = %v, want %v", got, benchmarkTimeWeightMin)
+	}
+	if pin, manual := routing.pinInfo(model); pin != "fast" || !manual {
+		t.Fatalf("manual pin after moving the slider = %q manual=%t, want fast", pin, manual)
+	}
+}
+
+// The degradation switch is a dashboard preference like the speed/price stop:
+// `d` flips it, the pane names it next to the key hint, and stats carries it
+// across a restart.
+func TestDegradationToggleFlipsAndPersists(t *testing.T) {
+	previous := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(previous)
+
+	const model = "moonshotai/kimi-k3"
+	now := time.Now()
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"cheap", "fast"}}}, time.Hour)
+	routing.setCurrentModel(model)
+	routing.now = func() time.Time { return now }
+	stats := newStats()
+	cfg := config{DegradationThreshold: defaultDegradationThreshold, DegradationWindow: defaultDegradationWindow}
+	dashboard := newDashboard(cfg, stats, routing)
+	dashboard.syncModel()
+
+	press := func() {
+		t.Helper()
+		updated, _ := dashboard.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+		dashboard = updated.(dashboardModel)
+	}
+
+	raw := ansi.Strip(dashboard.renderRouting(stats.snapshot(), 200, 24))
+	if !strings.Contains(raw, "Degradation recovery  on  60% / 2m  (d)") {
+		t.Fatalf("routing pane does not show the watch and its rule:\n%s", raw)
+	}
+	// d is named by the switch line, not repeated in the key hint above it.
+	if strings.Contains(raw, "(d) degradation recovery") {
+		t.Fatalf("key hint repeats the d switch:\n%s", raw)
+	}
+	if !strings.Contains(raw, "(r) reload provider list") {
+		t.Fatalf("key hint does not name the reload key:\n%s", raw)
+	}
+	// The enabled state keeps the terminal's foreground, like the model and pin
+	// labels; the disabled state is one of the dim labels.
+	dimPrefix, _ := stylePrefixSuffix(dimStyle)
+	styled := dashboard.renderRouting(stats.snapshot(), 200, 24)
+	if strings.Contains(styled, dimPrefix+"on") {
+		t.Fatalf("enabled state is dim, want the selected style:\n%s", ansi.Strip(styled))
+	}
+
+	press()
+	if routing.degradationEnabled() || stats.degradationEnabled() {
+		t.Fatal("d did not turn the watch off in routing and stats")
+	}
+	if raw := ansi.Strip(dashboard.renderRouting(stats.snapshot(), 200, 24)); !strings.Contains(raw, "Degradation recovery  off  (d)") {
+		t.Fatalf("routing pane still shows the watch on:\n%s", raw)
+	}
+	if styled := dashboard.renderRouting(stats.snapshot(), 200, 24); !strings.Contains(styled, dimPrefix+"off") {
+		t.Fatalf("disabled state is not dim:\n%q", styled)
+	}
+
+	checks := 0
+	dashboard.checkDegradation = func(got string) {
+		checks++
+		if got != model {
+			t.Fatalf("check ran for %q, want %q", got, model)
+		}
+	}
+	press()
+	if !routing.degradationEnabled() || !stats.degradationEnabled() {
+		t.Fatal("d did not turn the watch back on")
+	}
+	if checks != 1 {
+		t.Fatalf("turning the watch on ran %d checks, want 1", checks)
+	}
+}
+
+// The switch has to stay readable in a pane too narrow for its rule, it must
+// keep its key when the key hint above has already truncated, and it must never
+// exceed the space it was given.
+func TestDegradationLineFitsNarrowPanes(t *testing.T) {
+	cfg := config{DegradationThreshold: 0.6, DegradationWindow: 2 * time.Minute}
+	if got := ansi.Strip(renderDegradationLine(false, cfg, 80)); got != "Degradation recovery  off  (d)" {
+		t.Fatalf("off line = %q", got)
+	}
+	if got := ansi.Strip(renderDegradationLine(true, cfg, 80)); got != "Degradation recovery  on  60% / 2m  (d)" {
+		t.Fatalf("on line = %q", got)
+	}
+	if got := ansi.Strip(renderDegradationLine(true, cfg, 30)); got != "Degradation recovery  on  (d)" {
+		t.Fatalf("narrow line = %q, want the rule dropped first", got)
+	}
+	if got := ansi.Strip(renderDegradationLine(true, cfg, 20)); got != "on  (d)" {
+		t.Fatalf("narrower line = %q, want the label dropped before the key", got)
+	}
+	if got := ansi.Strip(renderDegradationLine(true, cfg, 3)); got != "(d)" {
+		t.Fatalf("narrowest line = %q, want the key kept", got)
+	}
+	for _, width := range []int{30, 16, 12, 3, 1} {
+		if got := lipgloss.Width(renderDegradationLine(true, cfg, width)); got > width {
+			t.Fatalf("line at width %d is %d cells: %q", width, got, ansi.Strip(renderDegradationLine(true, cfg, width)))
+		}
+	}
+}
+
+// The e2e harness configures a 300ms window, so the pane must show it rather
+// than reporting a zero-length window for a watch that is judging one.
+func TestShortDurationKeepsSubSecondWindows(t *testing.T) {
+	for _, test := range []struct {
+		in   time.Duration
+		want string
+	}{
+		{0, ""},
+		{-time.Second, ""},
+		{300 * time.Millisecond, "300ms"},
+		{90 * time.Second, "90s"},
+		{2 * time.Minute, "2m"},
+		{3 * time.Hour, "3h"},
+	} {
+		if got := shortDuration(test.in); got != test.want {
+			t.Fatalf("shortDuration(%v) = %q, want %q", test.in, got, test.want)
+		}
+	}
+	cfg := config{DegradationThreshold: 0.6, DegradationWindow: 300 * time.Millisecond}
+	if got := ansi.Strip(renderDegradationLine(true, cfg, 80)); got != "Degradation recovery  on  60% / 300ms  (d)" {
+		t.Fatalf("sub-second line = %q", got)
+	}
+}
+
+// The speed/price control carries its own keys, so a pane too narrow for the key
+// hint still says how to move it. It gives up the other stop names first, then
+// the label, then the lit stop, and never the keys.
+func TestTimeWeightLineKeepsItsKeysInNarrowPanes(t *testing.T) {
+	for _, test := range []struct {
+		width int
+		want  string
+	}{
+		{60, "Speed/price  price · balanced · performance  (←/→)"},
+		{28, "Speed/price  balanced  (←/→)"},
+		{20, "balanced  (←/→)"},
+		{12, "(←/→)"},
+		{4, "Spe…"},
+	} {
+		got := ansi.Strip(renderTimeWeightSlider(defaultBenchmarkTimeWeight, test.width))
+		if got != test.want {
+			t.Fatalf("line at width %d = %q, want %q", test.width, got, test.want)
+		}
+		if width := lipgloss.Width(got); width > test.width {
+			t.Fatalf("line at width %d is %d cells: %q", test.width, width, got)
+		}
+	}
+}
+
+func pressKey(t *testing.T, dashboard dashboardModel, msg tea.KeyMsg) (dashboardModel, tea.Cmd) {
+	t.Helper()
+	updated, cmd := dashboard.Update(msg)
+	return updated.(dashboardModel), cmd
+}
+
+func typeKey(t *testing.T, dashboard dashboardModel, text string) dashboardModel {
+	t.Helper()
+	dashboard, _ = pressKey(t, dashboard, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(text)})
+	return dashboard
+}
+
+func pickerIDs(models []catalogModel) []string {
+	ids := make([]string, len(models))
+	for i, model := range models {
+		ids[i] = model.ID
+	}
+	return ids
+}
+
+// The `k` modal searches the models orr already knows before the upstream
+// catalog arrives, and ranks prefix matches ahead of the rest so a typed model
+// family leads with its own ids.
+func TestPickerRowsPreferKnownModelsAndPrefixMatches(t *testing.T) {
+	const active, configured = "moonshotai/kimi-k3", "moonshotai/kimi-k2"
+	stats := newStats()
+	stats.record(requestRecord{Time: time.Now(), Model: active, Provider: "p1"})
+	routing := newRoutingState(map[string]providerConfig{
+		active:      {Order: []string{"p1"}},
+		configured:  {},
+		"zai/glm-5": {},
+	}, time.Hour)
+	routing.setCurrentModel(active)
+	dashboard := newDashboard(config{}, stats, routing)
+	dashboard.syncModel()
+	dashboard.picker.catalog = []catalogModel{
+		{ID: "moonshotai/kimi-vl", Name: "Kimi Vision"},
+		{ID: "zai/glm-air", Name: "GLM Air"},
+	}
+
+	// Known models keep their place ahead of catalog-only entries, which sort
+	// by id so an empty query is stable from one open to the next.
+	want := []string{active, configured, "zai/glm-5", "moonshotai/kimi-vl", "zai/glm-air"}
+	if got := pickerIDs(dashboard.pickerRows()); !slices.Equal(got, want) {
+		t.Fatalf("rows for an empty query = %v, want %v", got, want)
+	}
+
+	dashboard.picker.query = "KIMI"
+	want = []string{active, configured, "moonshotai/kimi-vl"}
+	if got := pickerIDs(dashboard.pickerRows()); !slices.Equal(got, want) {
+		t.Fatalf("rows for %q = %v, want %v", dashboard.picker.query, got, want)
+	}
+
+	// A match on the display name finds models whose id says nothing.
+	dashboard.picker.query = "vision"
+	want = []string{"moonshotai/kimi-vl"}
+	if got := pickerIDs(dashboard.pickerRows()); !slices.Equal(got, want) {
+		t.Fatalf("rows for a display-name match = %v, want %v", got, want)
+	}
+
+	dashboard.picker.query = "nothing-like-this"
+	if got := dashboard.pickerRows(); len(got) != 0 {
+		t.Fatalf("rows for an unmatched query = %v, want none", pickerIDs(got))
+	}
+}
+
+// `k` opens the modal on the models orr knows, Enter switches to the highlighted
+// model and keeps it on the tab list even though nothing has requested it.
+func TestKeyKOpensPickerAndEnterAddsTab(t *testing.T) {
+	previous := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(previous)
+
+	const modelA, modelB, picked = "a/b", "c/d", "zai/glm-5"
+	stats := newStats()
+	now := time.Now()
+	stats.record(requestRecord{Time: now.Add(-time.Minute), Model: modelA, Provider: "p1"})
+	stats.record(requestRecord{Time: now, Model: modelB, Provider: "p2"})
+	routing := newRoutingState(map[string]providerConfig{
+		modelA: {Order: []string{"p1"}},
+		modelB: {Order: []string{"p2"}},
+	}, time.Hour)
+	routing.setCurrentModel(modelB)
+	dashboard := newDashboard(config{}, stats, routing)
+	dashboard.fetchCatalog = func() ([]catalogModel, error) {
+		return []catalogModel{{ID: picked, Name: "GLM 5"}}, nil
+	}
+	dashboard.syncModel()
+	if dashboard.model != modelB {
+		t.Fatalf("displayed model = %q, want %q", dashboard.model, modelB)
+	}
+
+	dashboard, cmd := pressKey(t, dashboard, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	if !dashboard.picker.open {
+		t.Fatal("k did not open the model picker")
+	}
+	if cmd == nil {
+		t.Fatal("k did not start the catalog fetch")
+	}
+	updated, _ := dashboard.Update(cmd())
+	dashboard = updated.(dashboardModel)
+	if len(dashboard.picker.catalog) != 1 || dashboard.picker.catalog[0].ID != picked {
+		t.Fatalf("catalog after fetch = %v, want %q", pickerIDs(dashboard.picker.catalog), picked)
+	}
+
+	dashboard = typeKey(t, dashboard, "glm")
+	if rows := pickerIDs(dashboard.pickerRows()); !slices.Equal(rows, []string{picked}) {
+		t.Fatalf("rows after typing = %v, want [%s]", rows, picked)
+	}
+	dashboard, _ = pressKey(t, dashboard, tea.KeyMsg{Type: tea.KeyEnter})
+	if dashboard.picker.open {
+		t.Fatal("Enter left the model picker open")
+	}
+	if dashboard.model != picked {
+		t.Fatalf("displayed model after Enter = %q, want %q", dashboard.model, picked)
+	}
+	if !containsString(dashboard.watchedModels, picked) {
+		t.Fatalf("watched models = %v, want %q", dashboard.watchedModels, picked)
+	}
+	if _, ok := dashboard.routing.modelsSnapshot()[picked]; !ok {
+		t.Fatalf("picked model %q is missing from the routing state", picked)
+	}
+	raw := ansi.Strip(dashboard.renderRouting(stats.snapshot(), 200, 24))
+	if !strings.Contains(raw, "[3/3 Tab]") {
+		t.Fatalf("picked model did not join the tab list:\n%s", raw)
+	}
+}
+
+// `x` closes the displayed tab. Traffic that completes for the closed model
+// afterwards brings it back, which is what a request still in flight does.
+func TestKeyXClosesTabUntilTrafficReturns(t *testing.T) {
+	const modelA, modelB = "a/b", "c/d"
+	stats := newStats()
+	now := time.Now()
+	stats.record(requestRecord{Time: now.Add(-time.Minute), Model: modelA, Provider: "p1"})
+	stats.record(requestRecord{Time: now, Model: modelB, Provider: "p2"})
+	routing := newRoutingState(map[string]providerConfig{
+		modelA: {Order: []string{"p1"}},
+		modelB: {Order: []string{"p2"}},
+	}, time.Hour)
+	routing.setCurrentModel(modelB)
+	routing.now = func() time.Time { return now }
+	dashboard := newDashboard(config{}, stats, routing)
+	dashboard.syncModel()
+	if dashboard.model != modelB {
+		t.Fatalf("displayed model = %q, want %q", dashboard.model, modelB)
+	}
+
+	dashboard, _ = pressKey(t, dashboard, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if dashboard.model != modelA {
+		t.Fatalf("displayed model after x = %q, want %q", dashboard.model, modelA)
+	}
+	if slices.Contains(dashboard.activeModels, modelB) {
+		t.Fatalf("closed model is still on the tab list: %v", dashboard.activeModels)
+	}
+
+	stats.record(requestRecord{Time: now.Add(time.Second), Model: modelB, Provider: "p2"})
+	dashboard.syncModel()
+	if !slices.Contains(dashboard.activeModels, modelB) {
+		t.Fatalf("a request after the close did not reopen the tab: %v", dashboard.activeModels)
+	}
+	// The request does not steal the panel from the tab the user is watching.
+	if dashboard.model != modelA {
+		t.Fatalf("displayed model = %q after new traffic for %q", dashboard.model, modelB)
+	}
+	// The reopen is permanent: the close is forgotten, so the idle fallback can
+	// still show the model once its traffic leaves the active window.
+	if dashboard.modelClosed(modelB) {
+		t.Fatalf("closed tab entry survived its reopening traffic: %v", dashboard.closedModels)
+	}
+	now = now.Add(activeModelWindow + time.Minute)
+	dashboard.syncModel()
+	if dashboard.model != modelB {
+		t.Fatalf("idle fallback displayed %q, want the reopened %q", dashboard.model, modelB)
+	}
+}
+
+// A request that began before its tab was closed and finishes afterwards reopens
+// the tab: the close is documented as temporary while traffic is in flight.
+// Records carry the request's start time, so the completion time decides.
+func TestClosedTabReopensWhenAnInFlightRequestCompletes(t *testing.T) {
+	const modelA, modelB = "a/b", "c/d"
+	stats := newStats()
+	started := time.Now()
+	stats.record(requestRecord{Time: started.Add(-time.Minute), Model: modelA, Provider: "p1", Duration: time.Second})
+	routing := newRoutingState(map[string]providerConfig{
+		modelA: {Order: []string{"p1"}},
+		modelB: {Order: []string{"p2"}},
+	}, time.Hour)
+	routing.setCurrentModel(modelA)
+	now := started
+	routing.now = func() time.Time { return now }
+	dashboard := newDashboard(config{}, stats, routing)
+	dashboard.syncModel()
+	if dashboard.model != modelA {
+		t.Fatalf("displayed model = %q, want %q", dashboard.model, modelA)
+	}
+
+	dashboard, _ = pressKey(t, dashboard, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if dashboard.model != "" {
+		t.Fatalf("displayed model after closing the only tab = %q, want none", dashboard.model)
+	}
+
+	stats.record(requestRecord{Time: started, Model: modelA, Provider: "p1", Duration: 2 * time.Minute})
+	now = started.Add(3 * time.Minute)
+	dashboard.syncModel()
+	if !slices.Contains(dashboard.activeModels, modelA) {
+		t.Fatalf("completed in-flight request did not reopen the tab: %v", dashboard.activeModels)
+	}
+	if dashboard.model != modelA {
+		t.Fatalf("displayed model = %q, want the reopened %q", dashboard.model, modelA)
+	}
+}
+
+// A stream longer than the active window must still bring its tab back when it
+// ends. Activity dates from completion on both sides of the close: a start time
+// outside the window would drop the model from the tab list while the close was
+// being released, leaving the panel on a model the tab list no longer held.
+func TestClosedTabReopensWhenALongStreamEnds(t *testing.T) {
+	const model = "a/b"
+	stats := newStats()
+	started := time.Now()
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"p1"}}}, time.Hour)
+	routing.setCurrentModel(model)
+	now := started
+	routing.now = func() time.Time { return now }
+	dashboard := newDashboard(config{}, stats, routing)
+	dashboard.syncModel()
+	if dashboard.model != model {
+		t.Fatalf("displayed model = %q, want %q", dashboard.model, model)
+	}
+
+	// The tab is closed while a stream that began before the window is still
+	// running; its record only appears when it ends.
+	dashboard, _ = pressKey(t, dashboard, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if dashboard.model != "" {
+		t.Fatalf("displayed model after closing the only tab = %q, want none", dashboard.model)
+	}
+	stats.record(requestRecord{Time: started.Add(-12 * time.Minute), Model: model, Provider: "p1", Duration: 13 * time.Minute})
+	now = started.Add(time.Minute)
+	dashboard.syncModel()
+
+	if dashboard.modelClosed(model) {
+		t.Fatalf("completed stream did not release the close: %v", dashboard.closedModels)
+	}
+	if !slices.Contains(dashboard.activeModels, model) {
+		t.Fatalf("completed stream did not restore the tab: %v", dashboard.activeModels)
+	}
+	if dashboard.model != model {
+		t.Fatalf("displayed model = %q, want the restored %q", dashboard.model, model)
+	}
+}
+
+// Closing the last tab leaves the panel empty instead of falling back to the
+// last proxied model, which is the one just closed.
+func TestKeyXClosesTheOnlyTab(t *testing.T) {
+	const model = "a/b"
+	stats := newStats()
+	// The model is already outside the active window, so routing.current() is
+	// the only thing keeping it on screen.
+	stats.record(requestRecord{Time: time.Now().Add(-activeModelWindow - time.Minute), Model: model, Provider: "p1"})
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"p1"}}}, time.Hour)
+	routing.setCurrentModel(model)
+	dashboard := newDashboard(config{}, stats, routing)
+	dashboard.syncModel()
+	if dashboard.model != model {
+		t.Fatalf("displayed model = %q, want %q", dashboard.model, model)
+	}
+
+	dashboard, _ = pressKey(t, dashboard, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if dashboard.model != "" {
+		t.Fatalf("displayed model after closing the only tab = %q, want none", dashboard.model)
+	}
+	dashboard.syncModel()
+	if dashboard.model != "" {
+		t.Fatalf("the closed tab came back on the next tick as %q", dashboard.model)
+	}
+}
+
+// While the picker is open every printable key belongs to the query, so `q`
+// types instead of quitting, and Esc closes the modal.
+func TestPickerKeepsGlobalKeysAsQuery(t *testing.T) {
+	routing := newRoutingState(map[string]providerConfig{"a/b": {Order: []string{"p1"}}}, time.Hour)
+	routing.setCurrentModel("a/b")
+	dashboard := newDashboard(config{}, newStats(), routing)
+	dashboard, _ = pressKey(t, dashboard, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+
+	dashboard, cmd := pressKey(t, dashboard, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	if cmd != nil {
+		t.Fatal("q quit the dashboard while the picker was open")
+	}
+	if !dashboard.picker.open || dashboard.picker.query != "q" {
+		t.Fatalf("picker open=%t query=%q after q", dashboard.picker.open, dashboard.picker.query)
+	}
+
+	dashboard, _ = pressKey(t, dashboard, tea.KeyMsg{Type: tea.KeyEsc})
+	if dashboard.picker.open {
+		t.Fatal("Esc left the picker open")
+	}
+}
+
+// A page jump longer than the result list must wrap: a negative cursor would
+// make Enter index out of range and take the dashboard, and the proxy it serves,
+// down with it.
+func TestPickerPageKeysWrapLongJumps(t *testing.T) {
+	const first, second, third = "a/one", "b/two", "c/three"
+	routing := newRoutingState(map[string]providerConfig{
+		first: {}, second: {}, third: {},
+	}, time.Hour)
+	routing.setCurrentModel(first)
+	dashboard := newDashboard(config{}, newStats(), routing)
+	dashboard.syncModel()
+	dashboard, _ = pressKey(t, dashboard, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+
+	rows := pickerIDs(dashboard.pickerRows())
+	if len(rows) != 3 {
+		t.Fatalf("picker rows = %v, want the three configured models", rows)
+	}
+	for _, test := range []struct {
+		key  tea.KeyType
+		want string
+	}{
+		{tea.KeyPgUp, rows[1]},
+		{tea.KeyPgDown, rows[2]},
+	} {
+		dashboard.picker.open = true
+		dashboard.picker.query = ""
+		dashboard.picker.cursor = 0
+		dashboard, _ = pressKey(t, dashboard, tea.KeyMsg{Type: test.key})
+		if dashboard.picker.cursor < 0 || dashboard.picker.cursor >= len(rows) {
+			t.Fatalf("cursor after %v = %d, want [0,%d)", test.key, dashboard.picker.cursor, len(rows))
+		}
+		dashboard, _ = pressKey(t, dashboard, tea.KeyMsg{Type: tea.KeyEnter})
+		if dashboard.picker.open {
+			t.Fatalf("Enter after %v left the picker open", test.key)
+		}
+		if dashboard.model != test.want {
+			t.Fatalf("model after %v = %q, want %q", test.key, dashboard.model, test.want)
+		}
+	}
+}
+
+// The modal sits inside the terminal: it is centered over the dashboard, and
+// the dashboard keeps its exact width around it.
+func TestPickerOverlayFitsTerminal(t *testing.T) {
+	const model = "moonshotai/kimi-k3"
+	stats := newStats()
+	stats.record(requestRecord{Time: time.Now(), Model: model, Provider: "p1"})
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"p1"}}}, time.Hour)
+	routing.setCurrentModel(model)
+	dashboard := newDashboard(config{}, stats, routing)
+	dashboard.syncModel()
+	updated, _ := dashboard.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	dashboard = updated.(dashboardModel)
+	dashboard.picker.open = true
+	dashboard.picker.catalog = []catalogModel{
+		{ID: model, Name: "Kimi K3"},
+		{ID: "zai/glm-5", Name: "GLM 5"},
+	}
+
+	view := dashboard.View()
+	if got := lipgloss.Width(view); got != 120 {
+		t.Fatalf("view width = %d with the picker open, want 120:\n%s", got, ansi.Strip(view))
+	}
+	if got := lipgloss.Height(view); got > 40 {
+		t.Fatalf("view height = %d with the picker open, want <= 40", got)
+	}
+	raw := ansi.Strip(view)
+	for _, want := range []string{"Find model", "Search", "(Enter) select", "zai/glm-5", "Expenses", "Routing"} {
+		if !strings.Contains(raw, want) {
+			t.Fatalf("picker view is missing %q:\n%s", want, raw)
+		}
+	}
+}
+
+// The Routing pane names the new keys next to the ones it already advertised.
+func TestRoutingHintsNamePickerAndCloseKeys(t *testing.T) {
+	const model = "a/b"
+	stats := newStats()
+	stats.record(requestRecord{Time: time.Now(), Model: model, Provider: "p1"})
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"p1"}}}, time.Hour)
+	routing.setCurrentModel(model)
+	dashboard := newDashboard(config{}, stats, routing)
+	dashboard.syncModel()
+	raw := ansi.Strip(dashboard.renderRouting(stats.snapshot(), 200, 24))
+	for _, want := range []string{"(↑/↓) select", "(Enter) toggle", "(k) models", "(x) close tab", "(r) reload provider list", "(t) test provider", "(a) test all"} {
+		if !strings.Contains(raw, want) {
+			t.Fatalf("routing hints are missing %q:\n%s", want, raw)
+		}
+	}
+	// The provider-table keys keep their own line, so the model keys above them
+	// do not compete for the pane's width.
+	modelLine, providerLine := -1, -1
+	for i, line := range strings.Split(raw, "\n") {
+		if strings.Contains(line, "(k) models") {
+			modelLine = i
+		}
+		if strings.Contains(line, "(r) reload provider list") {
+			providerLine = i
+		}
+	}
+	if modelLine < 0 || providerLine != modelLine+1 {
+		t.Fatalf("provider keys are not on the line below the model keys:\n%s", raw)
 	}
 }

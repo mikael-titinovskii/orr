@@ -323,3 +323,31 @@ func TestProxyServeHTTPRegistryRoute(t *testing.T) {
 		t.Errorf("response missing openrouter: %s", body)
 	}
 }
+
+// The dashboard's picker searches this list, so the catalog fetch must hit the
+// models endpoint on the configured API base and keep ids and display names
+// while dropping entries no request could name.
+func TestFetchCatalogModelsListsSearchableIDs(t *testing.T) {
+	catalog := `{"data":[{"id":"moonshotai/kimi-k3","name":"Kimi K3"},{"id":"","name":"no id"},{"id":"zai/glm-5","name":""}]}`
+	requested := ""
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requested = req.URL.String()
+		return response(http.StatusOK, catalog), nil
+	})}
+	models, err := fetchCatalogModels(context.Background(), client, "https://openrouter.ai/api/v1", "sk-test")
+	if err != nil {
+		t.Fatalf("fetch catalog models: %v", err)
+	}
+	if requested != "https://openrouter.ai/api/v1/models" {
+		t.Fatalf("fetched %q, want the models catalog", requested)
+	}
+	want := []catalogModel{{ID: "moonshotai/kimi-k3", Name: "Kimi K3"}, {ID: "zai/glm-5"}}
+	if len(models) != len(want) {
+		t.Fatalf("models = %v, want %v", models, want)
+	}
+	for i := range want {
+		if models[i] != want[i] {
+			t.Fatalf("models = %v, want %v", models, want)
+		}
+	}
+}

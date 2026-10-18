@@ -40,6 +40,9 @@ type autoSelectionSnapshot struct {
 	} `json:"providers"`
 	WantBest string `json:"want_best"`
 	WantPin  string `json:"want_pin"`
+	// TimeWeight is the dashboard's speed/price exponent. Absent means the
+	// default, so fixtures written before the slider existed are unaffected.
+	TimeWeight *float64 `json:"time_weight"`
 }
 
 func TestAutoSelectionSnapshots(t *testing.T) {
@@ -104,12 +107,17 @@ func testAutoSelectionSnapshot(t *testing.T, snapshot autoSelectionSnapshot, rot
 	}
 	routing := newRoutingState(map[string]providerConfig{model: cfg}, time.Hour)
 	routing.now = func() time.Time { return now }
+	if snapshot.TimeWeight != nil {
+		routing.setTimeWeight(*snapshot.TimeWeight)
+	}
 	routing.endpointCache[model] = meta
 	routing.qualityCache[model] = providerQualityCache{values: qualities, fetchedAt: now.Add(-time.Duration(snapshot.QualityAgeMinutes) * time.Minute)}
 	if snapshot.Incumbent != "" {
 		routing.autoPin(model, snapshot.Incumbent)
 	}
-	profile := benchmarkReferenceProfile
+	// Snapshots were authored against this request shape, so they hold it fixed
+	// rather than tracking the production reference day, which has its own test.
+	profile := requestProfile{promptTokens: 2_000, cachedTokens: 18_000, completionTokens: 1_000}
 	if snapshot.Profile != nil {
 		profile = requestProfile{promptTokens: snapshot.Profile.Prompt, cachedTokens: snapshot.Profile.Cached, completionTokens: snapshot.Profile.Completion, observed: true}
 	}
