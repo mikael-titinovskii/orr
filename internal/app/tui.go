@@ -69,6 +69,12 @@ type providerTestBatchMsg struct {
 	revision uint64
 }
 
+// modelCatalogMsg carries the upstream model catalog the `k` picker searches.
+type modelCatalogMsg struct {
+	models []catalogModel
+	err    error
+}
+
 type dashboardModel struct {
 	stats            *stats
 	routing          *routingState
@@ -77,12 +83,15 @@ type dashboardModel struct {
 	width            int
 	height           int
 	selection        int
+	providerSort     providerSortColumn
+	predictionStep   int
 	model            string
 	activeModels     []string
 	autoScroll       bool
 	serverErr        error
 	spinnerFrame     int
 	refresh          func(model string)
+	checkDegradation func(model string)
 	testProvider     func(model, provider string) (providerTestSample, error)
 	testAllProviders func(model string, providers []string) []providerTestResult
 	testResults      map[string]providerTestMsg
@@ -100,20 +109,45 @@ type dashboardModel struct {
 	qualityFetchedAt map[string]time.Time
 	qualityRetryAt   map[string]time.Time
 	qualityLoading   map[string]bool
+	// watchedModels are the models added with `k`. They stay on the tab list
+	// without traffic, so a model nothing has requested yet can be inspected.
+	watchedModels []string
+	// closedModels holds the tabs closed with `x`, with the time of the close.
+	// A closed model returns to the list only on a request that completes
+	// afterwards, which is what brings back a model with traffic in flight.
+	closedModels map[string]time.Time
+	picker       modelPicker
+	fetchCatalog func() ([]catalogModel, error)
 }
 
 var (
-	panelStyle         = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("62")).Padding(0, 1)
+	// panelBorderColor frames the panes and colors the parenthetical keys of the
+	// controls inside them, so a helper reads as part of the frame rather than as
+	// another dim label.
+	panelBorderColor   = lipgloss.Color("62")
+	panelStyle         = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(panelBorderColor).Padding(0, 1)
 	titleStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
 	dimStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	errorStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 	watermarkStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("234"))
 	usageQuarterStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("249"))
 	releaseUpdateStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("136"))
+	keyHintStyle       = lipgloss.NewStyle().Foreground(panelBorderColor)
 	spinnerFrames      = []string{"─", "\\", "|", "/"}
 	// selectionStyle lifts the selected provider row with a subtle background
 	// so the '>' cursor's target line is easy to spot.
 	selectionStyle = lipgloss.NewStyle().Background(lipgloss.Color("237"))
+	// selectedStyle marks the current speed/price stop and the degradation
+	// switch's state. It sets no colour of its own, so those words keep the
+	// terminal's foreground the way the values on the header line do: the state
+	// reads by contrast with the dim label beside it, not as a second accent
+	// competing with the panel border.
+	selectedStyle = lipgloss.NewStyle()
+	// logStripeColor shades every other log column so adjacent values stay
+	// visually distinguishable across the table's full width. It sits close to
+	// a black background on purpose: the stripe should read as texture, not as
+	// a highlight competing with the values.
+	logStripeColor = lipgloss.Color("234")
 )
 
 // watermarkArt is the orr logo, drawn faintly in the bottom-right corner of
@@ -180,6 +214,7 @@ func newDashboard(cfg config, stats *stats, routing *routingState) dashboardMode
 		cfg: cfg, stats: stats, routing: routing,
 		viewport:         viewport.New(0, 0),
 		autoScroll:       true,
+		predictionStep:   defaultPredictionWorkloadStep,
 		testResults:      make(map[string]providerTestMsg),
 		testing:          make(map[string]bool),
 		allTesting:       make(map[string]map[string]bool),
@@ -190,6 +225,7 @@ func newDashboard(cfg config, stats *stats, routing *routingState) dashboardMode
 		qualityFetchedAt: make(map[string]time.Time),
 		qualityRetryAt:   make(map[string]time.Time),
 		qualityLoading:   make(map[string]bool),
+		closedModels:     make(map[string]time.Time),
 	}
 	if upstream, err := url.Parse(cfg.Upstream); err == nil && upstream.Scheme == "https" && upstream.Host == "openrouter.ai" {
 		client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
@@ -197,6 +233,11 @@ func newDashboard(cfg config, stats *stats, routing *routingState) dashboardMode
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			return routing.refreshProviderQuality(ctx, client, "https://openrouter.ai", cfg.openRouterKey(), model)
+		}
+		m.fetchCatalog = func() ([]catalogModel, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return fetchCatalogModels(ctx, client, cfg.Upstream, cfg.openRouterKey())
 		}
 	}
 	return m
@@ -309,18 +350,9 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				delete(m.allTesting, msg.model)
 				revision := m.allTestRevisions[msg.model]
 				delete(m.allTestRevisions, msg.model)
-				results := make([]providerTestResult, 0)
-				for _, provider := range m.routing.providers(msg.model, m.currentSnap().Observed[msg.model]) {
-					if result, ok := m.testResults[testResultKey(msg.model, provider)]; ok {
-						results = append(results, result.testResult(provider))
-					}
-				}
-				snap := m.currentSnap()
-				providers := m.routing.providers(msg.model, snap.Observed[msg.model])
 				now := m.routing.now()
-				results = mergeMeasuredProviderResults(results, m.stats.benchmarkPool(msg.model), providers, now)
-				profile := newRequestProfile(snap.MetricsRecords, msg.model, now)
-				apiErrs := providerAPIErrorRates(snap.Records, msg.model, now)
+				results := m.selectionResults(msg.model, m.freshTestResults(msg.model), now)
+				profile, apiErrs := m.selectionProfile(msg.model, now)
 				best, autoUpdated, err := m.routing.applyProviderTestResultsAtRevision(msg.model, results, profile, revision, apiErrs)
 				if err != nil {
 					m.serverErr = err
@@ -332,7 +364,7 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.stats.setAutoPin(msg.model, best)
 				} else if autoUpdated {
 					m.stats.clearAutoPin(msg.model)
-					fallback := m.routing.active(msg.model, snap.Observed[msg.model])
+					fallback := m.routing.active(msg.model, m.currentSnap().Observed[msg.model])
 					if m.routing.ensureAutoPin(msg.model, fallback) {
 						m.stats.setAutoPin(msg.model, fallback)
 					}
@@ -352,7 +384,6 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		delete(m.allTesting, msg.model)
 		delete(m.allTestRevisions, msg.model)
 		snap := m.currentSnap()
-		providers := m.routing.providers(msg.model, snap.Observed[msg.model])
 		// Only freshly measured results go into the display cache. The merged
 		// list summarizes the benchmark pool for ranking, and pooled entries
 		// carry no latency: storing them here blanked mLat behind a fresh
@@ -366,9 +397,8 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				testedAt: msg.testedAt,
 			}
 		}
-		msg.results = mergeMeasuredProviderResults(msg.results, m.stats.benchmarkPool(msg.model), providers, msg.testedAt)
-		profile := newRequestProfile(snap.MetricsRecords, msg.model, msg.testedAt)
-		apiErrs := providerAPIErrorRates(m.currentSnap().Records, msg.model, msg.testedAt)
+		msg.results = m.selectionResults(msg.model, msg.results, msg.testedAt)
+		profile, apiErrs := m.selectionProfile(msg.model, msg.testedAt)
 		best, autoUpdated, err := m.routing.applyProviderTestResultsAtRevision(msg.model, msg.results, profile, msg.revision, apiErrs)
 		if err != nil {
 			m.serverErr = err
@@ -389,7 +419,20 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.model == m.model {
 			m.selectActiveProvider(m.currentSnap())
 		}
+	case modelCatalogMsg:
+		m.picker.loading = false
+		m.picker.err = msg.err
+		// A failed or empty fetch leaves the models orr already knows in the
+		// list, so the picker stays usable without the catalog.
+		if msg.err == nil && len(msg.models) > 0 {
+			m.picker.catalog = msg.models
+			m.picker.fetchedAt = m.routing.now()
+		}
 	case tea.KeyMsg:
+		if m.picker.open {
+			next, cmd := m.updatePicker(msg)
+			return next, cmd
+		}
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -403,6 +446,23 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(providers) > 0 {
 				m.selection = (m.selection + 1) % len(providers)
 			}
+		case "left", "right":
+			step := benchmarkTimeWeightStep
+			if msg.String() == "left" {
+				step = -step
+			}
+			m.adjustTimeWeight(step)
+		case "d":
+			m.toggleDegradation()
+		case "p":
+			// Cycle the day the projection prices. It is a view setting, so it
+			// stays in memory and resets with the process.
+			m.predictionStep = (m.predictionStep + 1) % len(predictionWorkloadSteps)
+		case "k":
+			m.openPicker()
+			return m, m.pickerCmd()
+		case "x":
+			m.closeTab()
 		case "tab", "shift+tab":
 			if len(m.activeModels) > 1 {
 				idx := indexOfString(m.activeModels, m.model)
@@ -506,6 +566,17 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(cmds) > 0 {
 				return m, tea.Batch(cmds...)
 			}
+		case "o":
+			// Cycle the table's display order. Only the rows move: the routing
+			// order requests follow, the pin, and the providers file stay as they
+			// are. The cursor stays on the same provider.
+			selected := ""
+			providers := m.providers()
+			if m.selection >= 0 && m.selection < len(providers) {
+				selected = providers[m.selection]
+			}
+			m.providerSort = m.providerSort.next()
+			m.selectProvider(selected)
 		case "s":
 			m.stopwatch.toggle(m.routing.now(), m.currentSnap())
 		case "pgup":
@@ -585,16 +656,29 @@ func (m dashboardModel) topRowHeight() int {
 // the Routing panel's model list.
 const activeModelWindow = 10 * time.Minute
 
-// activeModels returns models with a completed request within the window,
-// ordered by most recent activity first.
+// requestFinishedAt is when record's request completed. Time is the start and
+// Duration carries the round trip, so a stream that outlived the active window
+// still dates its activity by the moment it finished — the same moment a closed
+// tab counts as reopened, so the tab list and the close cannot disagree about
+// whether the model is back.
+func requestFinishedAt(record requestRecord) time.Time {
+	return record.Time.Add(record.Duration)
+}
+
+// activeModels returns models with a request that finished within the window,
+// ordered by most recent activity first. Benchmark pings are orr's own probes,
+// not requests the user sent, so a cold start that measures every configured
+// model must not fill the tab list with models nothing asked for.
 func activeModels(snap statsSnapshot, now time.Time) []string {
 	seen := make(map[string]time.Time)
+	cutoff := now.Add(-activeModelWindow)
 	for _, record := range snap.Records {
-		if record.Model == "" || record.Time.Before(now.Add(-activeModelWindow)) {
+		finished := requestFinishedAt(record)
+		if record.Model == "" || record.Benchmark || finished.Before(cutoff) {
 			continue
 		}
-		if last, ok := seen[record.Model]; !ok || record.Time.After(last) {
-			seen[record.Model] = record.Time
+		if last, ok := seen[record.Model]; !ok || finished.After(last) {
+			seen[record.Model] = finished
 		}
 	}
 	models := make([]string, 0, len(seen))
@@ -603,6 +687,57 @@ func activeModels(snap statsSnapshot, now time.Time) []string {
 	}
 	sort.Slice(models, func(i, j int) bool { return seen[models[i]].After(seen[models[j]]) })
 	return models
+}
+
+// tabModels returns the models the Routing panel switches between: models with
+// recent traffic, then the models added with `k` that have none yet. A model
+// closed with `x` drops out until a request completes for it later, so closing
+// a tab whose traffic is still in flight is temporary. Closed entries are
+// cleared by expireClosedTabs before this runs.
+func (m *dashboardModel) tabModels(snap statsSnapshot, now time.Time) []string {
+	tabs := make([]string, 0, len(m.watchedModels)+4)
+	for _, model := range activeModels(snap, now) {
+		if m.modelClosed(model) {
+			continue
+		}
+		tabs = append(tabs, model)
+	}
+	for _, model := range m.watchedModels {
+		if !containsString(tabs, model) {
+			tabs = append(tabs, model)
+		}
+	}
+	return tabs
+}
+
+// hasRequestAfter reports whether a request for model finished after t and is
+// still inside the active window. A completion older than the window can no
+// longer put the model on the tab list, so it must not release the close either:
+// the two decisions share requestFinishedAt and activeModelWindow.
+func hasRequestAfter(snap statsSnapshot, model string, t, cutoff time.Time) bool {
+	for _, record := range snap.Records {
+		if record.Model != model || record.Benchmark {
+			continue
+		}
+		finished := requestFinishedAt(record)
+		if finished.After(t) && !finished.Before(cutoff) {
+			return true
+		}
+	}
+	return false
+}
+
+// expireClosedTabs forgets a close once a request has finished for the model
+// since and that completion is still fresh enough to restore the tab. From then
+// on the tab is open again, so the idle fallback must treat the model as
+// displayable even after its traffic leaves the active window.
+func (m *dashboardModel) expireClosedTabs(snap statsSnapshot, now time.Time) {
+	cutoff := now.Add(-activeModelWindow)
+	for model, closed := range m.closedModels {
+		if hasRequestAfter(snap, model, closed, cutoff) {
+			delete(m.closedModels, model)
+		}
+	}
 }
 
 // expireTestResults drops explicit ping-pong results that a real proxied
@@ -633,7 +768,8 @@ func (m *dashboardModel) syncModel() {
 	}
 	snap := m.currentSnap()
 	m.expireTestResults(snap)
-	m.activeModels = activeModels(snap, m.routing.now())
+	m.expireClosedTabs(snap, m.routing.now())
+	m.activeModels = m.tabModels(snap, m.routing.now())
 	// Keep the displayed model once chosen: concurrent requests for other
 	// models must not yank the Routing panel away from it.
 	if m.model != "" && containsString(m.activeModels, m.model) {
@@ -643,7 +779,7 @@ func (m *dashboardModel) syncModel() {
 	switch {
 	case len(m.activeModels) > 0:
 		next = m.activeModels[0]
-	case m.routing.current() != "":
+	case m.routing.current() != "" && !m.modelClosed(m.routing.current()):
 		next = m.routing.current()
 	default:
 		next = ""
@@ -657,15 +793,34 @@ func (m *dashboardModel) syncModel() {
 	}
 }
 
-// selectActiveProvider moves the selection to the model's active provider.
+// modelClosed reports whether model was closed with `x` and no request has
+// finished for it since; expireClosedTabs forgets the close on that traffic.
+func (m dashboardModel) modelClosed(model string) bool {
+	_, closed := m.closedModels[model]
+	return closed
+}
+
+// selectActiveProvider moves the selection to the model's active provider, in
+// the order the table currently displays.
 func (m *dashboardModel) selectActiveProvider(snap statsSnapshot) {
 	m.selection = 0
 	active := m.routing.active(m.model, snap.Observed[m.model])
-	for i, provider := range m.routing.providers(m.model, snap.Observed[m.model]) {
+	for i, provider := range m.providerTableData(snap).ordered(m.providerSort) {
 		if provider == active {
 			m.selection = i
 			break
 		}
+	}
+}
+
+// selectProvider keeps the cursor on a provider by name after the table is
+// re-ordered under it.
+func (m *dashboardModel) selectProvider(provider string) {
+	if provider == "" {
+		return
+	}
+	if index := indexOfString(m.providers(), provider); index >= 0 {
+		m.selection = index
 	}
 }
 
@@ -686,8 +841,10 @@ func indexOfString(values []string, target string) int {
 	return -1
 }
 
+// providers lists the current model's providers in the order the table shows
+// them, so navigation and the selection-bound keys follow the displayed rows.
 func (m dashboardModel) providers() []string {
-	return m.routing.providers(m.model, m.currentSnap().Observed[m.model])
+	return m.providerTableData(m.currentSnap()).ordered(m.providerSort)
 }
 
 func (m *dashboardModel) refreshLog() {
@@ -699,7 +856,12 @@ func (m *dashboardModel) refreshLog() {
 	}
 }
 
-const logTableMinWidth = 144
+const logTableMinWidth = 151
+
+// logTableTimeWidth is the width of the leading Time column, which every row
+// renders as 15:04:05. It is named so that logTableWidths and logTableColumns,
+// which both need it, cannot drift apart.
+const logTableTimeWidth = 8
 
 // renderLogRows renders only the scrollable body. The fixed header is rendered
 // beside the viewport so PgUp/PgDn never moves it out of view.
@@ -708,7 +870,7 @@ func renderLogRows(records []requestRecord, width int) string {
 	if tableWidth < logTableMinWidth {
 		return renderCompactLogRows(records, width)
 	}
-	modelWidth, providerWidth, _, _, _, _, _, _, _, _, _, _, _, _ := logTableWidths(tableWidth)
+	modelWidth, providerWidth, _, _, _, _, _, _, _, _, _, _, _, _, _ := logTableWidths(tableWidth)
 	lines := make([]string, 0, len(records))
 	for _, record := range records {
 		cells := []string{
@@ -722,16 +884,14 @@ func renderLogRows(records []requestRecord, width int) string {
 			logUncachedText(record),
 			logTokenValue(record.CompletionTokens),
 			logThinkPercentText(record),
-			fmt.Sprintf("%.0f", record.tokensPerSecond()),
+			logThroughputText(record),
+			logLatencyText(record),
 			fmt.Sprintf("$%.4f", record.Cost),
 			logCacheReadText(record),
 			logCacheWriteText(record),
 			logCachePercentText(record),
 		}
-		line := renderLogTableRow(cells, logTableColumns(tableWidth))
-		if record.apiError() {
-			line = errorStyle.Render(line)
-		}
+		line := renderLogTableRow(cells, logTableColumns(tableWidth), logRowForeground(record))
 		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
@@ -742,13 +902,16 @@ func logTableWidth(width int) int {
 }
 
 func logTableColumns(width int) []int {
-	modelWidth, providerWidth, reasonWidth, statusWidth, durationWidth, tokenInWidth, tokenInUncachedWidth, tokenOutWidth, thinkPercentWidth, speedWidth, costWidth, cacheReadWidth, cacheWriteWidth, cachePercentWidth := logTableWidths(width)
-	return []int{12, modelWidth, providerWidth, reasonWidth, statusWidth, durationWidth, tokenInWidth, tokenInUncachedWidth, tokenOutWidth, thinkPercentWidth, speedWidth, costWidth, cacheReadWidth, cacheWriteWidth, cachePercentWidth}
+	modelWidth, providerWidth, reasonWidth, statusWidth, durationWidth, tokenInWidth, tokenInUncachedWidth, tokenOutWidth, thinkPercentWidth, speedWidth, latencyWidth, costWidth, cacheReadWidth, cacheWriteWidth, cachePercentWidth := logTableWidths(width)
+	return []int{logTableTimeWidth, modelWidth, providerWidth, reasonWidth, statusWidth, durationWidth, tokenInWidth, tokenInUncachedWidth, tokenOutWidth, thinkPercentWidth, speedWidth, latencyWidth, costWidth, cacheReadWidth, cacheWriteWidth, cachePercentWidth}
 }
 
-func logTableWidths(width int) (model, provider, reason, status, duration, tokenIn, tokenInUncached, tokenOut, thinkPercent, speed, cost, cacheRead, cacheWrite, cachePercent int) {
+func logTableWidths(width int) (model, provider, reason, status, duration, tokenIn, tokenInUncached, tokenOut, thinkPercent, speed, latency, cost, cacheRead, cacheWrite, cachePercent int) {
 	const (
-		fixed           = 12 + 6 + 4 + 8 + 9 + 11 + 10 + 7 + 6 + 8 + 10 + 11 + 7 + 14 // fixed columns plus separators
+		// Every metric column shares one width: a grouped token count reaches
+		// nine cells, and holding the narrower columns to it too keeps the
+		// table a regular grid rather than a ragged one.
+		fixed           = logTableTimeWidth + 6 + 4 + 9 + 9 + 9 + 9 + 9 + 9 + 9 + 9 + 9 + 9 + 9 + 15 // fixed columns plus separators
 		minimumModel    = 9
 		minimumProvider = 10
 		maximumModel    = 36
@@ -757,7 +920,7 @@ func logTableWidths(width int) (model, provider, reason, status, duration, token
 	variable := max(0, width-fixed-minimumModel-minimumProvider)
 	model = min(maximumModel, minimumModel+variable/2)
 	provider = min(maximumProvider, minimumProvider+variable-variable/2)
-	return model, provider, 6, 4, 8, 9, 11, 10, 7, 6, 8, 10, 11, 7
+	return model, provider, 6, 4, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9
 }
 
 func logTableHeaderHeight(width int) int {
@@ -772,26 +935,70 @@ func renderLogTableHeader(width int) string {
 	if tableWidth < logTableMinWidth {
 		return dimStyle.Render(strings.Join([]string{
 			shorten("Time  Code  Duration  Cost", width),
-			shorten("Model / Provider  Reason  Tokens in  Tokens in u  Tokens out  Think%  Tok/s  Cache read  Cache write  Cache%", width),
+			shorten("Model / Provider  Reason  In  Uncached  Out  Think%  Tp  Lat  CR  CW  C%", width),
 		}, "\n"))
 	}
-	header := renderLogTableRow([]string{"Time", "Model", "Provider", "Reason", "Code", "Duration", "Tokens in", "Tokens in u", "Tokens out", "Think%", "Tok/s", "Cost", "Cache read", "Cache write", "Cache%"}, logTableColumns(tableWidth))
-	return dimStyle.Render(header)
+	return renderLogTableRow(logTableHeaderCells, logTableColumns(tableWidth), dimStyle.GetForeground())
 }
 
-func renderLogTableRow(cells []string, widths []int) string {
+// logTableHeaderCells are the column labels of the wide log table, in the same
+// order as logTableColumns. They are abbreviated so the table stays compact.
+var logTableHeaderCells = []string{"Time", "Model", "Provider", "Reason", "Code", "Duration", "In", "Uncached", "Out", "Think%", "Tp", "Lat", "Cost", "CR", "CW", "C%"}
+
+// logTableFirstMetricColumn is the index of Duration, the first column holding
+// a measured value rather than an identifier. It and everything after it is
+// centered; the columns before it are left-aligned.
+const logTableFirstMetricColumn = 5
+
+// renderLogTableRow lays out one log table row. The first column and every
+// other one after it carries the stripe background so adjacent values stay
+// distinguishable. Text columns are left-aligned; the metric columns are
+// centered, which is what a fixed-width numeric grid reads best as. fg applies
+// to the whole row — dim for the header, red for failed requests — and is set
+// per cell because a cell's own reset would otherwise clear a row-wide style.
+func renderLogTableRow(cells []string, widths []int, fg lipgloss.TerminalColor) string {
+	plain, shaded := logCellStyles(fg)
 	parts := make([]string, len(cells))
 	for i, cell := range cells {
-		parts[i] = padRight(shorten(cell, widths[i]), widths[i])
+		style := plain
+		if i%2 == 0 {
+			style = shaded
+		}
+		text := shorten(cell, widths[i])
+		if i >= logTableFirstMetricColumn {
+			text = padCenter(text, widths[i])
+		} else {
+			text = padRight(text, widths[i])
+		}
+		parts[i] = style.Render(text)
 	}
 	return strings.Join(parts, " ")
+}
+
+// logCellStyles returns the pair of cell styles used down a log table row: the
+// plain style and the shaded style for every other column.
+func logCellStyles(fg lipgloss.TerminalColor) (plain, shaded lipgloss.Style) {
+	plain = lipgloss.NewStyle()
+	if fg != nil {
+		plain = plain.Foreground(fg)
+	}
+	return plain, plain.Background(logStripeColor)
+}
+
+// logRowForeground returns the foreground shared by every cell of a log row,
+// or nil when the row takes the terminal's default foreground.
+func logRowForeground(record requestRecord) lipgloss.TerminalColor {
+	if record.apiError() {
+		return errorStyle.GetForeground()
+	}
+	return nil
 }
 
 func renderCompactLogRows(records []requestRecord, width int) string {
 	lines := make([]string, 0, len(records)*2)
 	for _, record := range records {
 		first := shorten(fmt.Sprintf("%s  %d  %s  $%.4f", record.Time.Local().Format("15:04:05"), record.Status, logDurationText(record.Duration), record.Cost), width)
-		second := shorten(fmt.Sprintf("%s / %s  %s  %s  %s  %s  %.0f  %s  %s  %s  %s", record.Model, record.Provider, logReasoningText(record), logTokenValue(record.PromptTokens), logUncachedText(record), logTokenValue(record.CompletionTokens), record.tokensPerSecond(), logThinkPercentText(record), logCacheReadText(record), logCacheWriteText(record), logCachePercentText(record)), width)
+		second := shorten(fmt.Sprintf("%s / %s  %s  %s  %s  %s  %s  %s  %s  %s  %s  %s", record.Model, record.Provider, logReasoningText(record), logTokenValue(record.PromptTokens), logUncachedText(record), logTokenValue(record.CompletionTokens), logThroughputText(record), logThinkPercentText(record), logLatencyText(record), logCacheReadText(record), logCacheWriteText(record), logCachePercentText(record)), width)
 		if record.apiError() {
 			first = errorStyle.Render(first)
 			second = errorStyle.Render(second)
@@ -805,7 +1012,7 @@ func logTokenValue(tokens int) string {
 	if tokens <= 0 {
 		return ""
 	}
-	return strconv.Itoa(tokens)
+	return groupDigits(tokens)
 }
 
 // logUncachedText renders the input tokens not served from cache (Tokens in
@@ -815,7 +1022,7 @@ func logUncachedText(record requestRecord) string {
 	if uncached <= 0 {
 		return ""
 	}
-	return strconv.Itoa(uncached)
+	return groupDigits(uncached)
 }
 
 // logReasoningText renders the reasoning effort level requested for the call
@@ -831,14 +1038,14 @@ func logCacheReadText(record requestRecord) string {
 	if record.CachedTokens <= 0 {
 		return ""
 	}
-	return strconv.Itoa(record.CachedTokens)
+	return groupDigits(record.CachedTokens)
 }
 
 func logCacheWriteText(record requestRecord) string {
 	if record.CacheWriteTokens <= 0 {
 		return ""
 	}
-	return strconv.Itoa(record.CacheWriteTokens)
+	return groupDigits(record.CacheWriteTokens)
 }
 
 func logCachePercentText(record requestRecord) string {
@@ -871,6 +1078,47 @@ func logDurationText(duration time.Duration) string {
 		return ""
 	}
 	return formatElapsed(duration)
+}
+
+// logThroughputText renders the request's output tokens per second, matching
+// the provider table's Tp column.
+func logThroughputText(record requestRecord) string {
+	return groupDigits(int(math.Round(record.tokensPerSecond())))
+}
+
+// logLatencyText renders the time to first token in milliseconds, matching
+// OpenRouter's latency definition and the provider table's mLat. A blank
+// means the proxy never saw a first streamed token for the request.
+func logLatencyText(record requestRecord) string {
+	if record.TTFT <= 0 {
+		return ""
+	}
+	return groupDigits(int(record.TTFT.Round(time.Millisecond) / time.Millisecond))
+}
+
+// groupDigits separates an integer into groups of three digits with spaces so
+// long numbers stay readable: 6591173 renders as "6 591 173".
+func groupDigits(n int) string {
+	digits := strconv.Itoa(n)
+	sign := ""
+	if strings.HasPrefix(digits, "-") {
+		sign, digits = "-", digits[1:]
+	}
+	if len(digits) <= 3 {
+		return sign + digits
+	}
+	head := len(digits) % 3
+	if head == 0 {
+		head = 3
+	}
+	var b strings.Builder
+	b.WriteString(sign)
+	b.WriteString(digits[:head])
+	for i := head; i < len(digits); i += 3 {
+		b.WriteByte(' ')
+		b.WriteString(digits[i : i+3])
+	}
+	return b.String()
 }
 
 func (m dashboardModel) View() string {
@@ -911,7 +1159,7 @@ func (m dashboardModel) View() string {
 	} else {
 		logTitle += " " + spinnerFrames[0]
 	}
-	logTitle += dimStyle.Render("  PgUp/PgDn scroll • q quit")
+	logTitle += "  " + renderKeyHints([]keyHint{{"PgUp/PgDn", "scroll"}, {"q", "quit"}}, max(1, m.width-8))
 	if m.releaseUpdate != "" {
 		logTitle += releaseUpdateStyle.Render(" • " + m.releaseUpdate + " available run ./orr upgrade")
 	}
@@ -919,7 +1167,11 @@ func (m dashboardModel) View() string {
 	logView := overlayWatermark(m.viewport.View(), logWidth)
 	logBody := renderLogTableHeader(logWidth) + "\n" + logView
 	logPane := panelStyle.Width(max(1, m.width-2)).Height(max(1, m.height-lipgloss.Height(top)-2)).Render(logTitle + "\n\n" + logBody)
-	return lipgloss.JoinVertical(lipgloss.Left, top, logPane)
+	view := lipgloss.JoinVertical(lipgloss.Left, top, logPane)
+	if m.picker.open {
+		return overlayCenter(view, m.renderPicker(m.width, m.height), m.width, m.height)
+	}
+	return view
 }
 
 // renderExpenses renders the Expenses panel capped at maxHeight lines: the
@@ -931,18 +1183,19 @@ func renderExpenses(snap statsSnapshot, now time.Time, width, maxHeight int) str
 	if snap.Budget > 0 {
 		used = month / snap.Budget * 100
 	}
-	usedLine := "Used"
+	// The label recedes so the figures and the bar read as the values.
+	const usedLabel = "Used"
+	usedValue := ""
 	if snap.Budget > 0 {
-		usedLabel := fmt.Sprintf("Used $%.0f / $%.0f ", month, snap.Budget)
-		barWidth := max(0, width-lipgloss.Width(usedLabel))
-		usedLine = usedLabel + renderUsageBar(used, barWidth)
+		usedValue = fmt.Sprintf(" $%.0f / $%.0f ", month, snap.Budget)
+		usedValue += renderUsageBar(used, max(0, width-lipgloss.Width(usedLabel+usedValue)))
 	} else if month > 0 {
-		usedLine = fmt.Sprintf("Used $%.0f", month)
+		usedValue = fmt.Sprintf(" $%.0f", month)
 	}
 	lines := []string{
 		titleStyle.Render("Expenses"),
 		"",
-		shorten(usedLine, width),
+		dimLabelLine(usedLabel, usedValue, width),
 		"",
 	}
 	// The four usage lines always stay; the table gets the remainder.
@@ -990,8 +1243,8 @@ func renderHistoryPerDay(snap statsSnapshot, now time.Time, width int) string {
 	lines := []string{
 		titleStyle.Render("History"),
 		"",
-		shorten(fmt.Sprintf("This m  %s  %s", month, formatDailyTokens(monthTokens)), width),
-		shorten(fmt.Sprintf("Last m  %s  %s", lastMonth, formatDailyTokens(lastMonthTokens)), width),
+		historyMonthLine("This m", month, monthTokens, width),
+		historyMonthLine("Last m", lastMonth, lastMonthTokens, width),
 		"",
 	}
 	for _, day := range days[:min(7, len(days))] {
@@ -999,6 +1252,23 @@ func renderHistoryPerDay(snap statsSnapshot, now time.Time, width int) string {
 		lines = append(lines, shorten(fmt.Sprintf("%-8s $%.4f  %s", parsed.Format("Jan 02"), snap.DailyCosts[day], formatDailyTokens(snap.DailyTokens[day])), width))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// dimLabelLine renders label in the dim label colour and the rest of the line at
+// the terminal's foreground. A line too narrow to hold the label keeps its plain
+// text, so truncation never lands inside a style.
+func dimLabelLine(label, rest string, width int) string {
+	plain := shorten(label+rest, width)
+	if !strings.HasPrefix(plain, label) {
+		return plain
+	}
+	return dimStyle.Render(label) + strings.TrimPrefix(plain, label)
+}
+
+// historyMonthLine renders one month's cost and tokens. The month label recedes
+// so the figures beside it read as the values.
+func historyMonthLine(label, cost string, tokens int64, width int) string {
+	return dimLabelLine(label, fmt.Sprintf("  %s  %s", cost, formatDailyTokens(tokens)), width)
 }
 
 func monthCostText(daily map[string]float64, month time.Time) string {
@@ -1032,10 +1302,217 @@ func formatDailyTokens(tokens int64) string {
 	if tokens <= 0 {
 		return ""
 	}
-	return fmt.Sprintf("%.2fm", float64(tokens)/1_000_000)
+	// A count that runs past a thousand million tokens is written in billions:
+	// "1478.16m" is a number nobody reads as a size.
+	millions := float64(tokens) / 1_000_000
+	if millions >= 999.995 {
+		return fmt.Sprintf("%.2fb", millions/1_000)
+	}
+	return fmt.Sprintf("%.2fm", millions)
+}
+
+// timeWeightStopNames name the control's positions from the price end to the
+// speed end. The control shows these instead of the exponent it sets: the
+// names are also the explanation of what each end buys, which a bar with a
+// number beside it never was.
+var timeWeightStopNames = []string{"price", "balanced", "performance"}
+
+// timeWeightStop is the position the live exponent sits on.
+func timeWeightStop(weight float64) int {
+	return int(math.Round((clampTimeWeight(weight) - benchmarkTimeWeightMin) / benchmarkTimeWeightStep))
+}
+
+// keyHint is one shortcut on a hint line: the key itself and what it does. Only
+// the key and its own parentheses take the panel border colour, so the hint
+// points at what to press without tinting the explanation beside it.
+type keyHint struct {
+	key         string
+	description string
+}
+
+func (h keyHint) parenthetical() string {
+	return "(" + h.key + ")"
+}
+
+func (h keyHint) plain() string {
+	if h.description == "" {
+		return h.parenthetical()
+	}
+	return h.parenthetical() + " " + h.description
+}
+
+func (h keyHint) render() string {
+	if h.description == "" {
+		return keyHintStyle.Render(h.parenthetical())
+	}
+	return keyHintStyle.Render(h.parenthetical()) + dimStyle.Render(" "+h.description)
+}
+
+// renderKeyHints lays the hints out on one line within width. A hint whose
+// description no longer fits keeps its key; once not even that fits, the rest
+// are dropped, because a styled line cannot be cut at an arbitrary column.
+func renderKeyHints(hints []keyHint, width int) string {
+	if len(hints) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(hints)*2)
+	used := 0
+	truncated := false
+	for _, hint := range hints {
+		separator := ""
+		if len(parts) > 0 {
+			separator = " • "
+		}
+		if used+lipgloss.Width(separator)+lipgloss.Width(hint.plain()) <= width {
+			if separator != "" {
+				parts = append(parts, dimStyle.Render(separator))
+			}
+			parts = append(parts, hint.render())
+			used += lipgloss.Width(separator) + lipgloss.Width(hint.plain())
+			continue
+		}
+		keyOnly := separator + hint.parenthetical()
+		if hint.description != "" && used+lipgloss.Width(keyOnly) < width {
+			if separator != "" {
+				parts = append(parts, dimStyle.Render(separator))
+			}
+			parts = append(parts, keyHintStyle.Render(hint.parenthetical()))
+			used += lipgloss.Width(keyOnly)
+		}
+		truncated = true
+		break
+	}
+	if len(parts) == 0 {
+		return keyHintStyle.Render(shorten(hints[0].parenthetical(), width))
+	}
+	if truncated && used+1 <= width {
+		parts = append(parts, dimStyle.Render("…"))
+	}
+	return strings.Join(parts, "")
+}
+
+// renderKeyHint fits one hint into width, shedding its description before the
+// key itself and shortening the key only when the pane cannot hold even that.
+func renderKeyHint(hint keyHint, width int) string {
+	if lipgloss.Width(hint.plain()) <= width {
+		return hint.render()
+	}
+	if lipgloss.Width(hint.parenthetical()) <= width {
+		return keyHintStyle.Render(hint.parenthetical())
+	}
+	return keyHintStyle.Render(shorten(hint.parenthetical(), width))
+}
+
+// renderTimeWeightSlider draws the speed/price control as its named stops, with
+// the current one lit. The line carries its own keys, the same convention as the
+// degradation line below it and the model line's `[n/m Tab]`, so the control
+// still says how to move once the key hint above it has truncated. Narrow panes
+// give up detail in the order that costs least: the other stop names first, then
+// the "Speed/price" label, then the lit stop itself, and never the keys, because
+// a styled line cannot be clipped without cutting an escape sequence in half.
+func renderTimeWeightSlider(weight float64, width int) string {
+	stop := timeWeightStop(weight)
+	const prefix = "Speed/price  "
+	const key = "(←/→)"
+	keys := "  " + key
+	full := prefix + strings.Join(timeWeightStopNames, " · ") + keys
+	if lipgloss.Width(full) <= width {
+		styled := make([]string, len(timeWeightStopNames))
+		for i, name := range timeWeightStopNames {
+			styled[i] = dimStyle.Render(name)
+		}
+		styled[stop] = selectedStyle.Render(timeWeightStopNames[stop])
+		return dimStyle.Render(prefix) + strings.Join(styled, dimStyle.Render(" · ")) + keyHintStyle.Render(keys)
+	}
+	current := prefix + timeWeightStopNames[stop] + keys
+	if lipgloss.Width(current) <= width {
+		return dimStyle.Render(prefix) + selectedStyle.Render(timeWeightStopNames[stop]) + keyHintStyle.Render(keys)
+	}
+	if lipgloss.Width(timeWeightStopNames[stop]+keys) <= width {
+		return selectedStyle.Render(timeWeightStopNames[stop]) + keyHintStyle.Render(keys)
+	}
+	if lipgloss.Width(key) <= width {
+		return keyHintStyle.Render(key)
+	}
+	return dimStyle.Render(shorten(full, width))
+}
+
+// renderDegradationLine draws the degradation recovery switch under the
+// speed/price control. On, it also names the rule the switch is running: the
+// share of baseline that counts as degraded, and how long the drop must hold.
+// The line carries the `d` key itself: the hint above it lists the pane's other
+// controls, and the same convention puts `[n/m Tab]` on the model line. A pane
+// that runs out of room drops the rule first, then the label, and never the key:
+// a styled line cannot be clipped safely at an arbitrary column.
+func renderDegradationLine(enabled bool, cfg config, width int) string {
+	const prefix = "Degradation recovery  "
+	const key = "  (d)"
+	state := "off"
+	stateStyle := dimStyle
+	if enabled {
+		state = "on"
+		stateStyle = selectedStyle
+	}
+	// Missing settings stay off the line rather than printing a zero: a pane is
+	// no place to invent a rule the watch is not running.
+	rule := ""
+	if enabled {
+		if cfg.DegradationThreshold > 0 {
+			rule = fmt.Sprintf("%.0f%%", cfg.DegradationThreshold*100)
+		}
+		if window := shortDuration(cfg.DegradationWindow); window != "" {
+			if rule != "" {
+				rule += " / "
+			}
+			rule += window
+		}
+	}
+	plain := prefix + state
+	styled := dimStyle.Render(prefix) + stateStyle.Render(state)
+	if rule != "" {
+		plain += "  " + rule
+		styled += dimStyle.Render("  " + rule)
+	}
+	plain += key
+	styled += keyHintStyle.Render(key)
+	if lipgloss.Width(plain) <= width {
+		return styled
+	}
+	plain = prefix + state + key
+	if lipgloss.Width(plain) <= width {
+		return dimStyle.Render(prefix) + stateStyle.Render(state) + keyHintStyle.Render(key)
+	}
+	plain = state + key
+	if lipgloss.Width(plain) <= width {
+		return stateStyle.Render(state) + keyHintStyle.Render(key)
+	}
+	if lipgloss.Width("(d)") <= width {
+		return keyHintStyle.Render("(d)")
+	}
+	return dimStyle.Render(shorten(plain, width))
+}
+
+// shortDuration renders a configured duration for the pane. Hours and minutes
+// are what this feature is tuned in; sub-minute windows keep their seconds, and
+// a sub-second one keeps its milliseconds rather than truncating to zero.
+func shortDuration(d time.Duration) string {
+	if d <= 0 {
+		return ""
+	}
+	if d%time.Hour == 0 {
+		return fmt.Sprintf("%dh", int(d/time.Hour))
+	}
+	if d%time.Minute == 0 {
+		return fmt.Sprintf("%dm", int(d/time.Minute))
+	}
+	if d < time.Second {
+		return d.String()
+	}
+	return fmt.Sprintf("%ds", int(d/time.Second))
 }
 
 func (m dashboardModel) renderRouting(snap statsSnapshot, width, height int) string {
+	data := m.providerTableData(snap)
 	pinned, pinnedManual := m.routing.pinInfo(m.model)
 	blocked := m.routing.blockedProviders(m.model)
 	pinSuffix := ""
@@ -1054,40 +1531,225 @@ func (m dashboardModel) renderRouting(snap statsSnapshot, width, height int) str
 		pinBroken = true
 		pinSuffix += " ⊘ " + shortBlockReason(entry.Reason)
 	}
-	modelLine := "Model  " + m.model
+	modelCounter := ""
 	if len(m.activeModels) > 1 {
 		idx := indexOfString(m.activeModels, m.model)
 		if idx < 0 {
 			idx = 0
 		}
-		modelLine += fmt.Sprintf("  [%d/%d Tab]", idx+1, len(m.activeModels))
+		modelCounter = fmt.Sprintf("[%d/%d Tab]", idx+1, len(m.activeModels))
 	}
-	hint := "↑/↓ select • Enter toggle • r refresh • t test • a all"
+	// The hint names each key in its own parentheses, so the panel's colour can
+	// point at what to press without tinting the explanation beside it. The
+	// degradation switch below carries its own `d`, so this line does not. The
+	// picker and the tab close sit next to the Tab switch they belong with, and
+	// the provider-table keys take their own line so neither has to shed its
+	// tail on a narrow pane.
+	hints := []keyHint{{"↑/↓", "select"}, {"Enter", "toggle"}}
 	if len(m.activeModels) > 1 {
-		hint = "↑/↓ select • Enter toggle • Tab switch • r refresh • t test • a all"
+		hints = append(hints, keyHint{"Tab", "switch"})
 	}
-	pinLine := "Pin    " + shorten(pinned+pinSuffix, max(1, width-7))
+	hints = append(hints,
+		keyHint{"k", "models"},
+		keyHint{"x", "close tab"},
+	)
+	providerHints := []keyHint{
+		{"r", "reload provider list"},
+		{"t", "test provider"},
+		{"a", "test all"},
+	}
+	// Each name on the line follows the same split: a dim label, then the value
+	// it names at the terminal's full brightness, the way the prediction line
+	// labels its figures. The pin's value is the exception when the account
+	// cannot route to it.
+	const (
+		modelLabel = "Model  "
+		pinLabel   = "Pin    "
+	)
+	pinValue := shorten(pinned+pinSuffix, max(1, width-lipgloss.Width(pinLabel)))
+	pinText := pinLabel + pinValue
+	pinStyled := dimStyle.Render(pinLabel) + pinValue
 	if pinBroken {
-		pinLine = errorStyle.Render(pinLine)
+		pinStyled = errorStyle.Render(pinText)
+	}
+	// The model counter, the table's display order, the model name, and the pin
+	// share a line, in that order. The pin keeps its place — it is what requests
+	// actually follow — and the model name is the only label shortened; the
+	// counter and the order indicator are dropped whole once space runs out.
+	const gap = "    "
+	orderText := "Order " + m.providerSort.label() + " (o)"
+	// The order's value stays at full brightness while the routing order is the
+	// default; once a column orders the table it is a state, so it takes the
+	// accent the panel's keys use.
+	orderName := m.providerSort.label()
+	if m.providerSort != providerSortRoute {
+		orderName = keyHintStyle.Render(m.providerSort.label())
+	}
+	orderStyled := dimStyle.Render("Order ") + orderName + keyHintStyle.Render(" (o)")
+	modelRoom := func(segments ...string) int {
+		used := 0
+		for _, segment := range segments {
+			if segment == "" {
+				continue
+			}
+			used += lipgloss.Width(segment) + lipgloss.Width(gap)
+		}
+		return width - used
+	}
+	joinSegments := func(segments ...string) string {
+		parts := make([]string, 0, len(segments))
+		for _, segment := range segments {
+			if segment != "" {
+				parts = append(parts, segment)
+			}
+		}
+		return strings.Join(parts, gap)
+	}
+	// A model name cut below this is no longer worth the cells it takes from
+	// the other labels.
+	const minModelWidth = 12
+	// The label is a fixed seven cells, so the name takes the cuts alone.
+	modelSegment := func(room int) string {
+		return dimStyle.Render(modelLabel) + shorten(m.model, max(1, room-lipgloss.Width(modelLabel)))
+	}
+	header := ""
+	switch {
+	case modelRoom(modelCounter, orderText, pinText) >= minModelWidth:
+		header = joinSegments(modelCounter, orderStyled,
+			modelSegment(modelRoom(modelCounter, orderText, pinText)), pinStyled)
+	case modelRoom(orderText, pinText) >= minModelWidth:
+		header = joinSegments(orderStyled, modelSegment(modelRoom(orderText, pinText)), pinStyled)
+	case modelRoom(pinText) >= minModelWidth:
+		header = joinSegments(modelSegment(modelRoom(pinText)), pinStyled)
+	case modelRoom(orderText, pinText) >= 0:
+		// Too narrow for the model: the order indicator keeps the pin company.
+		header = joinSegments(orderStyled, pinStyled)
+	default:
+		// The pin wins the line on its own.
+		header = pinStyled
 	}
 	lines := []string{
 		titleStyle.Render("Routing"),
 		"",
-		dimStyle.Render(shorten(hint, width)),
-		dimStyle.Render(shorten("Ts/mTs tok/s • Lat/mLat ms (m = measured) • GPQA/Tau OR benchmarks • Tool/Json OR weekly avg errors • mApi/mTool measured errors", width)),
-		dimStyle.Render(shorten("API P50: last 30m • website P50: 1 week", width)),
+		renderKeyHints(hints, width),
+		renderKeyHints(providerHints, width),
 		"",
-		shorten(modelLine, max(7, width)),
-		pinLine,
-		"",
+		renderTimeWeightSlider(m.routing.currentTimeWeight(), width),
+		renderDegradationLine(m.routing.degradationEnabled(), m.cfg, width),
 	}
+	// The projection follows the controls it qualifies, above the pin line: it
+	// describes the selected route rather than the current pin, and three
+	// horizons do not fit beside the pin without shortening the model name. A
+	// line too narrow for all three drops the figure whole rather than a horizon.
+	if predictText, predictStyled := m.predictionText(data); predictText != "" && lipgloss.Width(predictText) <= width {
+		lines = append(lines, predictStyled)
+	}
+	lines = append(lines, "", header, "")
 	tableHeight := max(1, height-lipgloss.Height(strings.Join(lines, "\n"))-2)
-	lines = append(lines, m.renderProviderTable(snap, width, tableHeight))
+	lines = append(lines, m.renderProviderTableData(data, width, tableHeight))
 	content := strings.Join(lines, "\n")
 	if lipgloss.Height(content) > height {
 		content = shortenLines(content, height)
 	}
 	return content
+}
+
+// predictionText projects the selected provider's spend over the pane's
+// horizons. The selection is the row the user is on, so the figures answer
+// "what would this route cost me" before it is pinned, and they follow ↑/↓ the
+// way the highlight does. The label carries the workload being priced, and the
+// workload is fixed, so the figures move only when the selection does or the
+// provider reprices; nothing is projected when its catalog entry is missing a
+// price the workload needs.
+func (m dashboardModel) predictionText(data providerTableData) (plain, styled string) {
+	provider, ok := data.selected(m.providerSort, m.selection)
+	if !ok {
+		return "", ""
+	}
+	endpoint, ok := data.endpoints[provider]
+	if !ok {
+		return "", ""
+	}
+	if _, blocked := data.blocked[provider]; blocked {
+		// The account cannot route to this provider, so its prices are not on
+		// offer and a projection would price a route that does not exist.
+		return "", ""
+	}
+	daily := m.predictionStepValue()
+	hourly, ok := newPredictionRate(float64(daily)).hourlyCost(endpoint.Pricing)
+	if !ok {
+		return "", ""
+	}
+	workload := formatPredictionWorkload(daily)
+	values := strings.Join(predictionSpend(hourly), "  ")
+	plain = "Prediction (p) " + workload + "  " + values
+	styled = dimStyle.Render("Prediction ") + keyHintStyle.Render("(p)") + " " + workload + "  " + values
+	return plain, styled
+}
+
+// freshTestResults collects the 't' ping-pong results still held for a model's
+// current providers, in routing order. Selection ignores the table's display
+// ordering: only which providers were measured matters here.
+func (m dashboardModel) freshTestResults(model string) []providerTestResult {
+	providers := m.routing.providers(model, m.currentSnap().Observed[model])
+	results := make([]providerTestResult, 0, len(providers))
+	for _, provider := range providers {
+		if result, ok := m.testResults[testResultKey(model, provider)]; ok {
+			results = append(results, result.testResult(provider))
+		}
+	}
+	return results
+}
+
+// selectionResults completes fresh measurements with the persisted benchmark
+// pool, which is what lets a selection be re-decided without re-measuring.
+func (m dashboardModel) selectionResults(model string, fresh []providerTestResult, now time.Time) []providerTestResult {
+	providers := m.routing.providers(model, m.currentSnap().Observed[model])
+	return mergeMeasuredProviderResults(fresh, m.stats.benchmarkPool(model), providers, now)
+}
+
+// selectionProfile is the reference request a selection is priced and timed
+// against, plus each provider's recent API error share.
+func (m dashboardModel) selectionProfile(model string, now time.Time) (requestProfile, map[string]float64) {
+	snap := m.currentSnap()
+	return newRequestProfile(snap.MetricsRecords, model, now), providerAPIErrorRates(snap.Records, model, now)
+}
+
+// adjustTimeWeight moves the speed/price slider by step and re-selects the
+// automatic pin from measurements already held, so the routing pane answers the
+// keystroke immediately instead of waiting for the next benchmark. The value is
+// mirrored into stats, which the periodic and shutdown saves persist; the
+// provider order is deliberately left alone (see rerankAutomaticPin).
+func (m *dashboardModel) adjustTimeWeight(step float64) {
+	weight := clampTimeWeight(m.routing.currentTimeWeight() + step)
+	m.routing.setTimeWeight(weight)
+	m.stats.setTimeWeight(weight)
+	if m.model == "" {
+		return
+	}
+	now := m.routing.now()
+	results := m.selectionResults(m.model, m.freshTestResults(m.model), now)
+	profile, apiErrors := m.selectionProfile(m.model, now)
+	best, updated := m.routing.rerankAutomaticPin(m.model, results, profile, apiErrors)
+	if best == "" || !updated {
+		return
+	}
+	syncPersistedAutomaticPin(m.routing, m.stats, m.model)
+	m.selectActiveProvider(m.currentSnap())
+}
+
+// toggleDegradation flips degradation recovery. Turning it on checks straight
+// away — the pane is where the user just made the decision, so the answer
+// should not wait for the next request to be measured. Turning it off needs no
+// action: the request path stops scanning on its own. The state is mirrored
+// into stats, which the periodic and shutdown saves persist.
+func (m *dashboardModel) toggleDegradation() {
+	enabled := !m.routing.degradationEnabled()
+	m.routing.setDegradation(enabled)
+	m.stats.setDegradation(enabled)
+	if enabled && m.checkDegradation != nil && m.model != "" {
+		m.checkDegradation(m.model)
+	}
 }
 
 // testResultKey scopes test state to a single (model, provider) pair, so
@@ -1123,6 +1785,9 @@ func (m dashboardModel) testResultFor(model, provider string) (providerTestMsg, 
 // noScore marks a metric with no data for a provider; such cells render unstyled.
 const noScore = -1
 
+// measuredMetrics holds the rolling 30-minute P50 throughput and P50 time to
+// first token measured by this proxy. latency is the median time to first
+// token, matching OpenRouter's latency definition.
 type measuredMetrics struct {
 	throughput float64
 	latency    float64
@@ -1313,8 +1978,12 @@ func percentileFloat(values []float64, p float64) float64 {
 	return values[lower] + (values[upper]-values[lower])*fraction
 }
 
-// providerMeasuredMetrics reports the rolling 30-minute P50 throughput and
-// total request latency shown in the routing table's mTs and mLat columns.
+// providerMeasuredMetrics reports the rolling 30-minute P50 throughput and P50
+// time to first token shown in the routing table's mTp and mLat
+// columns.
+//
+// Lat is the median time to first token, matching OpenRouter's latency
+// definition (their "latency" is time to first token).
 //
 // This is the lived-experience view: every successful request counts, including
 // the client's own traffic. Ranking deliberately does not use it — see
@@ -1332,7 +2001,7 @@ func providerMeasuredMetrics(records []requestRecord, model, provider string, no
 		if value := r.tokensPerSecond(); value > 0 {
 			throughputs = append(throughputs, value)
 		}
-		if value := float64(r.Duration.Milliseconds()); value > 0 {
+		if value := float64(r.TTFT.Milliseconds()); r.TTFT > 0 {
 			latencies = append(latencies, value)
 		}
 	}
@@ -1347,30 +2016,177 @@ func providerMeasuredMetrics(records []requestRecord, model, provider string, no
 	return tps, latency
 }
 
-func (m dashboardModel) renderProviderTable(snap statsSnapshot, width, height int) string {
-	pinned, pinnedManual := m.routing.pinInfo(m.model)
+// providerSortColumn is the provider table's display ordering. Routing order is
+// the default and stays the order requests follow; a metric column reorders the
+// rows on screen only, leaving the pin and the routing order untouched.
+type providerSortColumn int
+
+const (
+	providerSortRoute providerSortColumn = iota
+	providerSortInput
+	providerSortOutput
+	providerSortCache
+	providerSortThroughput
+	providerSortMeasuredThroughput
+	providerSortLatency
+	providerSortMeasuredLatency
+	providerSortGPQA
+	providerSortTau
+	providerSortToolError
+	providerSortJSONError
+	providerSortAPIError
+	providerSortMeasuredToolError
+	providerSortColumns
+)
+
+// providerSortLabels names each column as the table heads it, with Default
+// standing for the routing order requests follow.
+var providerSortLabels = [...]string{
+	providerSortRoute:              "Default",
+	providerSortInput:              "In",
+	providerSortOutput:             "Out",
+	providerSortCache:              "Cache",
+	providerSortThroughput:         "Tp",
+	providerSortMeasuredThroughput: "mTp",
+	providerSortLatency:            "Lat",
+	providerSortMeasuredLatency:    "mLat",
+	providerSortGPQA:               "GPQA",
+	providerSortTau:                "Tau",
+	providerSortToolError:          "Tool",
+	providerSortJSONError:          "Json",
+	providerSortAPIError:           "mApi",
+	providerSortMeasuredToolError:  "mTool",
+}
+
+// providerTableHeader heads the table: the provider label, then one column per
+// sortable metric, in providerSortColumn order so headerIndex indexes it.
+func providerTableHeader() []string {
+	return append([]string{"Provider"}, providerSortLabels[providerSortInput:]...)
+}
+
+func (c providerSortColumn) label() string {
+	if c < providerSortRoute || c >= providerSortColumns {
+		return providerSortLabels[providerSortRoute]
+	}
+	return providerSortLabels[c]
+}
+
+// headerIndex is the column's cell in the provider table header, or -1 when the
+// routing order is showing and no column is sorted.
+func (c providerSortColumn) headerIndex() int {
+	if c < providerSortInput || c >= providerSortColumns {
+		return -1
+	}
+	return int(c)
+}
+
+// next advances the 'o' cycle, wrapping back to the routing order.
+func (c providerSortColumn) next() providerSortColumn {
+	if c < providerSortRoute || c >= providerSortColumns-1 {
+		return providerSortRoute
+	}
+	return c + 1
+}
+
+// sortValueMissing marks a cell the table leaves blank. It sorts after every
+// reported value whatever the column's direction.
+var sortValueMissing = math.Inf(1)
+
+// providerSortValues holds one row's ordering values. Blanks stay at
+// sortValueMissing except for the error columns, where a reported zero is a
+// clean record and sorts first.
+type providerSortValues struct {
+	in, out, cache              float64
+	throughput, latency         float64
+	measThroughput, measLatency float64
+	gpqa, tau                   float64
+	toolError, jsonError        float64
+	apiError, measToolError     float64
+}
+
+// sortKey returns an ascending-is-best key for a column: prices, latencies and
+// error rates as reported, throughput and benchmark scores descending, and
+// blanks last.
+func (v providerSortValues) sortKey(column providerSortColumn) float64 {
+	switch column {
+	case providerSortInput:
+		return v.in
+	case providerSortOutput:
+		return v.out
+	case providerSortCache:
+		return v.cache
+	case providerSortThroughput:
+		return descendingKey(v.throughput)
+	case providerSortMeasuredThroughput:
+		return descendingKey(v.measThroughput)
+	case providerSortLatency:
+		return v.latency
+	case providerSortMeasuredLatency:
+		return v.measLatency
+	case providerSortGPQA:
+		return descendingKey(v.gpqa)
+	case providerSortTau:
+		return descendingKey(v.tau)
+	case providerSortToolError:
+		return v.toolError
+	case providerSortJSONError:
+		return v.jsonError
+	case providerSortAPIError:
+		return v.apiError
+	case providerSortMeasuredToolError:
+		return v.measToolError
+	}
+	return 0
+}
+
+// descendingKey flips a higher-is-better value for an ascending comparison,
+// leaving the missing marker at positive infinity so blanks stay last.
+func descendingKey(value float64) float64 {
+	if math.IsInf(value, 1) {
+		return value
+	}
+	return -value
+}
+
+// reportedValue keeps a measurement the table would show and blanks the rest.
+func reportedValue(value float64) float64 {
+	if value > 0 {
+		return value
+	}
+	return sortValueMissing
+}
+
+// providerTableData is one model's provider table: the inputs it renders and
+// the values its display ordering compares. Rows are held in routing order.
+type providerTableData struct {
+	providers    []string
+	endpoints    map[string]endpointMeta
+	measured     map[string]measuredMetrics
+	records      map[string][]requestRecord
+	scores       map[string]providerScores
+	blocked      map[string]blockedProvider
+	pinned       string
+	pinnedManual bool
+	sortValues   map[string]providerSortValues
+}
+
+// providerTableData gathers the table's inputs once, so the rows drawn and the
+// rows navigation and the p/t keys walk are built from the same values.
+func (m dashboardModel) providerTableData(snap statsSnapshot) providerTableData {
 	providers := m.routing.providers(m.model, snap.Observed[m.model])
-
-	endpoints := m.routing.endpoints(m.model)
-	endpointByTag := make(map[string]endpointMeta, len(endpoints))
-	for _, ep := range endpoints {
-		endpointByTag[ep.Tag] = ep
+	endpointByTag := make(map[string]endpointMeta, len(providers))
+	for _, endpoint := range m.routing.endpoints(m.model) {
+		endpointByTag[endpoint.Tag] = endpoint
 	}
-
-	if len(providers) == 0 && len(endpoints) == 0 {
-		return dimStyle.Render(shorten("waiting for model data", width))
-	}
-
-	header := []string{"Provider", "In", "Out", "Cache", "Ts", "mTs", "Lat", "mLat", "TTFT", "GPQA", "Tau", "Tool", "Json", "mApi", "mTool"}
 
 	now := m.routing.now()
 	measured := make(map[string]measuredMetrics, len(providers))
-	records := make(map[string][]requestRecord, len(providers))
 	for _, provider := range providers {
-		tps, lat := providerMeasuredMetrics(snap.MetricsRecords, m.model, provider, now)
-		measured[provider] = measuredMetrics{throughput: tps, latency: lat}
+		tps, latency := providerMeasuredMetrics(snap.MetricsRecords, m.model, provider, now)
+		measured[provider] = measuredMetrics{throughput: tps, latency: latency}
 	}
 	cutoff := now.Add(-measuredMetricsTTL)
+	records := make(map[string][]requestRecord, len(providers))
 	for _, record := range snapshotWindowRecords(snap) {
 		if record.Model == m.model && (record.Time.IsZero() || !record.Time.Before(cutoff)) {
 			records[record.Provider] = append(records[record.Provider], record)
@@ -1381,21 +2197,141 @@ func (m dashboardModel) renderProviderTable(snap statsSnapshot, width, height in
 	scores := computeScores(providers, endpointByTag, measured)
 	applyProviderQualityScores(providers, m.quality[m.model], scores)
 	applyMeasuredErrorScores(providers, records, scores)
-	ttfts := make(map[string]float64, len(providers))
+	pinned, pinnedManual := m.routing.pinInfo(m.model)
+
+	values := make(map[string]providerSortValues, len(providers))
 	for _, provider := range providers {
-		if value := groupTTFTDuration(records[provider]); value > 0 {
-			ttfts[provider] = float64(value)
-		}
+		_, isBlocked := blocked[provider]
+		values[provider] = m.providerSortRow(provider, endpointByTag, measured, records, isBlocked)
 	}
-	ttftLow, ttftHigh := robustBounds(ttfts)
-	ttftCells := make(map[string]string, len(providers))
-	for _, provider := range providers {
-		cell := groupTTFT(records[provider])
-		if value, ok := ttfts[provider]; ok {
-			cell = lipgloss.NewStyle().Foreground(gradientColor(displayContrastScore(scoreFor(value, ttftLow, ttftHigh)))).Render(cell)
-		}
-		ttftCells[provider] = cell
+	return providerTableData{
+		providers:    providers,
+		endpoints:    endpointByTag,
+		measured:     measured,
+		records:      records,
+		scores:       scores,
+		blocked:      blocked,
+		pinned:       pinned,
+		pinnedManual: pinnedManual,
+		sortValues:   values,
 	}
+}
+
+// ordered returns the rows in the dashboard's display order, keeping the
+// routing order between rows whose values tie, blanks included.
+func (d providerTableData) ordered(column providerSortColumn) []string {
+	if column == providerSortRoute {
+		return d.providers
+	}
+	ordered := append([]string(nil), d.providers...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return d.sortValues[ordered[i]].sortKey(column) < d.sortValues[ordered[j]].sortKey(column)
+	})
+	return ordered
+}
+
+// selected returns the provider the highlight is on in the dashboard's display
+// order, which is the row a keystroke or a projection is about.
+func (d providerTableData) selected(column providerSortColumn, selection int) (string, bool) {
+	ordered := d.ordered(column)
+	if selection < 0 || selection >= len(ordered) {
+		return "", false
+	}
+	return ordered[selection], true
+}
+
+// providerSortRow reads one row's ordering values from the data the table
+// renders, including the fresh 't' measurement that replaces mTp and mLat.
+func (m dashboardModel) providerSortRow(provider string, endpoints map[string]endpointMeta, measured map[string]measuredMetrics, records map[string][]requestRecord, blocked bool) providerSortValues {
+	values := providerSortValues{
+		in:             sortValueMissing,
+		out:            sortValueMissing,
+		cache:          sortValueMissing,
+		throughput:     sortValueMissing,
+		latency:        sortValueMissing,
+		measThroughput: sortValueMissing,
+		measLatency:    sortValueMissing,
+		gpqa:           sortValueMissing,
+		tau:            sortValueMissing,
+		toolError:      sortValueMissing,
+		jsonError:      sortValueMissing,
+		apiError:       sortValueMissing,
+		measToolError:  sortValueMissing,
+	}
+	if endpoint, ok := endpoints[provider]; ok {
+		values.in = reportedValue(endpoint.Pricing.Prompt.float())
+		values.out = reportedValue(endpoint.Pricing.Completion.float())
+		values.cache = reportedValue(endpoint.Pricing.InputCacheRead.float())
+		values.throughput = reportedValue(endpoint.Throughput)
+		values.latency = reportedValue(endpoint.Latency)
+	}
+	if metrics, ok := measured[provider]; ok {
+		values.measThroughput = reportedValue(metrics.throughput)
+		values.measLatency = reportedValue(metrics.latency)
+	}
+	if result, fresh := m.testResultFor(m.model, provider); fresh && result.err == nil {
+		if result.tps > 0 {
+			values.measThroughput = result.tps
+		}
+		values.measLatency = reportedValue(float64(result.ttft.Milliseconds()))
+	}
+	if blocked {
+		// The table blanks these cells: measurements of an endpoint the account
+		// cannot route to no longer describe an available route.
+		values.measThroughput, values.measLatency = sortValueMissing, sortValueMissing
+	}
+	quality := m.quality[m.model][provider]
+	if validQualityValue(quality.GPQA, 1) {
+		values.gpqa = *quality.GPQA
+	}
+	if validQualityValue(quality.Tau, 1) {
+		values.tau = *quality.Tau
+	}
+	if validQualityValue(quality.ToolError, 100) {
+		values.toolError = *quality.ToolError
+	}
+	if validQualityValue(quality.StructuredError, 100) {
+		values.jsonError = *quality.StructuredError
+	}
+	apiRate, toolRate := groupErrorRateValues(records[provider])
+	if apiRate >= 0 {
+		values.apiError = apiRate
+	}
+	if toolRate >= 0 {
+		values.measToolError = toolRate
+	}
+	return values
+}
+
+// metricLabel heads a metric line in the compact layout, in the dim label
+// colour the wide layout heads its columns with. The column ordering the rows is
+// pointed at in the accent the panel's keys use, so the marked name reads as a
+// state of the table rather than a second heading.
+func (m dashboardModel) metricLabel(label string) string {
+	if m.providerSort != providerSortRoute && m.providerSort.label() == label {
+		return keyHintStyle.Render(label)
+	}
+	return dimStyle.Render(label)
+}
+
+func (m dashboardModel) renderProviderTable(snap statsSnapshot, width, height int) string {
+	return m.renderProviderTableData(m.providerTableData(snap), width, height)
+}
+
+func (m dashboardModel) renderProviderTableData(data providerTableData, width, height int) string {
+	if len(data.providers) == 0 && len(data.endpoints) == 0 {
+		return dimStyle.Render(shorten("waiting for model data", width))
+	}
+
+	header := providerTableHeader()
+
+	providers := data.ordered(m.providerSort)
+	endpointByTag := data.endpoints
+	measured := data.measured
+	records := data.records
+	scores := data.scores
+	blocked := data.blocked
+	pinned, pinnedManual := data.pinned, data.pinnedManual
 	styleCell := func(value string, score float64) string {
 		if score < 0 {
 			return value
@@ -1409,7 +2345,7 @@ func (m dashboardModel) renderProviderTable(snap statsSnapshot, width, height in
 		minimumWidth += max(6, lipgloss.Width(label))
 	}
 	if width < max(110, minimumWidth) {
-		return m.renderCompactProviderTable(providers, endpointByTag, measured, records, ttftCells, scores, blocked, pinned, pinnedManual, m.selection, width, height, styleCell)
+		return m.renderCompactProviderTable(providers, endpointByTag, measured, records, scores, blocked, pinned, pinnedManual, m.selection, width, height, styleCell)
 	}
 
 	type tableRow struct {
@@ -1448,7 +2384,7 @@ func (m dashboardModel) renderProviderTable(snap statsSnapshot, width, height in
 		mLat := meas.latency
 		if r, fresh := m.testResultFor(m.model, provider); fresh && r.err == nil {
 			mToks = r.tps
-			mLat = float64(r.latency.Milliseconds())
+			mLat = float64(r.ttft.Milliseconds())
 		}
 		if isBlocked {
 			// An account-policy refusal makes the endpoint unroutable regardless
@@ -1464,7 +2400,7 @@ func (m dashboardModel) renderProviderTable(snap statsSnapshot, width, height in
 		quality[1] = styleCell(quality[1], s.tau)
 		quality[2] = styleQualityError(quality[2], s.orToolError)
 		quality[3] = styleQualityError(quality[3], s.orJSONError)
-		observed := []string{ttftCells[provider], quality[0], quality[1], quality[2], quality[3], apiErr, toolErr}
+		observed := []string{quality[0], quality[1], quality[2], quality[3], apiErr, toolErr}
 		if ok {
 			cells = append(cells,
 				styleCell(pricePerM(ep.Pricing.Prompt), s.prompt),
@@ -1493,8 +2429,11 @@ func (m dashboardModel) renderProviderTable(snap statsSnapshot, width, height in
 	}
 	columnWidths := providerTableColumnWidths(allCells, width)
 	lines := make([]string, 0, len(rows))
-	for _, row := range rows {
+	for i, row := range rows {
 		line := renderProviderTableRow(row.cells, columnWidths, width)
+		if i == 0 {
+			line = m.renderProviderHeaderRow(row.cells, columnWidths, width)
+		}
 		if row.blocked {
 			// Tint the whole row, discarding the price gradient: those prices
 			// are not on offer to this account, so colouring them as a good
@@ -1509,7 +2448,31 @@ func (m dashboardModel) renderProviderTable(snap statsSnapshot, width, height in
 	return renderProviderTableWindow(lines[0], lines[1:], m.selection, height)
 }
 
-func (m dashboardModel) renderCompactProviderTable(providers []string, endpoints map[string]endpointMeta, measured map[string]measuredMetrics, records map[string][]requestRecord, ttftCells map[string]string, scores map[string]providerScores, blocked map[string]blockedProvider, pinned string, pinnedManual bool, selection, width, height int, styleCell func(string, float64) string) string {
+// renderProviderHeaderRow heads the table in the dim label colour, with the
+// column ordering the rows pointed at in the accent the panel's keys use.
+func (m dashboardModel) renderProviderHeaderRow(names []string, columnWidths []int, maxWidth int) string {
+	sorted := m.providerSort.headerIndex()
+	line := ""
+	for i, name := range names {
+		cellWidth := 1
+		if i < len(columnWidths) {
+			cellWidth = columnWidths[i]
+		}
+		cell := padRight(shorten(name, cellWidth), cellWidth)
+		if i == sorted {
+			cell = keyHintStyle.Render(cell)
+		} else {
+			cell = dimStyle.Render(cell)
+		}
+		if i > 0 {
+			line += " "
+		}
+		line += cell
+	}
+	return shorten(line, maxWidth)
+}
+
+func (m dashboardModel) renderCompactProviderTable(providers []string, endpoints map[string]endpointMeta, measured map[string]measuredMetrics, records map[string][]requestRecord, scores map[string]providerScores, blocked map[string]blockedProvider, pinned string, pinnedManual bool, selection, width, height int, styleCell func(string, float64) string) string {
 	rows := make([]string, 0, len(providers))
 	for i, provider := range providers {
 		var lines []string
@@ -1542,7 +2505,7 @@ func (m dashboardModel) renderCompactProviderTable(providers []string, endpoints
 		mLat := meas.latency
 		if r, fresh := m.testResultFor(m.model, provider); fresh && r.err == nil {
 			mToks = r.tps
-			mLat = float64(r.latency.Milliseconds())
+			mLat = float64(r.ttft.Milliseconds())
 		}
 		if isBlocked {
 			mToks, mLat = 0, 0
@@ -1555,21 +2518,20 @@ func (m dashboardModel) renderCompactProviderTable(providers []string, endpoints
 		quality[2] = styleQualityError(quality[2], s.orToolError)
 		quality[3] = styleQualityError(quality[3], s.orJSONError)
 		pricing := []string{
-			"In " + styleCell(pricePerM(ep.Pricing.Prompt), s.prompt),
-			"Out " + styleCell(pricePerM(ep.Pricing.Completion), s.completion),
-			"Cache " + styleCell(pricePerM(ep.Pricing.InputCacheRead), s.cacheRead),
+			m.metricLabel("In") + " " + styleCell(pricePerM(ep.Pricing.Prompt), s.prompt),
+			m.metricLabel("Out") + " " + styleCell(pricePerM(ep.Pricing.Completion), s.completion),
+			m.metricLabel("Cache") + " " + styleCell(pricePerM(ep.Pricing.InputCacheRead), s.cacheRead),
 		}
 		performance := []string{
-			"Ts " + styleCell(formatThroughput(ep.Throughput), s.throughput),
-			"mTs " + styleCell(formatThroughput(mToks), s.measThroughput),
-			"Lat " + styleCell(formatLatency(ep.Latency), s.latency),
-			"mLat " + styleCell(formatLatency(mLat), s.measLatency),
-			"TTFT " + ttftCells[provider],
-			"GPQA " + quality[0],
-			"Tau " + quality[1],
+			m.metricLabel("Tp") + " " + styleCell(formatThroughput(ep.Throughput), s.throughput),
+			m.metricLabel("mTp") + " " + styleCell(formatThroughput(mToks), s.measThroughput),
+			m.metricLabel("Lat") + " " + styleCell(formatLatency(ep.Latency), s.latency),
+			m.metricLabel("mLat") + " " + styleCell(formatLatency(mLat), s.measLatency),
+			m.metricLabel("GPQA") + " " + quality[0],
+			m.metricLabel("Tau") + " " + quality[1],
 		}
 		if width < 60 {
-			observed := []string{"TTFT " + ttftCells[provider], "GPQA " + quality[0], "Tau " + quality[1]}
+			observed := []string{m.metricLabel("GPQA") + " " + quality[0], m.metricLabel("Tau") + " " + quality[1]}
 			lines = append(lines, ansi.Wrap(strings.Join(pricing, " "), max(1, width), ""))
 			lines = append(lines, ansi.Wrap(strings.Join(performance[:4], " "), max(1, width), ""))
 			lines = append(lines, ansi.Wrap(strings.Join(observed, " "), max(1, width), ""))
@@ -1577,8 +2539,8 @@ func (m dashboardModel) renderCompactProviderTable(providers []string, endpoints
 			lines = append(lines, ansi.Wrap(strings.Join(pricing, " "), max(1, width), ""))
 			lines = append(lines, ansi.Wrap(strings.Join(performance, " "), max(1, width), ""))
 		}
-		lines = append(lines, ansi.Wrap("Tool "+quality[2]+" Json "+quality[3], max(1, width), ""))
-		lines = append(lines, ansi.Wrap("mApi "+apiErr+" mTool "+toolErr, max(1, width), ""))
+		lines = append(lines, ansi.Wrap(m.metricLabel("Tool")+" "+quality[2]+" "+m.metricLabel("Json")+" "+quality[3], max(1, width), ""))
+		lines = append(lines, ansi.Wrap(m.metricLabel("mApi")+" "+apiErr+" "+m.metricLabel("mTool")+" "+toolErr, max(1, width), ""))
 		rows = append(rows, strings.Join(lines, "\n"))
 	}
 	return renderProviderTableWindow(titleStyle.Render("Provider metrics"), rows, selection, height)
@@ -1723,6 +2685,16 @@ func padRight(value string, width int) string {
 	return value + strings.Repeat(" ", width-w)
 }
 
+// padCenter centers value in width. An odd cell of slack goes to the right.
+func padCenter(value string, width int) string {
+	w := lipgloss.Width(value)
+	if w >= width {
+		return value
+	}
+	left := (width - w) / 2
+	return strings.Repeat(" ", left) + value + strings.Repeat(" ", width-w-left)
+}
+
 func formatThroughput(value float64) string {
 	if value <= 0 {
 		return ""
@@ -1756,12 +2728,19 @@ func shortenLines(content string, height int) string {
 	return strings.Join(lines[:height], "\n")
 }
 
+// displayMonthSpend reports the figure the budget row compares with the key's
+// cap. A polled usage for the current billing month is what that cap actually
+// counted, so it wins outright: local accounting also sums traffic the proxy
+// carried under other keys, which the cap never saw. Local traffic is only the
+// fallback for a key that has not answered a poll. The month field is the flag
+// for that answer — updateKeyInfo sets it on every poll that carries data — so
+// a key that has spent nothing this cycle reports the polled zero instead of
+// the proxy's own traffic from before the reset.
 func displayMonthSpend(snap statsSnapshot, now time.Time) float64 {
-	creditSpend := snap.CreditSpend
-	if snap.CreditMonth != now.Local().Format("2006-01") {
-		creditSpend = 0
+	if snap.CreditMonth == now.Local().Format("2006-01") {
+		return snap.CreditSpend
 	}
-	return max(monthSpend(snap.DailyCosts, now), creditSpend)
+	return monthSpend(snap.DailyCosts, now)
 }
 
 func shorten(value string, width int) string {
@@ -1892,13 +2871,15 @@ func groupLabelWidth(groups []modelGroup, width, dataWidth, dataCols int) int {
 	return max(1, min(labelWidth, maxLabelWidth))
 }
 
-// groupHeaderLine renders the title and column headers of a grouped table.
+// groupHeaderLine renders the title and column headers of a grouped table in
+// the dim label colour: the names head the table's columns, so they recede the
+// way every other heading does and leave the full brightness to the values.
 func groupHeaderLine(title string, labelWidth int, dataWidths []int, headers []string) string {
 	line := padRight(shorten(title, labelWidth), labelWidth)
 	for i, h := range headers {
 		line += " " + padRight(shorten(h, dataWidths[i]), dataWidths[i])
 	}
-	return line
+	return dimStyle.Render(line)
 }
 
 // groupEmptyRow renders a blank row for a grouped table with no data.
@@ -1961,26 +2942,6 @@ func renderGroupedTable(groups []modelGroup, width int, headers []string, minDat
 		lines = lines[:maxHeight]
 	}
 	return strings.Join(lines, "\n")
-}
-
-// groupTTFT returns the average time to first token across records, or "".
-func groupTTFT(records []requestRecord) string {
-	return durationText(groupTTFTDuration(records))
-}
-
-func groupTTFTDuration(records []requestRecord) time.Duration {
-	var total time.Duration
-	var count int
-	for _, r := range records {
-		if r.TTFT > 0 {
-			total += r.TTFT
-			count++
-		}
-	}
-	if count == 0 {
-		return 0
-	}
-	return total / time.Duration(count)
 }
 
 // Hide zero and missing rates; shade each measured error column independently.
@@ -2148,13 +3109,6 @@ func formatWindowCost(cost float64, count int) string {
 		return ""
 	}
 	return formatCost(cost)
-}
-
-func durationText(duration time.Duration) string {
-	if duration == 0 {
-		return ""
-	}
-	return fmt.Sprintf("%d", duration.Round(time.Millisecond)/time.Millisecond)
 }
 
 func formatPinTTL(d time.Duration) string {

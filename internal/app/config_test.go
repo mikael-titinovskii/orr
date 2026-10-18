@@ -12,6 +12,8 @@ var runtimeEnvNames = []string{
 	"ORR_TUI", "ORR_PIN_TTL", "ORR_PROVIDERS_FILE",
 	"ORR_UPDATE_MAX_PROVIDERS", "ORR_UPDATE_CACHE_ONLY",
 	"ORR_429_FAILOVER_THRESHOLD",
+	"ORR_DEGRADATION", "ORR_DEGRADATION_THRESHOLD", "ORR_DEGRADATION_WINDOW",
+	"ORR_DEGRADATION_MIN_SAMPLES", "ORR_DEGRADATION_COOLDOWN", "ORR_DEGRADATION_TIMEOUT",
 }
 
 func clearRuntimeEnv(t *testing.T) {
@@ -307,8 +309,92 @@ func TestRejectsInvalidDotEnvSettings(t *testing.T) {
 	}
 }
 
+func TestDegradationSettings(t *testing.T) {
+	clearRuntimeEnv(t)
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	content := `ORR_DEGRADATION=false
+ORR_DEGRADATION_THRESHOLD=0.75
+ORR_DEGRADATION_WINDOW=90s
+ORR_DEGRADATION_MIN_SAMPLES=5
+ORR_DEGRADATION_COOLDOWN=3m
+ORR_DEGRADATION_TIMEOUT=4s
+`
+	if err := os.WriteFile(envPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeProvidersFile(t, filepath.Join(dir, "providers.yaml"))
+	cfg, err := loadConfig(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.degradationDefault() {
+		t.Fatal("ORR_DEGRADATION=false was ignored")
+	}
+	if cfg.DegradationThreshold != 0.75 || cfg.DegradationWindow != 90*time.Second ||
+		cfg.DegradationMinSamples != 5 || cfg.DegradationCooldown != 3*time.Minute ||
+		cfg.DegradationTimeout != 4*time.Second {
+		t.Fatalf("degradation settings = %#v", cfg)
+	}
+
+	// Unset, the watch starts on and its tuning matches the documented defaults.
+	defaultsPath := filepath.Join(dir, "defaults.env")
+	if err := os.WriteFile(defaultsPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defaults, err := loadConfig(defaultsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaults.Degradation != nil || !defaults.degradationDefault() {
+		t.Fatal("unset ORR_DEGRADATION does not start the watch on")
+	}
+	if defaults.DegradationThreshold != defaultDegradationThreshold ||
+		defaults.DegradationWindow != defaultDegradationWindow ||
+		defaults.DegradationMinSamples != defaultDegradationMinSamples ||
+		defaults.DegradationCooldown != defaultDegradationCooldown ||
+		defaults.DegradationTimeout != defaultDegradationTimeout {
+		t.Fatalf("degradation defaults = %#v", defaults)
+	}
+}
+
+func TestDegradationRejectsInvalidSettings(t *testing.T) {
+	for _, content := range []string{
+		"ORR_DEGRADATION_THRESHOLD=0\n",
+		"ORR_DEGRADATION_THRESHOLD=1.5\n",
+		"ORR_DEGRADATION_THRESHOLD=high\n",
+		"ORR_DEGRADATION_WINDOW=soon\n",
+		"ORR_DEGRADATION_WINDOW=0s\n",
+		"ORR_DEGRADATION_WINDOW=30m\n",
+		"ORR_DEGRADATION_MIN_SAMPLES=0\n",
+		"ORR_DEGRADATION_MIN_SAMPLES=two\n",
+		"ORR_DEGRADATION_COOLDOWN=-1m\n",
+		"ORR_DEGRADATION_COOLDOWN=0s\n",
+		"ORR_DEGRADATION_TIMEOUT=0s\n",
+	} {
+		t.Run(content, func(t *testing.T) {
+			clearRuntimeEnv(t)
+			dir := t.TempDir()
+			envPath := filepath.Join(dir, ".env")
+			if err := os.WriteFile(envPath, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			writeProvidersFile(t, filepath.Join(dir, "providers.yaml"))
+			if _, err := loadConfig(envPath); err == nil {
+				t.Fatalf("invalid setting accepted: %q", content)
+			}
+		})
+	}
+}
+
 func TestPinTTLDefaultAndValidation(t *testing.T) {
-	cfg := config{Listen: "127.0.0.1:1", Upstream: "https://example.test", Models: map[string]providerConfig{"a/b": {}}, UpdateMaxProviders: 20, RateLimitFailoverThreshold: defaultRateLimitFailoverThreshold}
+	cfg := config{
+		Listen: "127.0.0.1:1", Upstream: "https://example.test", Models: map[string]providerConfig{"a/b": {}},
+		UpdateMaxProviders: 20, RateLimitFailoverThreshold: defaultRateLimitFailoverThreshold,
+		DegradationThreshold: defaultDegradationThreshold, DegradationWindow: defaultDegradationWindow,
+		DegradationMinSamples: defaultDegradationMinSamples, DegradationCooldown: defaultDegradationCooldown,
+		DegradationTimeout: defaultDegradationTimeout,
+	}
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("zero pin TTL should be valid: %v", err)
 	}

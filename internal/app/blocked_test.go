@@ -204,6 +204,25 @@ func TestPolicyRefusalsDoNotCountAsProviderHealthErrors(t *testing.T) {
 	}
 }
 
+// A benchmark round that answers with an error is spent in its own run: that
+// result is an error and the provider's pool is cleared. Counting the same round
+// here as well would let one bad probe veto every later run for half an hour,
+// even after the provider answered its pings cleanly.
+func TestBenchmarkRoundsStayOutOfProviderErrorRates(t *testing.T) {
+	now := time.Now()
+	records := []requestRecord{
+		{Time: now.Add(-time.Minute), Model: "author/model", Provider: "client-failed", Status: http.StatusBadGateway, Err: true},
+		{Time: now.Add(-time.Minute), Model: "author/model", Provider: "ping-failed", Status: http.StatusBadGateway, Err: true, Benchmark: true},
+	}
+	rates := providerAPIErrorRates(records, "author/model", now)
+	if rate := rates["client-failed"]; rate <= 0 {
+		t.Fatalf("client error rate = %v, want the client failure counted", rate)
+	}
+	if _, counted := rates["ping-failed"]; counted {
+		t.Fatalf("a benchmark round counted in the provider error rate: %v", rates)
+	}
+}
+
 func TestMarkBlockedDemotesProviderAndPromotesAutoPin(t *testing.T) {
 	const model = "author/model"
 	path := filepath.Join(t.TempDir(), "providers.yaml")
@@ -555,6 +574,10 @@ func panelRow(t *testing.T, panel, provider string) string {
 	t.Helper()
 	lines := strings.Split(ansi.Strip(panel), "\n")
 	for i, line := range lines {
+		if strings.HasPrefix(line, "Prediction") {
+			// The projection line names the provider it prices; it is not a row.
+			continue
+		}
 		if strings.Contains(line, provider) && !strings.Contains(line, "blocked by") {
 			return strings.Join(lines[i:min(i+3, len(lines))], "\n")
 		}
@@ -609,8 +632,7 @@ func TestProviderTestRecordsRefusalAndStopsRetrying(t *testing.T) {
 }
 
 // Once a provider is known to be refused, spending benchmark rounds on it only
-// buys the same refusal — and worse, those refusals would satisfy the 70%
-// completion threshold in place of real measurements.
+// buys the same refusal, and every refusal is a round that told orr nothing.
 func TestBenchmarkSkipsBlockedProviders(t *testing.T) {
 	const model = "moonshotai/kimi-k2.5"
 	cfg := testConfig("https://upstream.test/api/v1")
@@ -962,8 +984,8 @@ func TestFreshFailureBeatsAStalePooledSuccess(t *testing.T) {
 	if got := byProvider["answered"]; got.err == nil || got.tps != 0 {
 		t.Fatalf("answered = %+v, want the fresh failure kept, not week-old throughput", got)
 	}
-	// A cancelled test still must not throw away what the pool knows, or the
-	// 70%-completion deadline would wipe every provider it did not reach.
+	// A cancelled test still must not throw away what the pool knows: a run that
+	// ends at its deadline leaves the providers it never reached unmeasured.
 	if got := byProvider["cancelled"]; got.err != nil || got.tps != 300 {
 		t.Fatalf("cancelled = %+v, want the pooled measurement preserved", got)
 	}

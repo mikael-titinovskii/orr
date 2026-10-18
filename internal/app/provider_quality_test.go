@@ -80,7 +80,7 @@ func TestQualityCannotOverrideLatencyTier(t *testing.T) {
 	}
 	meta["slow"] = endpointMeta{Pricing: testPricing(.01, .04, .001)}
 	qualities := map[string]providerQuality{"slow": {GPQA: floatPtr(1), Tau: floatPtr(1), ToolError: floatPtr(0), StructuredError: floatPtr(0)}}
-	deals := rankProviderDeals(results, benchmarkReferenceProfile, meta, map[string]int{"a": 0, "b": 1, "slow": 2}, "", qualities)
+	deals := rankProviderDeals(results, benchmarkReferenceProfile, meta, map[string]int{"a": 0, "b": 1, "slow": 2}, "", qualities, defaultBenchmarkTimeWeight)
 	if deals[0].result.provider == "slow" || deals[2].viable {
 		t.Fatal("quality bypassed latency ceiling")
 	}
@@ -155,18 +155,36 @@ func TestHeadlessBenchmarksFetchAndCacheQuality(t *testing.T) {
 	p.dailyTestProvider = func(context.Context, string, string, int) (providerTestSample, error) {
 		return providerTestSample{tps: 200, ttft: time.Millisecond}, nil
 	}
+	awaitQuality := func() providerQuality {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			p.routing.mu.RLock()
+			cached, ok := p.routing.qualityCache[model]
+			p.routing.mu.RUnlock()
+			if ok {
+				return cached.values["a"]
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("headless quality fetch never landed")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
 	for range 2 {
 		_, complete := p.benchmarkProviders(model, []string{"a"}, p.now().Add(time.Second), true, 1)
 		if !complete {
 			t.Fatal("benchmark incomplete")
 		}
+		// The fetch runs beside the measurement now, so the ranking never waits
+		// for it; the cache is what tells the fetch it landed.
+		quality := awaitQuality()
+		if quality.GPQA == nil || *quality.GPQA != .9 || quality.ToolError == nil || *quality.ToolError != 0 {
+			t.Fatalf("missing headless quality: %+v", quality)
+		}
 	}
 	if calls.Load() != 5 {
 		t.Fatalf("quality requests=%d, want one cached fetch of 5", calls.Load())
-	}
-	quality := p.routing.qualityCache[model].values["a"]
-	if quality.GPQA == nil || *quality.GPQA != .9 || quality.ToolError == nil || *quality.ToolError != 0 {
-		t.Fatalf("missing headless quality: %+v", quality)
 	}
 }
 
@@ -340,7 +358,7 @@ func TestProviderTableShowsOpenRouterQualityAtDifferentWidths(t *testing.T) {
 	}}
 	for _, width := range []int{36, 60, 68, 100, 110, 160} {
 		view := ansi.Strip(dashboard.renderProviderTable(dashboard.stats.snapshot(), width, 100))
-		for _, want := range []string{"GPQA", "Tau", "Tool", "Json", "Ts", "Lat", "90.1%", "76.0%", "0.02%", "1.73%", "50.0%"} {
+		for _, want := range []string{"GPQA", "Tau", "Tool", "Json", "Tp", "Lat", "90.1%", "76.0%", "0.02%", "1.73%", "50.0%"} {
 			if !strings.Contains(view, want) {
 				t.Fatalf("missing %q at width %d:\n%s", want, width, view)
 			}

@@ -32,6 +32,13 @@ func serve(cfg config) error {
 		return fmt.Errorf("load stats: %w", err)
 	}
 	p.routing.restorePins(p.stats.providerPinsSnapshot())
+	// The persisted speed/price exponent governs the very first benchmark, so a
+	// value dialed in with the dashboard slider outlives the process.
+	p.routing.setTimeWeight(p.stats.currentTimeWeight())
+	// The degradation switch follows the same rule: ORR_DEGRADATION only seeds a
+	// state the dashboard has never toggled.
+	p.stats.seedDegradation(cfg.degradationDefault())
+	p.routing.setDegradation(p.stats.degradationEnabled())
 
 	listener, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
@@ -142,6 +149,9 @@ func runDashboard(ctx context.Context, cfg config, p *proxy, serverErrors <-chan
 	dashboard := newDashboard(cfg, p.stats, p.routing)
 	dashboard.refresh = func(model string) {
 		p.routing.forceRefreshModelOrder(model, p.client, p.cfg.Upstream, p.cfg.openRouterKey(), p.cfg.UpdateMaxProviders, p.cfg.UpdateCacheOnly)
+	}
+	dashboard.checkDegradation = func(model string) {
+		p.checkDegradation(model)
 	}
 	dashboard.testProvider = func(model, provider string) (providerTestSample, error) {
 		return p.testProvider(model, provider, providerTestRounds)

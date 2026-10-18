@@ -169,9 +169,15 @@ func TestDailyBenchmarkSelectsHealthyProviderWhenAnotherFails(t *testing.T) {
 	defer upstream.Close()
 
 	orr := startServerWithEnv(t, upstream.URL+"/api/v1", staleProviders("broken", "healthy"), map[string]string{"OPENROUTER_API_KEY": "benchmark-key"})
-	postCompletion(t, orr.baseURL, "partial benchmark failure")
-	assertStrictPin(t, <-live, "broken")
+	// The first request is what measures this model: a model nobody has pinned is
+	// not warmed at startup, and the request itself rides the stored order while
+	// the run happens behind it.
+	postCompletion(t, orr.baseURL, "trigger the benchmark")
 	waitForPersistedOrder(t, orr.providersPath, "healthy", "broken")
+	// Requests that raced the run are not the ones under test.
+	for len(live) > 0 {
+		<-live
+	}
 	postCompletion(t, orr.baseURL, "use healthy measured provider")
 	assertStrictPin(t, <-live, "healthy")
 }

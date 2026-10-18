@@ -42,8 +42,13 @@ type proxy struct {
 	dailyClosed    bool
 	recoveryLast   map[string]time.Time
 	recoveryWanted map[string]bool
-	rateLimitMu    sync.Mutex
-	rateLimitRuns  map[rateLimitKey]int
+	// degradationMu guards the watchdog's cooldown and scan throttle, which the
+	// request path and the dashboard both touch.
+	degradationMu      sync.Mutex
+	degradationLast    map[string]time.Time
+	degradationChecked map[string]time.Time
+	rateLimitMu        sync.Mutex
+	rateLimitRuns      map[rateLimitKey]int
 	// Test seams for the daily benchmark coordinator. Production uses
 	// testProvider and dailyBenchmarkGate when these are unset.
 	dailyTestProvider func(context.Context, string, string, int) (providerTestSample, error)
@@ -77,16 +82,18 @@ func newProxy(cfg config) (*proxy, error) {
 	routing := newRoutingState(cfg.Models, cfg.PinTTL)
 	routing.setProvidersPath(cfg.providersPath)
 	p := &proxy{
-		cfg:            cfg,
-		upstream:       u,
-		stats:          newStats(),
-		routing:        routing,
-		registry:       newModelRegistry(&http.Client{Timeout: 20 * time.Second}, cfg.Upstream, cfg.openRouterKey(), cfg.Listen, registryTTL),
-		dailyReady:     make(map[string]chan struct{}),
-		recoveryLast:   make(map[string]time.Time),
-		recoveryWanted: make(map[string]bool),
-		rateLimitRuns:  make(map[rateLimitKey]int),
-		now:            time.Now,
+		cfg:                cfg,
+		upstream:           u,
+		stats:              newStats(),
+		routing:            routing,
+		registry:           newModelRegistry(&http.Client{Timeout: 20 * time.Second}, cfg.Upstream, cfg.openRouterKey(), cfg.Listen, registryTTL),
+		dailyReady:         make(map[string]chan struct{}),
+		recoveryLast:       make(map[string]time.Time),
+		recoveryWanted:     make(map[string]bool),
+		degradationLast:    make(map[string]time.Time),
+		degradationChecked: make(map[string]time.Time),
+		rateLimitRuns:      make(map[rateLimitKey]int),
+		now:                time.Now,
 		client: &http.Client{Transport: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
 			MaxIdleConns:          100,
@@ -133,6 +140,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	record, err := p.forward(w, r)
 	p.stats.record(record)
 	p.observeProviderFailure(record)
+	p.observeProviderDegradation(record)
 	if err != nil && !errors.Is(err, r.Context().Err()) {
 		log.Printf("%s %s: %v", r.Method, r.URL.Path, err)
 	}
@@ -478,11 +486,30 @@ const (
 	providerRecoveryCooldown = 30 * time.Second
 )
 
-// prepareDailyModel starts the once-per-day catalog refresh and benchmark for
-// model. Work is asynchronous with respect to user requests. The returned
-// channel is used by tests and closes when 70% of providers have finished or
-// three seconds have elapsed, whichever happens first; unfinished benchmark
-// requests are then canceled.
+// benchmarkKind says why an automatic run was started. It only decides which
+// cooldown the run consumes when it finishes, so a run that fails early cannot
+// be retried in an unbounded loop.
+type benchmarkKind int
+
+const (
+	benchmarkDaily benchmarkKind = iota
+	benchmarkRecovery
+	benchmarkDegradation
+)
+
+// benchmarkFreshness is how old a model's last measurement may be before a
+// request asks for another one. Measurement follows the models clients actually
+// use: a model nobody asked for is never measured, and the one that is asked for
+// gets a fresh field once the data behind its pin is stale. Five minutes is
+// short enough that a restart is a measurement and long enough that a crash loop
+// cannot hammer providers.
+const benchmarkFreshness = 5 * time.Minute
+
+// prepareDailyModel starts the catalog refresh and benchmark a request for model
+// asks for. Work is asynchronous with respect to user requests. The returned
+// channel is used by tests and closes when every provider has finished or the
+// gate has elapsed, whichever happens first; unfinished benchmark requests are
+// then canceled.
 func (p *proxy) prepareDailyModel(model string) <-chan struct{} {
 	p.dailyMu.Lock()
 	if p.dailyClosed {
@@ -494,7 +521,7 @@ func (p *proxy) prepareDailyModel(model string) <-chan struct{} {
 		return ready
 	}
 	refreshDone := p.routing.maybeRefreshModelOrder(model, p.client, p.cfg.Upstream, p.cfg.openRouterKey(), p.cfg.UpdateMaxProviders, p.cfg.UpdateCacheOnly)
-	benchmarkDue := strings.TrimSpace(p.cfg.OpenRouterAPIKey) != "" && !p.stats.benchmarkRanToday(model, p.now())
+	benchmarkDue := strings.TrimSpace(p.cfg.OpenRouterAPIKey) != "" && !p.stats.benchmarkedWithin(model, p.now(), benchmarkFreshness)
 	if refreshDone == nil && benchmarkDue {
 		// The catalog and its endpoint metadata were already refreshed today,
 		// but that does not prove a benchmark ran. Refresh it again to hydrate
@@ -513,10 +540,6 @@ func (p *proxy) prepareDailyModel(model string) <-chan struct{} {
 
 	go p.runDailyBenchmark(model, refreshDone, ready)
 	return ready
-}
-
-func (p *proxy) runDailyBenchmark(model string, refreshDone <-chan struct{}, ready chan struct{}) {
-	p.runAutomaticBenchmark(model, refreshDone, ready, false)
 }
 
 // startProviderRecovery runs the same bounded catalog refresh and benchmark
@@ -548,29 +571,47 @@ func (p *proxy) startProviderRecovery(model string) <-chan struct{} {
 	p.dailyWG.Add(1)
 	p.dailyMu.Unlock()
 
-	go p.runAutomaticBenchmark(model, refreshDone, ready, true)
+	go p.runAutomaticBenchmark(model, refreshDone, ready, benchmarkRecovery, p.dailyGate)
 	return ready
 }
 
-func (p *proxy) runAutomaticBenchmark(model string, refreshDone <-chan struct{}, ready chan struct{}, recovery bool) {
+// runDailyBenchmark is prepareDailyModel's scheduled run.
+func (p *proxy) runDailyBenchmark(model string, refreshDone <-chan struct{}, ready chan struct{}) {
+	p.runAutomaticBenchmark(model, refreshDone, ready, benchmarkDaily, p.dailyGate)
+}
+
+// runAutomaticBenchmark performs one bounded catalog refresh and provider
+// benchmark. kind decides which cooldown the finished run consumes: recovery
+// also honors a recovery that arrived while another kind was running, and a
+// degradation run always consumes its own cooldown so a provider that stays bad
+// is re-tested on a schedule rather than on every request.
+func (p *proxy) runAutomaticBenchmark(model string, refreshDone <-chan struct{}, ready chan struct{}, kind benchmarkKind, gate time.Duration) {
 	defer func() {
 		p.dailyMu.Lock()
 		delete(p.dailyReady, model)
 		wanted := p.recoveryWanted[model]
 		delete(p.recoveryWanted, model)
-		if recovery || wanted {
+		if kind == benchmarkRecovery || wanted {
 			p.recoveryLast[model] = p.now()
+		}
+		if kind == benchmarkDegradation {
+			p.degradationMu.Lock()
+			p.degradationLast[model] = p.now()
+			p.degradationMu.Unlock()
 		}
 		p.dailyMu.Unlock()
 		p.dailyWG.Done()
 	}()
-	gate := p.dailyGate
 	if gate <= 0 {
 		gate = dailyBenchmarkGate
 	}
-	deadline := time.Now().Add(gate)
-	timer := time.NewTimer(time.Until(deadline))
-	defer timer.Stop()
+	// The refresh gets the gate first and the pings get a fresh one afterwards:
+	// catalog latency is not provider latency, and spending the whole budget on a
+	// refresh is how a model ends up with a refreshed order and no measurement at
+	// all. The gate is still released when the refresh budget expires, so
+	// coalesced callers are not held behind a slow catalog.
+	refreshTimer := time.NewTimer(time.Until(time.Now().Add(gate)))
+	defer refreshTimer.Stop()
 	released := false
 	release := func() {
 		if !released {
@@ -578,14 +619,13 @@ func (p *proxy) runAutomaticBenchmark(model string, refreshDone <-chan struct{},
 			released = true
 		}
 	}
-	timedOut := false
 	select {
 	case <-refreshDone:
-	case <-timer.C:
+	case <-refreshTimer.C:
 		release()
-		timedOut = true
 		<-refreshDone
 	}
+	deadline := time.Now().Add(gate)
 	cfg, revision, ok := p.routing.modelConfigAtRevision(model)
 	if !ok || cfg.UpdatedAt.Format(time.DateOnly) != p.now().Format(time.DateOnly) {
 		release()
@@ -605,9 +645,6 @@ func (p *proxy) runAutomaticBenchmark(model string, refreshDone <-chan struct{},
 			p.stats.setAutoPin(model, providers[0])
 		}
 		release()
-		return
-	}
-	if timedOut {
 		return
 	}
 
@@ -732,43 +769,28 @@ func (p *proxy) automaticProviderFailover(model, provider string) (string, bool)
 	return replacement, true
 }
 
-// benchmarkCompletionTarget returns the number of provider tests a run must
-// collect before it may stop. Automatic discovery rounds up to ensure at
-// least 70% of the eligible providers completed; manual runs require all of
-// them. Keeping this boundary in one small function makes the production rule
-// explicit and directly testable for every provider-count edge case.
-func benchmarkCompletionTarget(providers int, stopAtSeventyPercent bool) int {
-	if providers <= 0 {
-		return 0
-	}
-	if !stopAtSeventyPercent {
-		return providers
-	}
-	return (7*providers + 9) / 10
-}
-
-// benchmarkProviders runs up to maxConcurrency provider tests at once.
-// Automatic runs may stop at 70% completion; manual runs target every
-// provider. Both modes stop at deadline, canceling in-flight and not-yet-started
-// requests. Optional quality metadata loads concurrently and may use the rest
-// of the deadline (up to ten seconds) after provider tests finish.
-func (p *proxy) benchmarkProviders(model string, providers []string, deadline time.Time, stopAtSeventyPercent bool, maxConcurrency int) ([]providerTestResult, bool) {
+// benchmarkProviders runs up to maxConcurrency provider tests at once and waits
+// for all of them or the deadline, whichever comes first. The deadline is the
+// only thing that ends a run early: a slow provider costs its own slot, not the
+// coverage of the providers that already answered, and nothing is waiting on
+// this automatic background work. Requests still in flight at the deadline are
+// canceled. Optional quality metadata loads concurrently and may use the rest of
+// the deadline (up to ten seconds) after provider tests finish.
+func (p *proxy) benchmarkProviders(model string, providers []string, deadline time.Time, automatic bool, maxConcurrency int) ([]providerTestResult, bool) {
 	if len(providers) == 0 || !p.now().Before(deadline) {
 		return nil, false
 	}
 	// Providers known to be blocked are not measured: every round would spend
-	// a request to be told again that the account cannot route there, and the
-	// 70% completion threshold would be met by refusals instead of
-	// measurements. They come back into the rotation when the block expires.
+	// a request to be told again that the account cannot route there. They come
+	// back into the rotation when the block expires.
 	blocked := p.routing.blockedProviders(model)
 	if routable, unroutable := partitionBlocked(providers, blocked); len(unroutable) > 0 && len(routable) > 0 {
 		providers = routable
 	}
 	// Automatic runs do not immediately probe providers that just exhausted
-	// their request capacity. Besides producing avoidable traffic, their quick
-	// 429s would count toward the 70% completion target and cancel healthy but
-	// slower candidates. Manual benchmarks remain the explicit re-probe path.
-	if stopAtSeventyPercent {
+	// their request capacity: every round would be an avoidable 429. Manual
+	// benchmarks remain the explicit re-probe path.
+	if automatic {
 		unavailable := p.routing.temporarilyUnavailableProviders(model)
 		eligible := make([]string, 0, len(providers))
 		for _, provider := range providers {
@@ -792,21 +814,20 @@ func (p *proxy) benchmarkProviders(model string, providers []string, deadline ti
 	ctx, cancel := context.WithTimeout(context.Background(), remaining)
 	defer cancel()
 	// Quality fetches run alongside the measurements, including without a TUI.
-	// They share the run's deadline but not its early worker cancellation, so
-	// reaching 70% does not throw away almost-complete quality metadata.
+	// They share the run's deadline but not its early worker cancellation, so a
+	// measure that ends at the deadline does not throw away almost-complete
+	// quality metadata.
 	if p.upstream != nil && p.upstream.Scheme == "https" && p.upstream.Host == "openrouter.ai" {
 		qualityCtx, qualityCancel := context.WithTimeout(context.Background(), min(remaining, 10*time.Second))
-		qualityDone := make(chan struct{})
 		client := *p.client
 		client.Timeout = 10 * time.Second
 		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		// Quality metadata is dashboard detail, so the ranking that applies these
+		// measurements never waits for it: a slow quality fetch would otherwise
+		// delay the pin this run exists to set.
 		go func() {
-			defer close(qualityDone)
+			defer qualityCancel()
 			_, _ = p.routing.refreshProviderQuality(qualityCtx, &client, "https://openrouter.ai", p.cfg.openRouterKey(), model)
-		}()
-		defer func() {
-			<-qualityDone
-			qualityCancel()
 		}()
 	}
 	testProvider := p.testProviderContext
@@ -848,9 +869,10 @@ func (p *proxy) benchmarkProviders(model string, providers []string, deadline ti
 		}()
 	}
 
-	threshold := benchmarkCompletionTarget(len(providers), stopAtSeventyPercent)
-	completed := make([]providerTestResult, 0, threshold)
-	for len(completed) < threshold {
+	// Wait for every provider or the deadline. Stopping at a share of providers
+	// would rank a partial field while the budget for the rest was still there.
+	completed := make([]providerTestResult, 0, len(providers))
+	for len(completed) < len(providers) {
 		select {
 		case result := <-results:
 			completed = append(completed, result)
@@ -865,8 +887,7 @@ func (p *proxy) benchmarkProviders(model string, providers []string, deadline ti
 		}
 	}
 	cancel()
-	// Reaching the automatic threshold also cancels the remaining providers.
-	// Their results are not part of completed, but their stats mutations must
+	// Every provider reported inside the deadline. Their stats mutations must
 	// land before the caller snapshots the pool and ranks it.
 	workers.Wait()
 	return completed, true

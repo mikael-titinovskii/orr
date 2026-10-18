@@ -82,7 +82,9 @@ func fetchCreditInfo(ctx context.Context, client *http.Client, upstream, apiKey 
 		if result.Data.LimitReset != nil {
 			resetValue = *result.Data.LimitReset
 		}
-		s.updateKeyInfo(usageValue, limitValue, resetValue)
+		// A payload that carries only the cap still updates the budget, but it
+		// says nothing about spend: the last polled usage keeps standing.
+		s.updateKeyInfo(usageValue, usage != nil, limitValue, resetValue)
 	}
 }
 

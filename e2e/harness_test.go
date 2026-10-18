@@ -48,13 +48,27 @@ func TestMain(m *testing.M) {
 	}
 
 	code := m.Run()
-	if err := os.RemoveAll(buildDir); err != nil {
+	// On Windows a test server's process can exit a moment before the OS
+	// releases its executable image, so one RemoveAll races the file system and
+	// turns a passing run into a failure. Retry briefly instead.
+	if err := removeAllWithRetry(buildDir, 20, 100*time.Millisecond); err != nil {
 		fmt.Fprintln(os.Stderr, "remove e2e build directory:", err)
 		if code == 0 {
 			code = 1
 		}
 	}
 	os.Exit(code)
+}
+
+func removeAllWithRetry(dir string, attempts int, delay time.Duration) error {
+	var err error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if err = os.RemoveAll(dir); err == nil {
+			return nil
+		}
+		time.Sleep(delay)
+	}
+	return err
 }
 
 // server is a real orr subprocess with an isolated config and user directory.

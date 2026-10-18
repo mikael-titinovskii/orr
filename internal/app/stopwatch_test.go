@@ -68,6 +68,30 @@ func TestStopwatchAccumulatesMetricsFromRecords(t *testing.T) {
 	}
 }
 
+// One client request completes, then a benchmark probe lands in the ring before
+// the next tick. The probe advances no client counter, so the row must take the
+// client record and leave the probe's spend out.
+func TestStopwatchSkipsBenchmarkProbesBetweenTicks(t *testing.T) {
+	s := newStopwatch()
+	now := time.Now()
+	s.toggle(now, statsSnapshot{SessionRequestCount: 0})
+	snap := statsSnapshot{
+		SessionRequestCount: 1,
+		Records: []requestRecord{
+			{Time: now.Add(time.Second), Model: "m", Provider: "p", Status: 200, Cost: 0.02, PromptTokens: 100, CompletionTokens: 50},
+			{Time: now.Add(2 * time.Second), Model: "m", Provider: "p", Status: 200, Cost: 9, PromptTokens: 900, CompletionTokens: 900, Benchmark: true},
+		},
+	}
+	s.tick(now.Add(3*time.Second), snap)
+	row := s.rows[0]
+	if row.cost != 0.02 {
+		t.Fatalf("row cost = %v, want the client request's 0.02", row.cost)
+	}
+	if row.tokTotal != 150 {
+		t.Fatalf("row tokens = %d, want the client request's 150", row.tokTotal)
+	}
+}
+
 func TestStopwatchIgnoresRecordsWhileStopped(t *testing.T) {
 	s := newStopwatch()
 	now := time.Now()

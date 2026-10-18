@@ -3,9 +3,40 @@ package app
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+// The startup warm-up asks a different question from the daily schedule: not
+// "did it run today" but "is what this process holds recent". A run ten minutes
+// old still counts as today, and that is exactly the case the warm-up must not
+// skip after a restart.
+func TestBenchmarkedWithinUsesTheWarmWindow(t *testing.T) {
+	now := time.Date(2026, time.October, 18, 12, 0, 0, 0, time.Local)
+	s := newStats()
+	s.now = func() time.Time { return now }
+	if s.benchmarkedWithin("author/model", now, 5*time.Minute) {
+		t.Fatal("a model that never ran counted as recently benchmarked")
+	}
+	s.markBenchmarkRun("author/model", now.Add(-4*time.Minute))
+	if !s.benchmarkedWithin("author/model", now, 5*time.Minute) {
+		t.Fatal("a run four minutes old did not count as recent")
+	}
+	s.markBenchmarkRun("author/model", now.Add(-10*time.Minute))
+	if s.benchmarkedWithin("author/model", now, 5*time.Minute) {
+		t.Fatal("a run ten minutes old counted as recent, which is the daily rule the warm-up exists to avoid")
+	}
+	if !s.benchmarkedWithin("author/model", now, 15*time.Minute) {
+		t.Fatal("a run ten minutes old did not count inside a fifteen-minute window")
+	}
+	// A latch ahead of the wall clock — a stats file written before the clock
+	// was stepped back — is stale, not fresh.
+	s.markBenchmarkRun("author/model", now.Add(time.Hour))
+	if s.benchmarkedWithin("author/model", now, 5*time.Minute) {
+		t.Fatal("a future latch counted as a fresh run")
+	}
+}
 
 func TestReplaceFileFailurePreservesDestination(t *testing.T) {
 	dir := t.TempDir()
@@ -148,10 +179,109 @@ func TestStatsSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
+// The speed/price exponent is a dashboard preference, so it has to survive a
+// restart. Zero is the trap: it means "price alone" and is a real setting, so a
+// plain omitempty field would drop it and silently restore the default.
+func TestTimeWeightRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "orr", "stats.json")
+	s := newStats()
+	s.setTimeWeight(benchmarkTimeWeightMin)
+	if err := s.save(path); err != nil {
+		t.Fatal(err)
+	}
+	loaded := newStats()
+	if err := loaded.load(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.currentTimeWeight(); got != benchmarkTimeWeightMin {
+		t.Fatalf("restored weight = %v, want %v", got, benchmarkTimeWeightMin)
+	}
+}
+
+// The degradation switch follows the same rule as the speed/price stop, with
+// two additions: "off" is a real setting, and the value is only written once the
+// user has toggled it, so ORR_DEGRADATION can keep seeding every start until
+// then.
+func TestDegradationRoundTripAndSeeding(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "orr", "stats.json")
+	// A process that never pressed `d` must not freeze the seeded value into the
+	// stats file, or the environment variable could never seed it again.
+	untouched := newStats()
+	if err := untouched.save(path); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "degradation") {
+		t.Fatalf("an untouched switch was persisted: %s", data)
+	}
+	seeded := newStats()
+	if err := seeded.load(path); err != nil {
+		t.Fatal(err)
+	}
+	seeded.seedDegradation(false)
+	if seeded.degradationEnabled() {
+		t.Fatal("configured default did not seed a state the user never toggled")
+	}
+
+	// After a press, the saved switch is the last word.
+	pressed := newStats()
+	pressed.setDegradation(false)
+	if err := pressed.save(path); err != nil {
+		t.Fatal(err)
+	}
+	loaded := newStats()
+	if err := loaded.load(path); err != nil {
+		t.Fatal(err)
+	}
+	if loaded.degradationEnabled() {
+		t.Fatal("saved off switch restored as on")
+	}
+	loaded.seedDegradation(true)
+	if loaded.degradationEnabled() {
+		t.Fatal("configured default overrode a saved toggle")
+	}
+
+	fresh := newStats()
+	if !fresh.degradationEnabled() {
+		t.Fatal("a fresh state does not start the watch on")
+	}
+}
+
+// A file written before the field existed, and a hand-edited value outside what
+// the slider can express, both land on a position the control can show.
+func TestTimeWeightLoadDefaultsAndClamps(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stats.json")
+	for _, test := range []struct {
+		name string
+		body string
+		want float64
+	}{
+		{"absent", `{"version":1}`, defaultBenchmarkTimeWeight},
+		{"out of range", `{"version":1,"time_weight":9}`, benchmarkTimeWeightMax},
+		{"off a stop", `{"version":1,"time_weight":1.4}`, 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(path, []byte(test.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			loaded := newStats()
+			if err := loaded.load(path); err != nil {
+				t.Fatal(err)
+			}
+			if got := loaded.currentTimeWeight(); got != test.want {
+				t.Fatalf("weight = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestCreditSpendRoundTripKeepsCurrentMonth(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "orr", "stats.json")
 	s := newStats()
-	s.updateKeyInfo(12.5, 75, "monthly")
+	s.updateKeyInfo(12.5, true, 75, "monthly")
 	if err := s.save(path); err != nil {
 		t.Fatal(err)
 	}
@@ -162,6 +292,47 @@ func TestCreditSpendRoundTripKeepsCurrentMonth(t *testing.T) {
 	}
 	if got := loaded.snapshot().CreditSpend; got != 12.5 {
 		t.Fatalf("credit spend = %v, want 12.5", got)
+	}
+}
+
+// A poll can carry the cap and its reset without usage_monthly. That answer says
+// nothing about spend, so the last polled figure has to stand rather than
+// presenting a zero the key never reported.
+func TestUpdateKeyInfoKeepsUsageWhenThePollOmitsIt(t *testing.T) {
+	s := newStats()
+	s.updateKeyInfo(12.5, true, 75, "monthly")
+	s.updateKeyInfo(0, false, 90, "monthly")
+	snap := s.snapshot()
+	if snap.CreditSpend != 12.5 {
+		t.Fatalf("credit spend = %v after a limit-only poll, want 12.5", snap.CreditSpend)
+	}
+	if snap.CreditMonth == "" {
+		t.Fatal("a limit-only poll cleared the month that marks a polled spend")
+	}
+	if snap.Budget != 90 {
+		t.Fatalf("budget = %v, want the limit-only poll's 90", snap.Budget)
+	}
+}
+
+// A reset that differs from the stored one opens a new cycle even inside the
+// same calendar month. Spend polled under the old cycle must not be reported
+// against the new cap, so the row falls back to the proxy's own accounting until
+// a poll carries usage again.
+func TestUpdateKeyInfoDropsSpendWhenANewCycleStartsWithoutUsage(t *testing.T) {
+	s := newStats()
+	s.updateKeyInfo(12.5, true, 75, "2026-10-01T00:00:00Z")
+	s.updateKeyInfo(0, false, 50, "2026-10-18T00:00:00Z")
+	snap := s.snapshot()
+	if snap.CreditSpend != 0 || snap.CreditMonth != "" {
+		t.Fatalf("old cycle's spend survived a new cycle: spend %v month %q", snap.CreditSpend, snap.CreditMonth)
+	}
+	if snap.Budget != 50 {
+		t.Fatalf("budget = %v, want the new cycle's 50", snap.Budget)
+	}
+	// A usage answer for the new cycle restores the polled figure.
+	s.updateKeyInfo(1.5, true, 50, "2026-10-18T00:00:00Z")
+	if snap := s.snapshot(); snap.CreditSpend != 1.5 {
+		t.Fatalf("credit spend = %v, want the new cycle's 1.5", snap.CreditSpend)
 	}
 }
 

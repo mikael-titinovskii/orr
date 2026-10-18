@@ -807,7 +807,11 @@ func TestSelectionRejectsLatencyOutlierThatLeadsOnThroughput(t *testing.T) {
 		{provider: "baidu/fp8", tps: 162, ttft: 903 * time.Millisecond, input: 0.60, output: 2.40, cache: 0.06},
 		{provider: "coreweave/fp8", tps: 134, ttft: 647 * time.Millisecond, input: 0.58, output: 2.30, cache: 0.06},
 	}
-	best, order := selectFrom(t, benchmarkReferenceProfile, "", field...)
+	// These fixtures were priced against a prompt-heavy reference request, so the
+	// shape is held fixed here: the case under test is the eight-second first
+	// token, not the production request mix.
+	profile := requestProfile{promptTokens: 2_000, cachedTokens: 18_000, completionTokens: 1_000}
+	best, order := selectFrom(t, profile, "", field...)
 	if best == "streamlake/fp8" {
 		t.Fatalf("best = %q, want the eight-second leader rejected", best)
 	}
@@ -818,7 +822,7 @@ func TestSelectionRejectsLatencyOutlierThatLeadsOnThroughput(t *testing.T) {
 	// The same provider at a normal first token is the best deal in the field:
 	// the guardrail reacts to the latency, not to the provider.
 	field[0].ttft = 1584 * time.Millisecond
-	best, _ = selectFrom(t, benchmarkReferenceProfile, "", field...)
+	best, _ = selectFrom(t, profile, "", field...)
 	if best != "streamlake/fp8" {
 		t.Fatalf("best = %q, want streamlake/fp8 once its latency is normal", best)
 	}
@@ -1061,7 +1065,7 @@ func TestSelectionBoundaryContracts(t *testing.T) {
 			{provider: "median-b", tps: 1, samples: benchmarkMinLatencySamples},
 			{provider: "boundary", tps: 2.0 / 3.0, samples: benchmarkMinLatencySamples},
 		}
-		deals := rankProviderDeals(results, profile, nil, map[string]int{"median-a": 0, "median-b": 1, "boundary": 2}, "", nil)
+		deals := rankProviderDeals(results, profile, nil, map[string]int{"median-a": 0, "median-b": 1, "boundary": 2}, "", nil, defaultBenchmarkTimeWeight)
 		byProvider := make(map[string]providerDeal, len(deals))
 		for _, deal := range deals {
 			byProvider[deal.result.provider] = deal
@@ -1071,7 +1075,7 @@ func TestSelectionBoundaryContracts(t *testing.T) {
 		}
 
 		results[2].tps = 0.666666
-		deals = rankProviderDeals(results, profile, nil, map[string]int{"median-a": 0, "median-b": 1, "boundary": 2}, "", nil)
+		deals = rankProviderDeals(results, profile, nil, map[string]int{"median-a": 0, "median-b": 1, "boundary": 2}, "", nil, defaultBenchmarkTimeWeight)
 		for _, deal := range deals {
 			if deal.result.provider == "boundary" && deal.viable {
 				t.Fatal("provider beyond 1.5x the median remained viable")
@@ -1581,11 +1585,11 @@ func TestMeasuredSampleTakesFirstTokenFromBenchmarkRoundsOnly(t *testing.T) {
 	// pull it away from the benchmark-only figure the pool reports.
 	tps, latency := providerMeasuredMetrics(records, model, "pinned", now)
 	if tps <= result.tps {
-		t.Fatalf("displayed mTs = %v, want the client's faster requests counted alongside the pool's %v",
+		t.Fatalf("displayed mTp = %v, want the client's faster requests counted alongside the pool's %v",
 			tps, result.tps)
 	}
 	if latency <= 900 {
-		t.Fatalf("displayed mLat = %v ms, want the client's long requests counted", latency)
+		t.Fatalf("displayed mLat = %v ms, want the client's long first-token waits counted", latency)
 	}
 
 	// A provider with no benchmark rounds has no comparable measurement at
@@ -1642,6 +1646,26 @@ func TestBenchmarkPoolSurvivesSaveAndLoad(t *testing.T) {
 // The pool keeps only the most recent rounds, so a provider that genuinely
 // changes is re-ranked within a couple of runs instead of being averaged
 // against a week of stale measurements.
+// A coding day is dominated by cached input, so the reference request weighs the
+// cache-read price above the answer price. A provider with a cheap output price
+// and an expensive cache must not win the pin on a cold start — that is the case
+// this pins: identical speed and quality, opposite price shapes.
+func TestReferenceProfilePrizesTheCacheOverTheAnswer(t *testing.T) {
+	results := []providerTestResult{
+		benchmarkResult("cheap-cache", 100, time.Second),
+		benchmarkResult("cheap-output", 100, time.Second),
+	}
+	meta := map[string]endpointMeta{
+		"cheap-cache":  {Pricing: testPricing(.30, 1.20, .002)},
+		"cheap-output": {Pricing: testPricing(.09, .18, .03)},
+	}
+	deals := rankProviderDeals(results, benchmarkReferenceProfile, meta,
+		map[string]int{"cheap-cache": 0, "cheap-output": 1}, "", nil, defaultBenchmarkTimeWeight)
+	if deals[0].result.provider != "cheap-cache" {
+		t.Fatalf("winner = %q, want the provider with the cheaper cache read", deals[0].result.provider)
+	}
+}
+
 func TestBenchmarkPoolKeepsOnlyRecentRounds(t *testing.T) {
 	const model = "author/model"
 	now := time.Now()
@@ -1778,17 +1802,20 @@ func TestSelectionRefusesASpikedProviderEvenWhenItIsCheapest(t *testing.T) {
 		{provider: "normal-b", tps: 360, ttft: 600 * time.Millisecond, input: 0.60, output: 2.40, cache: 0.06},
 	}
 
-	// The discount really is large enough to win on the product alone.
-	spikedCost, _ := benchmarkReferenceProfile.cost(testPricing(spiked.input, spiked.output, spiked.cache))
-	spikedSeconds, _ := benchmarkReferenceProfile.seconds(benchmarkResult(spiked.provider, spiked.tps, spiked.ttft))
-	normalCost, _ := benchmarkReferenceProfile.cost(testPricing(0.55, 2.20, 0.06))
-	normalSeconds, _ := benchmarkReferenceProfile.seconds(benchmarkResult("normal-a", 380, 500*time.Millisecond))
+	// The discount really is large enough to win on the product alone. The shape
+	// is the prompt-heavy one these fixtures were priced against: the case under
+	// test is the time ceiling, not the production request mix.
+	profile := requestProfile{promptTokens: 2_000, cachedTokens: 18_000, completionTokens: 1_000}
+	spikedCost, _ := profile.cost(testPricing(spiked.input, spiked.output, spiked.cache))
+	spikedSeconds, _ := profile.seconds(benchmarkResult(spiked.provider, spiked.tps, spiked.ttft))
+	normalCost, _ := profile.cost(testPricing(0.55, 2.20, 0.06))
+	normalSeconds, _ := profile.seconds(benchmarkResult("normal-a", 380, 500*time.Millisecond))
 	if spikedCost*spikedSeconds >= normalCost*normalSeconds {
 		t.Fatalf("fixture no longer exercises the ceiling: spiked score %.5f is not the lowest",
 			spikedCost*spikedSeconds)
 	}
 
-	best, order := selectFrom(t, benchmarkReferenceProfile, "", field...)
+	best, order := selectFrom(t, profile, "", field...)
 	if best != "normal-a" {
 		t.Fatalf("best = %q, want normal-a", best)
 	}
@@ -1934,4 +1961,171 @@ func FuzzAutomaticSelectionNeverChoosesIneligibleProvider(f *testing.F) {
 			}
 		}
 	})
+}
+
+// The dashboard's speed/price slider re-decides the automatic pin from
+// measurements already held, so one provider field must yield different winners
+// at different weights — and must not rewrite the persisted order or cancel an
+// in-flight benchmark while doing it.
+func TestRerankAutomaticPinFollowsTimeWeight(t *testing.T) {
+	const model = "author/model"
+	now := time.Date(2026, time.September, 30, 12, 0, 0, 0, time.UTC)
+	configured := map[string]providerConfig{model: {Order: []string{"cheap", "mid", "fast"}}}
+	path := filepath.Join(t.TempDir(), "providers.yaml")
+	if err := writeProvidersFileAtomic(path, configured); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	routing := newRoutingState(configured, time.Hour)
+	routing.now = func() time.Time { return now }
+	routing.setProvidersPath(path)
+	routing.endpointCache[model] = []endpointMeta{
+		{Tag: "cheap", Pricing: testPricing(0.4, 1.6, 0.04)},
+		{Tag: "mid", Pricing: testPricing(0.8, 3.2, 0.08)},
+		{Tag: "fast", Pricing: testPricing(1.5, 6, 0.15)},
+	}
+	// Every provider is inside 1.5x the field median, so the weight is the only
+	// thing deciding the winner: cheap is dearest in time and cheapest in
+	// dollars, fast is the other way round.
+	results := []providerTestResult{
+		benchmarkResult("cheap", 200, 500*time.Millisecond),
+		benchmarkResult("mid", 250, 400*time.Millisecond),
+		benchmarkResult("fast", 500, 150*time.Millisecond),
+	}
+	profile := requestProfile{promptTokens: 2000, cachedTokens: 18000, completionTokens: 1000, observed: true}
+	revision := routing.modelRevision(model)
+
+	for _, test := range []struct {
+		weight  float64
+		want    string
+		updated bool
+	}{
+		{0, "cheap", true},
+		// The winner is unchanged, so the pin must not be re-armed.
+		{1, "cheap", false},
+		{2, "fast", true},
+	} {
+		routing.setTimeWeight(test.weight)
+		best, updated := routing.rerankAutomaticPin(model, results, profile, nil)
+		if best != test.want || updated != test.updated {
+			t.Fatalf("weight %.2f: best=%q updated=%t, want best=%q updated=%t", test.weight, best, updated, test.want, test.updated)
+		}
+		if pin, manual := routing.pinInfo(model); pin != test.want || manual {
+			t.Fatalf("weight %.2f: pin=%q manual=%t, want automatic %q", test.weight, pin, manual, test.want)
+		}
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("a slider move rewrote the provider order:\n%s", after)
+	}
+	if got := routing.modelRevision(model); got != revision {
+		t.Fatalf("a slider move advanced the model revision from %d to %d", revision, got)
+	}
+}
+
+// The slider must not decide differently from a benchmark run: the churn margin
+// applies here too, so a move does not hand the pin to a provider the benchmark
+// would have refused at the same weight.
+func TestRerankAutomaticPinRespectsChurnMargin(t *testing.T) {
+	const model = "author/model"
+	now := time.Date(2026, time.September, 30, 12, 0, 0, 0, time.UTC)
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"held", "rival"}}}, time.Hour)
+	routing.now = func() time.Time { return now }
+	routing.endpointCache[model] = []endpointMeta{
+		{Tag: "held", Pricing: testPricing(1, 4, 0.1)},
+		{Tag: "rival", Pricing: testPricing(1, 4, 0.1)},
+	}
+	routing.autoPin(model, "held")
+	profile := requestProfile{completionTokens: 1000, observed: true}
+
+	// Equal prices, so only duration separates them: about 1.8 percent better,
+	// inside the switch threshold.
+	marginal := []providerTestResult{
+		benchmarkResult("held", 100, time.Second),
+		benchmarkResult("rival", 102, time.Second),
+	}
+	best, updated := routing.rerankAutomaticPin(model, marginal, profile, nil)
+	if best != "held" || updated {
+		t.Fatalf("best=%q updated=%t, want the incumbent inside the churn margin to keep the pin", best, updated)
+	}
+	if pin, _ := routing.pinInfo(model); pin != "held" {
+		t.Fatalf("pin after a marginal challenger = %q, want held", pin)
+	}
+
+	// About 12 percent better, past the threshold, so the pin moves.
+	clear := []providerTestResult{
+		benchmarkResult("held", 100, time.Second),
+		benchmarkResult("rival", 115, time.Second),
+	}
+	best, updated = routing.rerankAutomaticPin(model, clear, profile, nil)
+	if best != "rival" || !updated {
+		t.Fatalf("best=%q updated=%t, want the clear challenger to take the pin", best, updated)
+	}
+	if pin, _ := routing.pinInfo(model); pin != "rival" {
+		t.Fatalf("pin after a clear challenger = %q, want rival", pin)
+	}
+}
+
+// A manual pin is the user's instruction and outranks the slider, and an
+// empty measurement set must leave the existing pin rather than clear it.
+func TestRerankAutomaticPinRespectsManualPinAndEmptyResults(t *testing.T) {
+	const model = "author/model"
+	now := time.Date(2026, time.September, 30, 12, 0, 0, 0, time.UTC)
+	results := []providerTestResult{benchmarkResult("other", 100, time.Second)}
+	profile := requestProfile{completionTokens: 1000, observed: true}
+
+	manual := newRoutingState(map[string]providerConfig{model: {Order: []string{"chosen", "other"}, ManualPin: "chosen"}}, time.Hour)
+	manual.now = func() time.Time { return now }
+	manual.endpointCache[model] = []endpointMeta{
+		{Tag: "chosen", Pricing: testPricing(1, 4, 0.1)},
+		{Tag: "other", Pricing: testPricing(1, 4, 0.1)},
+	}
+	manual.setTimeWeight(benchmarkTimeWeightMax)
+	if best, updated := manual.rerankAutomaticPin(model, results, profile, nil); best != "" || updated {
+		t.Fatalf("manual pin was overridden: best=%q updated=%t", best, updated)
+	}
+	if pin, isManual := manual.pinInfo(model); pin != "chosen" || !isManual {
+		t.Fatalf("manual pin after rerank = %q manual=%t", pin, isManual)
+	}
+
+	automatic := newRoutingState(map[string]providerConfig{model: {Order: []string{"held", "other"}}}, time.Hour)
+	automatic.now = func() time.Time { return now }
+	automatic.autoPin(model, "held")
+	if best, updated := automatic.rerankAutomaticPin(model, nil, profile, nil); best != "" || updated {
+		t.Fatalf("empty results changed the pin: best=%q updated=%t", best, updated)
+	}
+	if pin, _ := automatic.pinInfo(model); pin != "held" {
+		t.Fatalf("pin after an empty rerank = %q, want it preserved", pin)
+	}
+}
+
+// The weight is clamped to the control's range and snapped to one of its three
+// stops, so a hand-edited persisted value cannot strand the control.
+func TestClampTimeWeight(t *testing.T) {
+	for _, test := range []struct {
+		in   float64
+		want float64
+	}{
+		{-1, benchmarkTimeWeightMin},
+		{0, benchmarkTimeWeightMin},
+		{0.4, benchmarkTimeWeightMin},
+		{0.5, defaultBenchmarkTimeWeight},
+		{1, defaultBenchmarkTimeWeight},
+		{1.4, defaultBenchmarkTimeWeight},
+		{1.5, benchmarkTimeWeightMax},
+		{9, benchmarkTimeWeightMax},
+		{math.NaN(), defaultBenchmarkTimeWeight},
+	} {
+		if got := clampTimeWeight(test.in); got != test.want {
+			t.Fatalf("clampTimeWeight(%v) = %v, want %v", test.in, got, test.want)
+		}
+	}
 }

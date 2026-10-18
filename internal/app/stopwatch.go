@@ -57,7 +57,11 @@ func (s *stopwatchState) tick(now time.Time, snap statsSnapshot) {
 
 // accumulate folds the records completed since the last accumulation into the
 // running row. The diff against the session request count bounds the scan to
-// the records that actually arrived, so this stays cheap on every tick.
+// the client requests that actually arrived, so this stays cheap on every tick.
+// The ring also holds orr's own benchmark probes, which advance no client
+// counter: the scan walks back over exactly the unaccumulated client records,
+// so a probe recorded in between can neither stand in for a client request nor
+// add its spend to the row.
 func (s *stopwatchState) accumulate(snap statsSnapshot) {
 	if len(s.rows) == 0 {
 		return
@@ -66,17 +70,19 @@ func (s *stopwatchState) accumulate(snap statsSnapshot) {
 	if total <= s.seenCount {
 		return
 	}
-	newCount := int(total - s.seenCount)
+	pending := int(total - s.seenCount)
 	records := snap.Records
-	if newCount > len(records) {
-		newCount = len(records)
-	}
 	row := &s.rows[len(s.rows)-1]
-	for _, r := range records[len(records)-newCount:] {
+	for i := len(records) - 1; i >= 0 && pending > 0; i-- {
+		r := records[i]
+		if r.Benchmark {
+			continue
+		}
 		row.cost += r.Cost
 		row.tokTotal += r.PromptTokens + r.CompletionTokens
 		row.completionTotal += r.CompletionTokens
 		row.thinkTotal += r.ReasoningTokens
+		pending--
 	}
 	s.seenCount = total
 }
@@ -103,7 +109,7 @@ func (s *stopwatchState) render(width, maxLines int, now time.Time) string {
 	lines := []string{
 		titleStyle.Render("Stopwatch"),
 		"",
-		dimStyle.Render(shorten("s start/stop", width)),
+		renderKeyHint(keyHint{"s", "start/stop"}, width),
 		"",
 		renderStopwatchHeader(width),
 	}

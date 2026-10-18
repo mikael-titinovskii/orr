@@ -161,5 +161,38 @@
       {"tag":"quality","input":0.5,"output":2,"cache":0.05,"tps":300,"ttft_ms":300,"gpqa":1,"tau":1,"tool_error":0,"json_error":0,"api_error":0.02}
     ],
     "want_best":"", "want_pin":""
+  },
+  {
+    "name":"time weight zero selects on price alone",
+    "why":"At 0.00 duration drops out of the score, so the cheapest provider wins however slow it is; all three are inside 1.5 times the median duration, so only the weight decides.",
+    "time_weight":0,
+    "providers":[
+      {"tag":"cheap","input":0.4,"output":1.6,"cache":0.04,"tps":200,"ttft_ms":1000},
+      {"tag":"mid","input":0.5,"output":2,"cache":0.05,"tps":250,"ttft_ms":400},
+      {"tag":"fast","input":1.5,"output":6,"cache":0.15,"tps":500,"ttft_ms":150}
+    ],
+    "want_best":"cheap", "want_pin":"cheap"
+  },
+  {
+    "name":"default time weight trades price against duration",
+    "why":"The same field at 1.00 prefers mid: cheap's price lead no longer covers the six seconds one request takes on it.",
+    "time_weight":1,
+    "providers":[
+      {"tag":"cheap","input":0.4,"output":1.6,"cache":0.04,"tps":200,"ttft_ms":1000},
+      {"tag":"mid","input":0.5,"output":2,"cache":0.05,"tps":250,"ttft_ms":400},
+      {"tag":"fast","input":1.5,"output":6,"cache":0.15,"tps":500,"ttft_ms":150}
+    ],
+    "want_best":"mid", "want_pin":"mid"
+  },
+  {
+    "name":"high time weight buys speed at any price",
+    "why":"The same field at 2.00 prefers fast: doubling the exponent makes the seconds saved worth the price premium.",
+    "time_weight":2,
+    "providers":[
+      {"tag":"cheap","input":0.4,"output":1.6,"cache":0.04,"tps":200,"ttft_ms":1000},
+      {"tag":"mid","input":0.5,"output":2,"cache":0.05,"tps":250,"ttft_ms":400},
+      {"tag":"fast","input":1.5,"output":6,"cache":0.15,"tps":500,"ttft_ms":150}
+    ],
+    "want_best":"fast", "want_pin":"fast"
   }
 ]
