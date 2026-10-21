@@ -40,6 +40,8 @@ func runUpdateWithOptions(envPath string, preferEnvFile bool, maxProviders int, 
 	// Fetch every model's endpoints concurrently with a bounded worker pool so
 	// updating many models does not serialize on network round trips.
 	orders := make(map[string][]string, len(models))
+	skips := make(map[string]string)
+	failures := make(map[string]error)
 	results := make(chan updateResult, len(models))
 	var wg sync.WaitGroup
 	workers := min(4, len(models))
@@ -56,10 +58,14 @@ func runUpdateWithOptions(envPath string, preferEnvFile bool, maxProviders int, 
 	wg.Wait()
 	close(results)
 	for result := range results {
-		if result.err != nil {
-			return result.err
+		switch {
+		case result.err != nil:
+			failures[result.model] = result.err
+		case result.skipped != "":
+			skips[result.model] = result.skipped
+		default:
+			orders[result.model] = result.order
 		}
-		orders[result.model] = result.order
 	}
 
 	replaceOrders(&cfg, orders)
@@ -67,26 +73,47 @@ func runUpdateWithOptions(envPath string, preferEnvFile bool, maxProviders int, 
 		return err
 	}
 	for _, model := range models {
-		fmt.Fprintf(output, "%s: %s\n", model, strings.Join(orders[model], ", "))
+		if order, ok := orders[model]; ok {
+			fmt.Fprintf(output, "%s: %s\n", model, strings.Join(order, ", "))
+		} else if reason, ok := skips[model]; ok {
+			fmt.Fprintf(output, "%s: skipped (%s)\n", model, reason)
+		}
 	}
-	return nil
+	var errs []error
+	for _, model := range models {
+		if err, ok := failures[model]; ok {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 type updateResult struct {
-	model string
-	order []string
-	err   error
+	model   string
+	order   []string
+	skipped string
+	err     error
 }
 
 func fetchUpdateOrder(client *http.Client, upstream, apiKey, model string, maxProviders int, cacheOnly bool) updateResult {
+	if isAliasModel(model) {
+		return updateResult{model: model, skipped: "alias model"}
+	}
 	result, err := fetchEndpoints(context.Background(), client, upstream, apiKey, model)
 	if err != nil {
 		return updateResult{model: model, err: fmt.Errorf("update %s: %w", model, err)}
 	}
-	endpoints := compatibleEndpoints(result.Data.Endpoints)
-	endpoints = rankUpdateEndpoints(endpoints, cacheOnly)
+	compatible := compatibleEndpoints(result.Data.Endpoints)
+	endpoints := rankUpdateEndpoints(compatible, cacheOnly)
 	if len(endpoints) == 0 {
-		return updateResult{model: model, err: fmt.Errorf("update %s: no healthy tool-capable endpoints found", model)}
+		switch {
+		case len(result.Data.Endpoints) > 0 && !supportsTools(result.Data.Endpoints):
+			return updateResult{model: model, skipped: "no tool-capable endpoints"}
+		case cacheOnly && len(compatible) > 0:
+			return updateResult{model: model, err: fmt.Errorf("update %s: no cache-capable endpoints found", model)}
+		default:
+			return updateResult{model: model, err: fmt.Errorf("update %s: no healthy tool-capable endpoints found", model)}
+		}
 	}
 	limit := min(maxProviders, len(endpoints))
 	order := make([]string, limit)

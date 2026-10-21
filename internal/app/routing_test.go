@@ -2129,3 +2129,210 @@ func TestClampTimeWeight(t *testing.T) {
 		}
 	}
 }
+
+// A failing endpoint fetch clears the cache marker so the next request retries,
+// but it must not retry on every request: the retry delay is the floor.
+func TestEndpointRefreshBacksOffAfterFailure(t *testing.T) {
+	const model = "author/model"
+	routing := newRoutingState(map[string]providerConfig{model: {}}, time.Hour)
+	now := time.Date(2026, time.October, 17, 12, 0, 0, 0, time.Local)
+	routing.now = func() time.Time { return now }
+	var fetches atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		fetches.Add(1)
+		return response(http.StatusInternalServerError, "catalog down"), nil
+	})}
+
+	routing.refreshEndpoints(model, client, "https://upstream.test/api/v1", "")
+	routing.refreshEndpoints(model, client, "https://upstream.test/api/v1", "")
+	if got := fetches.Load(); got != 1 {
+		t.Fatalf("fetches = %d, want the failed fetch not retried immediately", got)
+	}
+	now = now.Add(endpointFetchRetryDelay)
+	routing.refreshEndpoints(model, client, "https://upstream.test/api/v1", "")
+	if got := fetches.Load(); got != 2 {
+		t.Fatalf("fetches = %d, want a retry once the retry delay passed", got)
+	}
+}
+
+// The once-per-day catalog refresh only knows that the catalog is still stale,
+// which is exactly what a failure leaves behind. Without its own retry delay it
+// is re-attempted per answered request, and each attempt carries a benchmark run
+// that cannot measure anything.
+func TestAutomaticCatalogRefreshBacksOffAfterFailure(t *testing.T) {
+	const model = "author/model"
+	routing := newRoutingState(map[string]providerConfig{model: {}}, time.Hour)
+	routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
+	now := time.Date(2026, time.October, 17, 12, 0, 0, 0, time.Local)
+	routing.now = func() time.Time { return now }
+	var fetches atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		fetches.Add(1)
+		return response(http.StatusInternalServerError, "catalog down"), nil
+	})}
+
+	first := routing.maybeRefreshModelOrder(model, client, "https://upstream.test/api/v1", "", 20, false)
+	if first == nil {
+		t.Fatal("a stale catalog did not start a refresh")
+	}
+	<-first
+	if got := fetches.Load(); got != 1 {
+		t.Fatalf("fetches = %d, want one failed attempt", got)
+	}
+	if again := routing.maybeRefreshModelOrder(model, client, "https://upstream.test/api/v1", "", 20, false); again != nil {
+		t.Fatal("a failed refresh was retried immediately")
+	}
+	if got := fetches.Load(); got != 1 {
+		t.Fatalf("fetches = %d, want no request inside the retry delay", got)
+	}
+
+	// A refresh the user asked for is not held back by the automatic schedule.
+	forced := routing.launchModelOrderRefresh(model, client, "https://upstream.test/api/v1", "", 20, false, true)
+	if forced == nil {
+		t.Fatal("a forced refresh was blocked by the automatic retry delay")
+	}
+	<-forced
+	if got := fetches.Load(); got != 2 {
+		t.Fatalf("fetches = %d, want the forced attempt to reach upstream", got)
+	}
+
+	now = now.Add(modelOrderRetryDelay)
+	retried := routing.maybeRefreshModelOrder(model, client, "https://upstream.test/api/v1", "", 20, false)
+	if retried == nil {
+		t.Fatal("the automatic refresh never retried after the delay")
+	}
+	<-retried
+	if got := fetches.Load(); got != 3 {
+		t.Fatalf("fetches = %d, want a retry once the delay passed", got)
+	}
+}
+
+// The dashboard's refresh key is a user instruction, so it reaches upstream even
+// while the automatic schedule is backing off after a failure.
+func TestForceRefreshModelOrderBypassesTheFailureBackoff(t *testing.T) {
+	const model = "author/model"
+	routing := newRoutingState(map[string]providerConfig{model: {}}, time.Hour)
+	routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
+	now := time.Date(2026, time.October, 17, 12, 0, 0, 0, time.Local)
+	routing.now = func() time.Time { return now }
+	var fetches atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		fetches.Add(1)
+		return response(http.StatusInternalServerError, "catalog down"), nil
+	})}
+
+	failed := routing.maybeRefreshModelOrder(model, client, "https://upstream.test/api/v1", "", 20, false)
+	if failed == nil {
+		t.Fatal("a stale catalog did not start a refresh")
+	}
+	<-failed
+	if got := fetches.Load(); got != 1 {
+		t.Fatalf("fetches = %d, want one failed attempt", got)
+	}
+
+	routing.forceRefreshModelOrder(model, client, "https://upstream.test/api/v1", "", 20, false)
+	routing.waitForRefreshes()
+	if got := fetches.Load(); got != 2 {
+		t.Fatalf("fetches = %d, want the forced refresh to reach upstream during the backoff", got)
+	}
+}
+
+func TestAliasModelsNeverFetchProviderEndpoints(t *testing.T) {
+	const model = "~anthropic/claude-fable-latest"
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"together"}}}, time.Hour)
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_ = json.NewEncoder(w).Encode(endpointList{})
+	}))
+	defer upstream.Close()
+
+	if err := routing.refreshModelOrder(model, upstream.Client(), upstream.URL, "", 20, false); err != nil {
+		t.Fatalf("alias refresh returned error: %v", err)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("alias model made %d catalog calls, want none", got)
+	}
+	cfg, _ := routing.modelConfig(model)
+	if len(cfg.Order) != 1 || cfg.Order[0] != "together" {
+		t.Fatalf("alias order changed: %#v", cfg.Order)
+	}
+}
+
+// An alias id (~author/family-latest) resolves to a model but has no endpoint
+// list of its own, so the request every refresh would make can never succeed.
+// The order refresh and orr update already skip it; the per-request endpoint
+// cache refresh must too, and must not arm a retry that would keep asking.
+func TestAliasModelSkipsEndpointRefresh(t *testing.T) {
+	const model = "~author/family-latest"
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"provider"}}}, time.Hour)
+	now := time.Date(2026, time.October, 17, 12, 0, 0, 0, time.Local)
+	routing.now = func() time.Time { return now }
+	var fetches atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		fetches.Add(1)
+		return response(http.StatusOK, `{"data":{"endpoints":[]}}`), nil
+	})}
+
+	routing.refreshEndpoints(model, client, "https://upstream.test/api/v1", "")
+	now = now.Add(time.Hour)
+	routing.refreshEndpoints(model, client, "https://upstream.test/api/v1", "")
+
+	if got := fetches.Load(); got != 0 {
+		t.Fatalf("endpoint fetches = %d, want none for an alias model", got)
+	}
+	routing.mu.RLock()
+	retryAt, armed := routing.endpointRetryAt[model]
+	routing.mu.RUnlock()
+	if armed {
+		t.Fatalf("alias model armed a retry at %v, want no request scheduled", retryAt)
+	}
+}
+
+// The failure floor is a statement about the catalog, so a refresh that lands the
+// catalog clears it. Otherwise one transient failure would keep suppressing
+// automatic launches after the catalog recovered.
+func TestSuccessfulCatalogRefreshClearsTheFailureFloor(t *testing.T) {
+	const model = "author/model"
+	routing := newRoutingState(map[string]providerConfig{model: {}}, time.Hour)
+	routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
+	now := time.Date(2026, time.October, 17, 12, 0, 0, 0, time.Local)
+	routing.now = func() time.Time { return now }
+	failing := true
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		if failing {
+			return response(http.StatusInternalServerError, "catalog down"), nil
+		}
+		catalog := endpointList{}
+		catalog.Data.Endpoints = []modelEndpoint{{
+			Tag: "provider", ProviderName: "Provider", Status: 0,
+			SupportedParameters: []string{"tools", "tool_choice"},
+		}}
+		data, _ := json.Marshal(catalog)
+		return response(http.StatusOK, string(data)), nil
+	})}
+
+	failed := routing.maybeRefreshModelOrder(model, client, "https://upstream.test/api/v1", "", 20, false)
+	if failed == nil {
+		t.Fatal("a stale catalog did not start a refresh")
+	}
+	<-failed
+	if again := routing.maybeRefreshModelOrder(model, client, "https://upstream.test/api/v1", "", 20, false); again != nil {
+		t.Fatal("the failed refresh was retried immediately")
+	}
+
+	// A refresh that reaches upstream inside the floor clears it, so the automatic
+	// schedule resumes as soon as the catalog is written.
+	failing = false
+	recovered := routing.launchModelOrderRefresh(model, client, "https://upstream.test/api/v1", "", 20, false, true)
+	if recovered == nil {
+		t.Fatal("a forced refresh did not start")
+	}
+	<-recovered
+	routing.mu.RLock()
+	_, floorArmed := routing.modelOrderFailedAt[model]
+	routing.mu.RUnlock()
+	if floorArmed {
+		t.Fatal("a successful refresh left the failure floor armed")
+	}
+}

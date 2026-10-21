@@ -933,6 +933,238 @@ func TestDailyBenchmarkRunsWhenCatalogIsFreshButBenchmarkIsDue(t *testing.T) {
 	}
 }
 
+// A manual pin is the user's choice of provider, so there is nothing for a daily
+// run to decide: no catalog read, no benchmark pings, no rewritten order. The
+// pin is enforced after a run too, but spending provider requests on a decision
+// that cannot change is the part this guards.
+func TestManualPinSkipsDailyProviderCheckups(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.OpenRouterAPIKey = "sk-test"
+	cfg.Models = map[string]providerConfig{model: {
+		Order:     []string{"pinned", "other"},
+		ManualPin: "pinned",
+		UpdatedAt: time.Now().Add(-24 * time.Hour),
+	}}
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalogCalls atomic.Int32
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet {
+			catalogCalls.Add(1)
+			return response(http.StatusOK, `{"data":{"endpoints":[]}}`), nil
+		}
+		return response(http.StatusOK, `{"id":"ok"}`), nil
+	})
+	var pings atomic.Int32
+	p.dailyTestProvider = func(context.Context, string, string, int) (providerTestSample, error) {
+		pings.Add(1)
+		return pingSample(100, 100*time.Millisecond), nil
+	}
+
+	if ready := p.prepareDailyModel(model); ready != nil {
+		t.Fatal("a manual pin started a daily provider checkup")
+	}
+	p.waitForDailyBenchmarks()
+	if got := pings.Load(); got != 0 {
+		t.Fatalf("benchmark pings = %d, want none under a manual pin", got)
+	}
+	if got := catalogCalls.Load(); got != 0 {
+		t.Fatalf("catalog reads = %d, want none under a manual pin", got)
+	}
+	if provider, manual := p.routing.pinInfo(model); provider != "pinned" || !manual {
+		t.Fatalf("pin = %q manual=%v, want the manual pin untouched", provider, manual)
+	}
+
+	// Removing the pin hands the decision back to orr, so the next request is a
+	// measurement again.
+	if err := p.routing.setManualPin(model, ""); err != nil {
+		t.Fatal(err)
+	}
+	ready := p.prepareDailyModel(model)
+	if ready == nil {
+		t.Fatal("an unpinned model still skipped its daily run")
+	}
+	p.waitForDailyBenchmarks()
+}
+
+// A run that spent pings and still learned nothing is the same spend as a
+// successful one, so it takes the full freshness window: retrying a slow or
+// failing provider set a minute later would only spend more.
+func TestFailedPingsConsumeTheFreshnessWindow(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.OpenRouterAPIKey = "sk-test"
+	cfg.UpdateMaxProviders = 20
+	cfg.Models = map[string]providerConfig{model: {
+		Order:     []string{"provider"},
+		UpdatedAt: time.Now(),
+	}}
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pings atomic.Int32
+	p.dailyTestProvider = func(context.Context, string, string, int) (providerTestSample, error) {
+		pings.Add(1)
+		return providerTestSample{}, errProviderAnswered
+	}
+
+	ready := p.prepareDailyModel(model)
+	if ready == nil {
+		t.Fatal("a due model did not start a run")
+	}
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run never released the request gate")
+	}
+	p.waitForDailyBenchmarks()
+	if got := pings.Load(); got == 0 {
+		t.Fatal("the run never pinged a provider")
+	}
+	if !p.stats.benchmarkedWithin(model, p.now(), benchmarkFreshness) {
+		t.Fatal("a run that spent pings did not consume the freshness window")
+	}
+	if p.stats.benchmarkAbortedWithin(model, p.now(), benchmarkRetryAfterAbort) {
+		t.Fatal("a run that spent pings armed the short abort floor as well")
+	}
+	if again := p.prepareDailyModel(model); again != nil {
+		p.waitForDailyBenchmarks()
+		t.Fatal("the next request relaunched a run that had just spent pings")
+	}
+}
+
+// A failing catalog must not be re-fetched by every request, and the model must
+// not be relaunched before the refresh floor expires.
+func TestFailedCatalogRefreshIsNotRetriedPerRequest(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.OpenRouterAPIKey = "sk-test"
+	cfg.UpdateMaxProviders = 20
+	cfg.Models = map[string]providerConfig{model: {
+		Order:     []string{"provider"},
+		UpdatedAt: time.Now().Add(-24 * time.Hour),
+	}}
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalogCalls atomic.Int32
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet {
+			catalogCalls.Add(1)
+			return response(http.StatusInternalServerError, "catalog down"), nil
+		}
+		return response(http.StatusOK, `{"id":"ok"}`), nil
+	})
+	var pings atomic.Int32
+	p.dailyTestProvider = func(context.Context, string, string, int) (providerTestSample, error) {
+		pings.Add(1)
+		return pingSample(100, time.Millisecond), nil
+	}
+
+	ready := p.prepareDailyModel(model)
+	if ready == nil {
+		t.Fatal("a due run with a failing catalog was never attempted")
+	}
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("aborted run never released the request gate")
+	}
+	p.waitForDailyBenchmarks()
+	if got := pings.Load(); got != 0 {
+		t.Fatalf("benchmark pings = %d after the catalog failed, want none", got)
+	}
+	if p.stats.benchmarkedWithin(model, p.now(), benchmarkFreshness) {
+		t.Fatal("a run that never pinged consumed the five-minute freshness window")
+	}
+	if !p.stats.benchmarkAbortedWithin(model, p.now(), benchmarkRetryAfterAbort) {
+		t.Fatal("a run that never pinged did not arm the short abort floor")
+	}
+	for range 3 {
+		if again := p.prepareDailyModel(model); again != nil {
+			p.waitForDailyBenchmarks()
+			t.Fatal("a subsequent request relaunched a run that could not measure")
+		}
+	}
+	if got := catalogCalls.Load(); got != 1 {
+		t.Fatalf("catalog reads = %d, want the failed refresh not retried per request", got)
+	}
+
+	// Past the floor the model is retried rather than hidden until the five-minute
+	// window expires. The gate is time.Now-based while the injected clock is a
+	// minute ahead, so it has to be wide enough not to expire.
+	now := time.Now().Add(benchmarkRetryAfterAbort + time.Second)
+	p.dailyGate = 2 * benchmarkRetryAfterAbort
+	p.setClock(func() time.Time { return now })
+	retried := p.prepareDailyModel(model)
+	if retried == nil {
+		t.Fatal("the failed run was not retried once the floor expired")
+	}
+	select {
+	case <-retried:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retry never released the request gate")
+	}
+	p.waitForDailyBenchmarks()
+	if got := catalogCalls.Load(); got != 2 {
+		t.Fatalf("catalog reads = %d, want one retry after the floor", got)
+	}
+}
+
+// The recovery cooldown is persisted with the rest of the stats file: a restart
+// must not hand the same failing provider a fresh benchmark allowance.
+func TestProviderRecoveryCooldownSurvivesRestart(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.Models = map[string]providerConfig{model: {
+		Order:     []string{"provider"},
+		UpdatedAt: time.Now(),
+	}}
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.client.Transport = degradationCatalogTransport("provider")
+	p.dailyTestProvider = func(context.Context, string, string, int) (providerTestSample, error) {
+		return pingSample(100, time.Millisecond), nil
+	}
+	ready := p.startProviderRecovery(model)
+	if ready == nil {
+		t.Fatal("recovery did not start a benchmark")
+	}
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("recovery run never finished")
+	}
+	p.waitForDailyBenchmarks()
+	if p.stats.recoveryLastRun(model).IsZero() {
+		t.Fatal("recovery run did not consume its cooldown")
+	}
+	statsPath := filepath.Join(t.TempDir(), "stats.json")
+	if err := p.stats.save(statsPath); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.stats.load(statsPath); err != nil {
+		t.Fatal(err)
+	}
+	if again := restarted.startProviderRecovery(model); again != nil {
+		restarted.waitForDailyBenchmarks()
+		t.Fatal("restart re-ran recovery inside the cooldown")
+	}
+	restarted.waitForDailyBenchmarks()
+}
+
 func TestConfiguredConsecutive429sFailOverAndRunFastRecovery(t *testing.T) {
 	const model = "author/model"
 	cfg := testConfig("https://upstream.test/api/v1")
@@ -2338,5 +2570,317 @@ func TestDailyRefreshWithoutKeyUpdatesProvisionalAutomaticChoice(t *testing.T) {
 	}
 	if provider, manual := p.routing.pinInfo(model); provider != "new-head" || manual {
 		t.Fatalf("refreshed pin = %q manual=%v, want automatic new-head", provider, manual)
+	}
+}
+
+// Skipping the run while pinned must not cost the model its measurement once the
+// pin is gone: the next request measures the field again and installs the
+// winner, so unpinning is not a state the app has to be restarted out of.
+func TestUnpinningRestoresAutomaticMeasurement(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.OpenRouterAPIKey = "sk-test"
+	cfg.UpdateMaxProviders = 20
+	cfg.Models = map[string]providerConfig{model: {
+		Order:     []string{"slow", "fast"},
+		ManualPin: "slow",
+		UpdatedAt: time.Now().Add(-24 * time.Hour),
+	}}
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet {
+			catalog := endpointList{}
+			catalog.Data.Endpoints = []modelEndpoint{
+				{Tag: "slow", ProviderName: "Slow", Status: 0, SupportedParameters: []string{"tools", "tool_choice"}},
+				{Tag: "fast", ProviderName: "Fast", Status: 0, SupportedParameters: []string{"tools", "tool_choice"}},
+			}
+			data, _ := json.Marshal(catalog)
+			return response(http.StatusOK, string(data)), nil
+		}
+		return response(http.StatusOK, `{"id":"ok"}`), nil
+	})
+	p.dailyTestProvider = func(_ context.Context, _, provider string, _ int) (providerTestSample, error) {
+		if provider == "fast" {
+			return pingSample(200, 100*time.Millisecond), nil
+		}
+		return pingSample(20, time.Second), nil
+	}
+
+	if ready := p.prepareDailyModel(model); ready != nil {
+		t.Fatal("a manual pin measured the field")
+	}
+	if err := p.routing.setManualPin(model, ""); err != nil {
+		t.Fatal(err)
+	}
+	if provider, manual := p.routing.pinInfo(model); provider != "" || manual {
+		t.Fatalf("pin after unpinning = %q manual=%v, want none", provider, manual)
+	}
+	ready := p.prepareDailyModel(model)
+	if ready == nil {
+		t.Fatal("an unpinned model did not start measuring again")
+	}
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run never released the request gate")
+	}
+	p.waitForDailyBenchmarks()
+	if provider := p.routing.pinnedProvider(model); provider != "fast" {
+		t.Fatalf("automatic pin = %q, want the measured winner fast", provider)
+	}
+}
+
+// Pinning a model must not stop orr from keeping its endpoint metadata current:
+// the order is not used to choose a provider while pinned, but pricing, quality,
+// and the dashboard still read that cache.
+func TestManualPinKeepsEndpointMetadataFresh(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.Models = map[string]providerConfig{model: {
+		Order:     []string{"pinned", "other"},
+		ManualPin: "pinned",
+		UpdatedAt: time.Now(),
+	}}
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.trackEndpoints = true
+	var catalogCalls atomic.Int32
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet {
+			catalogCalls.Add(1)
+			catalog := endpointList{}
+			catalog.Data.Endpoints = []modelEndpoint{
+				{Tag: "pinned", ProviderName: "Pinned", Status: 0, SupportedParameters: []string{"tools", "tool_choice"}},
+				{Tag: "other", ProviderName: "Other", Status: 0, SupportedParameters: []string{"tools", "tool_choice"}},
+			}
+			data, _ := json.Marshal(catalog)
+			return response(http.StatusOK, string(data)), nil
+		}
+		return response(http.StatusOK, `{"model":"author/model","usage":{}}`), nil
+	})
+
+	req, _ := http.NewRequest(http.MethodPost, "http://proxy.test/v1/chat/completions",
+		strings.NewReader(`{"model":"author/model","messages":[]}`))
+	p.ServeHTTP(newMemoryResponseWriter(), req)
+	deadline := time.Now().Add(2 * time.Second)
+	for len(p.routing.endpoints(model)) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("a manually pinned model never refreshed its endpoint metadata")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := catalogCalls.Load(); got == 0 {
+		t.Fatal("endpoint catalog was never fetched for a pinned model")
+	}
+}
+
+// A manual pin is a pin of one provider, so a 429 on it is answered rather than
+// routed around. The gate reads the pin the same way routing does, so the
+// provider the client is pinned to is the provider the failover decision sees.
+func TestRateLimitDoesNotFailOverAManualPin(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.RateLimitFailoverThreshold = 1
+	cfg.Models = map[string]providerConfig{model: {
+		Order:     []string{"pinned", "other"},
+		ManualPin: "pinned",
+		UpdatedAt: time.Now(),
+	}}
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	replacement, failover := p.rateLimitReplacement(model, "pinned", false)
+	if failover || replacement != "" {
+		t.Fatalf("429 failover = (replacement %q, %v), want none for a manual pin", replacement, failover)
+	}
+	p.rateLimitMu.Lock()
+	streak := p.rateLimitRuns[rateLimitKey{model: model, provider: "pinned"}]
+	p.rateLimitMu.Unlock()
+	if streak != 0 {
+		t.Fatalf("consecutive 429 count = %d, want the pinned provider's streak dropped", streak)
+	}
+	if provider := p.routing.pinnedProvider(model); provider != "pinned" {
+		t.Fatalf("routed provider = %q, want the pinned provider", provider)
+	}
+	if provider, manual := p.routing.pinInfo(model); provider != "pinned" || !manual {
+		t.Fatalf("pin = %q manual=%v, want pinned manual", provider, manual)
+	}
+}
+
+// A run that could not test every provider inside the gate still consumes the
+// freshness window. The unmeasured providers keep whatever the pool holds and
+// the next request must not relaunch the run just because it finished partial.
+func TestPartialBenchmarkStillConsumesTheFreshnessWindow(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.OpenRouterAPIKey = "sk-test"
+	cfg.UpdateMaxProviders = 20
+	cfg.Models = map[string]providerConfig{model: {
+		Order:     []string{"winner", "slow"},
+		UpdatedAt: time.Now(),
+	}}
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.dailyGate = 200 * time.Millisecond
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet {
+			return response(http.StatusOK, `{"id":"ok"}`), nil
+		}
+		catalog := endpointList{}
+		catalog.Data.Endpoints = []modelEndpoint{
+			{Tag: "winner", ProviderName: "Winner", Status: 0, SupportedParameters: []string{"tools", "tool_choice"}},
+			{Tag: "slow", ProviderName: "Slow", Status: 0, SupportedParameters: []string{"tools", "tool_choice"}},
+		}
+		data, _ := json.Marshal(catalog)
+		return response(http.StatusOK, string(data)), nil
+	})
+	var measured atomic.Int32
+	p.dailyTestProvider = func(ctx context.Context, _, provider string, _ int) (providerTestSample, error) {
+		if provider == "winner" {
+			measured.Add(1)
+			return pingSample(200, 100*time.Millisecond), nil
+		}
+		<-ctx.Done()
+		return providerTestSample{}, ctx.Err()
+	}
+
+	ready := p.prepareDailyModel(model)
+	if ready == nil {
+		t.Fatal("a due model did not start a run")
+	}
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("partial run never released the request gate")
+	}
+	p.waitForDailyBenchmarks()
+	if got := measured.Load(); got == 0 {
+		t.Fatal("the run measured nothing")
+	}
+	pool := p.stats.benchmarkPool(model)
+	if len(pool["slow"]) != 0 {
+		t.Fatalf("slow provider was measured despite the gate: %#v", pool["slow"])
+	}
+	if !p.stats.benchmarkedWithin(model, p.now(), benchmarkFreshness) {
+		t.Fatal("a partial run left the freshness window open")
+	}
+	if again := p.prepareDailyModel(model); again != nil {
+		p.waitForDailyBenchmarks()
+		t.Fatal("a partial run was relaunched by the next request")
+	}
+}
+
+// An alias id has no endpoint list to fetch and nothing to measure, so a request
+// for one must not start a run at all — otherwise it cycles a no-op run for as
+// long as the client keeps using the alias.
+func TestAliasModelSkipsTheDailyRun(t *testing.T) {
+	const model = "~author/family-latest"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.OpenRouterAPIKey = "sk-test"
+	cfg.Models = map[string]providerConfig{model: {
+		Order:     []string{"provider"},
+		UpdatedAt: time.Now().Add(-24 * time.Hour),
+	}}
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalogCalls, pings atomic.Int32
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet {
+			catalogCalls.Add(1)
+		}
+		return response(http.StatusOK, `{"id":"ok"}`), nil
+	})
+	p.dailyTestProvider = func(context.Context, string, string, int) (providerTestSample, error) {
+		pings.Add(1)
+		return pingSample(100, time.Millisecond), nil
+	}
+
+	if ready := p.prepareDailyModel(model); ready != nil {
+		p.waitForDailyBenchmarks()
+		t.Fatal("an alias model started a daily run")
+	}
+	p.waitForDailyBenchmarks()
+	if got := pings.Load(); got != 0 {
+		t.Fatalf("benchmark pings = %d for an alias model", got)
+	}
+	if got := catalogCalls.Load(); got != 0 {
+		t.Fatalf("catalog reads = %d for an alias model", got)
+	}
+}
+
+// A run that pings nothing because every provider is in a 429 backoff spends no
+// provider request, but its catalog refresh is still a request, so it settles the
+// schedule for the freshness window instead of re-fetching once a minute.
+func TestNoEligibleProvidersConsumesTheFreshnessWindow(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.OpenRouterAPIKey = "sk-test"
+	cfg.UpdateMaxProviders = 20
+	cfg.Models = map[string]providerConfig{model: {
+		Order:     []string{"provider"},
+		UpdatedAt: time.Now(),
+	}}
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalogCalls, pings atomic.Int32
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet {
+			return response(http.StatusOK, `{"id":"ok"}`), nil
+		}
+		catalogCalls.Add(1)
+		catalog := endpointList{}
+		catalog.Data.Endpoints = []modelEndpoint{{
+			Tag: "provider", ProviderName: "Provider", Status: 0,
+			SupportedParameters: []string{"tools", "tool_choice"},
+		}}
+		data, _ := json.Marshal(catalog)
+		return response(http.StatusOK, string(data)), nil
+	})
+	p.dailyTestProvider = func(context.Context, string, string, int) (providerTestSample, error) {
+		pings.Add(1)
+		return pingSample(100, time.Millisecond), nil
+	}
+	// The only provider exhausted its capacity, which is what keeps an automatic
+	// run from pinging anything.
+	p.routing.mu.Lock()
+	p.routing.temporarilyUnavailable[model] = map[string]time.Time{"provider": p.now()}
+	p.routing.mu.Unlock()
+
+	ready := p.prepareDailyModel(model)
+	if ready == nil {
+		t.Fatal("a due model did not start a run")
+	}
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run never released the request gate")
+	}
+	p.waitForDailyBenchmarks()
+	if got := pings.Load(); got != 0 {
+		t.Fatalf("benchmark pings = %d for a provider in backoff", got)
+	}
+	if !p.stats.benchmarkedWithin(model, p.now(), benchmarkFreshness) {
+		t.Fatal("a run that refreshed the catalog did not consume the freshness window")
+	}
+	if p.stats.benchmarkAbortedWithin(model, p.now(), benchmarkRetryAfterAbort) {
+		t.Fatal("a run that refreshed the catalog also armed the short abort floor")
+	}
+	if again := p.prepareDailyModel(model); again != nil {
+		p.waitForDailyBenchmarks()
+		t.Fatal("the next request fetched the same catalog again")
 	}
 }

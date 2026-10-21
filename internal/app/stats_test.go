@@ -492,3 +492,71 @@ func TestDiagnosticsEmptyWindows(t *testing.T) {
 		}
 	}
 }
+
+// The recovery cooldown is part of the persisted state: a restart must not hand
+// the same failing provider a fresh benchmark allowance minutes apart.
+func TestStatsPersistsTheRecoveryCooldown(t *testing.T) {
+	const model = "author/model"
+	now := time.Date(2026, time.October, 18, 12, 0, 0, 0, time.Local)
+	s := newStats()
+	s.now = func() time.Time { return now }
+	s.markRecoveryRun(model, now)
+	path := filepath.Join(t.TempDir(), "stats.json")
+	if err := s.save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded := newStats()
+	loaded.now = func() time.Time { return now }
+	if err := loaded.load(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.recoveryLastRun(model); !got.Equal(now) {
+		t.Fatalf("reloaded recovery run = %v, want %v", got, now)
+	}
+	// A latch ahead of the wall clock is stale, not a cooldown that outlives the
+	// failure it belongs to.
+	behind := now.Add(-time.Minute)
+	loaded.now = func() time.Time { return behind }
+	if got := loaded.recoveryLastRun(model); !got.IsZero() {
+		t.Fatalf("a future recovery latch reported a cooldown: %v", got)
+	}
+}
+
+// A stats file written before the recovery cooldown existed must still load: the
+// field is additive, and a missing one means "no cooldown yet", not a decode
+// error that would cost the user their spend and pin history on upgrade.
+func TestStatsLoadsWithoutRecoveryRuns(t *testing.T) {
+	const model = "author/model"
+	now := time.Date(2026, time.October, 18, 12, 0, 0, 0, time.Local)
+	lastRun := now.Add(-time.Hour).Format(time.RFC3339Nano)
+	legacy := `{
+  "version": 1,
+  "request_count": 7,
+  "benchmark_runs": {"` + model + `": "` + lastRun + `"},
+  "provider_pins": {"` + model + `": {"provider": "pinned", "pinned_at": "` + lastRun + `"}}
+}
+`
+	path := filepath.Join(t.TempDir(), "stats.json")
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := newStats()
+	s.now = func() time.Time { return now }
+	if err := s.load(path); err != nil {
+		t.Fatalf("legacy stats file did not load: %v", err)
+	}
+	if !s.benchmarkedWithin(model, now, 2*time.Hour) {
+		t.Fatal("legacy benchmark run was not restored")
+	}
+	if pin := s.providerPinsSnapshot()[model]; pin.Provider != "pinned" {
+		t.Fatalf("legacy pin = %#v, want pinned", pin)
+	}
+	if got := s.recoveryLastRun(model); !got.IsZero() {
+		t.Fatalf("absent recovery_runs reported a cooldown: %v", got)
+	}
+	// The file can be written back in the new shape without losing anything.
+	if err := s.save(filepath.Join(t.TempDir(), "saved.json")); err != nil {
+		t.Fatalf("stats with a legacy history did not save: %v", err)
+	}
+}

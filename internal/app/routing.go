@@ -15,6 +15,19 @@ import (
 
 const endpointCacheTTL = 5 * time.Minute
 
+// endpointFetchRetryDelay bounds how often the endpoint cache is refilled after
+// a failed fetch. Clearing the TTL marker on failure is what lets the next
+// request retry instead of waiting out the cache window; without a floor on that
+// retry, an upstream that keeps failing turns every answered request into
+// another catalog GET and another log line.
+const endpointFetchRetryDelay = 30 * time.Second
+
+// modelOrderRetryDelay bounds how often the once-per-day catalog refresh is
+// retried after it fails. The schedule only knows that the catalog is still
+// stale, which is exactly what a failure leaves behind, so without this the
+// refresh — and the benchmark run it carries — is re-attempted per request.
+const modelOrderRetryDelay = time.Minute
+
 // Provider selection compares what one request actually costs the client and
 // how long it actually takes, instead of ranking raw prices and raw speeds
 // against each other. Both numbers come from the same reference request, so
@@ -205,6 +218,7 @@ type routingState struct {
 	providersPath          string
 	endpointCache          map[string][]endpointMeta
 	endpointFetchedAt      map[string]time.Time
+	endpointRetryAt        map[string]time.Time
 	qualityCache           map[string]providerQualityCache
 	qualityLoading         map[string]chan struct{}
 	qualityGenerations     map[string]uint64
@@ -212,6 +226,7 @@ type routingState struct {
 	modelRevisions         map[string]uint64
 	modelOrderUpdating     map[string]bool
 	modelOrderDone         map[string]chan struct{}
+	modelOrderFailedAt     map[string]time.Time
 	pendingPins            map[string]persistedPin
 	temporarilyUnavailable map[string]map[string]time.Time
 	timeWeight             float64
@@ -233,6 +248,7 @@ func newRoutingState(models map[string]providerConfig, pinTTL time.Duration) *ro
 		pinTTL:                 pinTTL,
 		endpointCache:          make(map[string][]endpointMeta),
 		endpointFetchedAt:      make(map[string]time.Time),
+		endpointRetryAt:        make(map[string]time.Time),
 		qualityCache:           make(map[string]providerQualityCache),
 		qualityLoading:         make(map[string]chan struct{}),
 		qualityGenerations:     make(map[string]uint64),
@@ -240,6 +256,7 @@ func newRoutingState(models map[string]providerConfig, pinTTL time.Duration) *ro
 		modelRevisions:         make(map[string]uint64),
 		modelOrderUpdating:     make(map[string]bool),
 		modelOrderDone:         make(map[string]chan struct{}),
+		modelOrderFailedAt:     make(map[string]time.Time),
 		pendingPins:            make(map[string]persistedPin),
 		temporarilyUnavailable: make(map[string]map[string]time.Time),
 		timeWeight:             defaultBenchmarkTimeWeight,
@@ -871,6 +888,15 @@ func (r *routingState) pinInfo(model string) (string, bool) {
 	return pin.provider, pin.manual
 }
 
+// manualPin reports whether model's provider was chosen by the user rather than
+// by orr. It is the one predicate every gate asks — the daily run, the watchdog,
+// the 429 failover, and the refusal reroute — so none of them can disagree with
+// the routing decision itself about whether a model is pinned.
+func (r *routingState) manualPin(model string) bool {
+	_, manual := r.pinInfo(model)
+	return manual
+}
+
 func (r *routingState) resolveProvider(model, provider string) (string, bool) {
 	if provider == "" {
 		return "", false
@@ -1173,25 +1199,40 @@ func (r *routingState) endpoints(model string) []endpointMeta {
 }
 
 func (r *routingState) refreshEndpoints(model string, client *http.Client, upstream, apiKey string) {
+	if isAliasModel(model) {
+		// An alias id resolves to a model but exposes no endpoint list of its own,
+		// so this request could never succeed. The guard matches the order refresh
+		// and `orr update`: nothing is fetched, and the alias keeps whatever order
+		// and measurements it already has.
+		return
+	}
 	r.mu.Lock()
 	if model == "" {
 		r.mu.Unlock()
 		return
 	}
-	if last, ok := r.endpointFetchedAt[model]; ok && r.now().Sub(last) < endpointCacheTTL {
+	now := r.now()
+	if retryAt, ok := r.endpointRetryAt[model]; ok && !retryAt.After(now) && now.Sub(retryAt) < endpointFetchRetryDelay {
+		r.mu.Unlock()
+		return
+	}
+	if last, ok := r.endpointFetchedAt[model]; ok && now.Sub(last) < endpointCacheTTL {
 		r.mu.Unlock()
 		return
 	}
 	// Mark as fetched now so concurrent requests don't pile up.
-	r.endpointFetchedAt[model] = r.now()
+	r.endpointFetchedAt[model] = now
 	r.mu.Unlock()
 
 	result, err := fetchEndpoints(context.Background(), client, upstream, apiKey, model)
 	if err != nil {
 		// Do not burn the TTL on a failed fetch: clear the marker so the next
-		// request retries instead of waiting out the full cache window.
+		// request retries instead of waiting out the full cache window, but keep
+		// the retry on a floor so a provider catalog that keeps failing does not
+		// get a fresh GET from every answered request.
 		r.mu.Lock()
 		delete(r.endpointFetchedAt, model)
+		r.endpointRetryAt[model] = r.now()
 		r.mu.Unlock()
 		log.Printf("refresh endpoints for %s: %v", model, err)
 		return
@@ -1201,6 +1242,7 @@ func (r *routingState) refreshEndpoints(model string, client *http.Client, upstr
 	r.endpointCache[model] = meta
 	r.nameMap[model] = nameMap
 	r.endpointFetchedAt[model] = r.now()
+	delete(r.endpointRetryAt, model)
 	r.mu.Unlock()
 	r.resolvePendingPins(model)
 }
@@ -1208,6 +1250,9 @@ func (r *routingState) refreshEndpoints(model string, client *http.Client, upstr
 func (r *routingState) refreshModelOrder(model string, client *http.Client, upstream, apiKey string, maxProviders int, cacheOnly bool) error {
 	if !validModelID(model) {
 		return errors.New("invalid model")
+	}
+	if isAliasModel(model) {
+		return nil
 	}
 	r.mu.RLock()
 	refreshRevision := r.modelRevisions[model]
@@ -1845,13 +1890,16 @@ func (r *routingState) maybeRefreshModelOrder(model string, client *http.Client,
 		r.mu.Unlock()
 		return nil
 	}
-	today := r.now().Format(time.DateOnly)
+	now := r.now()
+	today := now.Format(time.DateOnly)
 	if len(cfg.Order) > 0 && cfg.UpdatedAt.Format(time.DateOnly) == today {
 		r.mu.Unlock()
 		return nil
 	}
 	r.mu.Unlock()
-	return r.launchModelOrderRefresh(model, client, upstream, apiKey, maxProviders, cacheOnly)
+	// The retry floor lives in launchModelOrderRefresh, so an automatic caller that
+	// is backing off gets nil there rather than being checked twice.
+	return r.launchModelOrderRefresh(model, client, upstream, apiKey, maxProviders, cacheOnly, false)
 }
 
 // forceRefreshModelOrder refreshes the provider order for model immediately,
@@ -1867,15 +1915,27 @@ func (r *routingState) forceRefreshModelOrder(model string, client *http.Client,
 		return
 	}
 	r.mu.Unlock()
-	r.launchModelOrderRefresh(model, client, upstream, apiKey, maxProviders, cacheOnly)
+	r.launchModelOrderRefresh(model, client, upstream, apiKey, maxProviders, cacheOnly, true)
 }
 
-func (r *routingState) launchModelOrderRefresh(model string, client *http.Client, upstream, apiKey string, maxProviders int, cacheOnly bool) <-chan struct{} {
+// launchModelOrderRefresh starts one provider-order refresh for model unless one
+// is already in flight, in which case the caller gets the running one's channel.
+// An automatic launch (force false) also honors the retry delay a refresh that
+// left the catalog stale put behind; a refresh the user asked for (force true)
+// does not.
+func (r *routingState) launchModelOrderRefresh(model string, client *http.Client, upstream, apiKey string, maxProviders int, cacheOnly bool, force bool) <-chan struct{} {
 	r.mu.Lock()
 	if r.modelOrderUpdating[model] {
 		done := r.modelOrderDone[model]
 		r.mu.Unlock()
 		return done
+	}
+	if !force {
+		now := r.now()
+		if failedAt := r.modelOrderFailedAt[model]; !failedAt.IsZero() && !failedAt.After(now) && now.Sub(failedAt) < modelOrderRetryDelay {
+			r.mu.Unlock()
+			return nil
+		}
 	}
 	done := make(chan struct{})
 	r.modelOrderUpdating[model] = true
@@ -1892,7 +1952,20 @@ func (r *routingState) launchModelOrderRefresh(model string, client *http.Client
 			r.mu.Unlock()
 			close(done)
 		}()
-		r.refreshModelOrder(model, client, upstream, apiKey, maxProviders, cacheOnly)
+		err := r.refreshModelOrder(model, client, upstream, apiKey, maxProviders, cacheOnly)
+		r.mu.Lock()
+		// The floor is a statement about the catalog, so it is armed only while the
+		// catalog is still stale. A refresh that committed its order and then failed
+		// to write the file has nothing to retry, and a later per-model change that
+		// made the fetch fail is not an outage either.
+		cfg, known := r.models[model]
+		stale := !known || cfg.UpdatedAt.Format(time.DateOnly) != r.now().Format(time.DateOnly)
+		if err != nil && stale {
+			r.modelOrderFailedAt[model] = r.now()
+		} else {
+			delete(r.modelOrderFailedAt, model)
+		}
+		r.mu.Unlock()
 	}()
 	return done
 }

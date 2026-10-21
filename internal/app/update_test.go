@@ -1,9 +1,14 @@
 package app
 
 import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -103,5 +108,146 @@ func TestReplaceOrdersDoesNotDuplicatePinnedProvider(t *testing.T) {
 	replaceOrders(&cfg, map[string][]string{"a/b": {"fast", "pinned"}})
 	if got := cfg.Models["a/b"].Order; !reflect.DeepEqual(got, []string{"fast", "pinned"}) {
 		t.Fatalf("pinned provider duplicated: %#v", got)
+	}
+}
+
+func TestUpdateSkipsAliasAndNonToolModels(t *testing.T) {
+	clearRuntimeEnv(t)
+	const model = "moonshotai/kimi-k3"
+	params := []string{"tools", "tool_choice"}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		result := endpointList{}
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/models/"+model+"/endpoints"):
+			result.Data.Endpoints = []modelEndpoint{
+				{Tag: "slow", ProviderName: "Slow", Status: 0, SupportedParameters: params, Throughput: &percentiles{P50: 10}},
+				{Tag: "fast", ProviderName: "Fast", Status: 0, SupportedParameters: params, Throughput: &percentiles{P50: 100}},
+			}
+		case strings.HasSuffix(r.URL.Path, "/models/scaledown/summarize/endpoints"):
+			result.Data.Endpoints = []modelEndpoint{
+				{Tag: "scaledown", ProviderName: "ScaleDown", Status: 0, SupportedParameters: []string{"max_tokens"}},
+			}
+		}
+		_ = json.NewEncoder(w).Encode(result)
+	}))
+	defer upstream.Close()
+
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	writeTestFile(t, envPath, "OPENROUTER_API_KEY=test\nORR_UPSTREAM="+upstream.URL+"\n")
+	writeTestFile(t, filepath.Join(dir, "providers.yaml"), "version: 1\nmodels:\n"+
+		"    ~anthropic/claude-fable-latest: {}\n"+
+		"    "+model+": {}\n"+
+		"    scaledown/summarize:\n"+
+		"        order:\n"+
+		"            - old\n"+
+		"        manual_pin: old\n")
+
+	var output strings.Builder
+	if err := runUpdateWithOptions(envPath, false, 20, false, &output); err != nil {
+		t.Fatalf("update returned error: %v", err)
+	}
+	if !strings.Contains(output.String(), "~anthropic/claude-fable-latest: skipped (alias model)") {
+		t.Fatalf("alias skip not reported:\n%s", output.String())
+	}
+	if !strings.Contains(output.String(), "scaledown/summarize: skipped (no tool-capable endpoints)") {
+		t.Fatalf("tool filter skip not reported:\n%s", output.String())
+	}
+	cfg, err := loadConfig(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Models[model].Order; !reflect.DeepEqual(got, []string{"fast", "slow"}) {
+		t.Fatalf("updated order = %#v, want [fast slow]", got)
+	}
+	if got := cfg.Models["~anthropic/claude-fable-latest"]; len(got.Order) != 0 || !got.UpdatedAt.IsZero() {
+		t.Fatalf("alias model was updated: %#v", got)
+	}
+	if got := cfg.Models["scaledown/summarize"]; !reflect.DeepEqual(got.Order, []string{"old"}) || got.ManualPin != "old" {
+		t.Fatalf("skipped model lost its order or pin: %#v", got)
+	}
+}
+
+func TestUpdateWritesSuccessfulOrdersWhenModelsFail(t *testing.T) {
+	clearRuntimeEnv(t)
+	const (
+		good  = "moonshotai/kimi-k3"
+		empty = "openai/gpt-6-luna"
+		mixed = "z-ai/glm-5.3"
+	)
+	params := []string{"tools", "tool_choice"}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		result := endpointList{}
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/models/"+good+"/endpoints"):
+			result.Data.Endpoints = []modelEndpoint{
+				{Tag: "fast", ProviderName: "Fast", Status: 0, SupportedParameters: params, Throughput: &percentiles{P50: 100}},
+			}
+		case strings.HasSuffix(r.URL.Path, "/models/"+mixed+"/endpoints"):
+			result.Data.Endpoints = []modelEndpoint{
+				{Tag: "plain", ProviderName: "Plain", Status: 0, SupportedParameters: []string{"max_tokens"}},
+				{Tag: "tools-down", ProviderName: "Tools Down", Status: 1, SupportedParameters: params},
+			}
+		}
+		_ = json.NewEncoder(w).Encode(result)
+	}))
+	defer upstream.Close()
+
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	writeTestFile(t, envPath, "OPENROUTER_API_KEY=test\nORR_UPSTREAM="+upstream.URL+"\n")
+	writeTestFile(t, filepath.Join(dir, "providers.yaml"), "version: 1\nmodels:\n"+
+		"    "+good+": {}\n"+
+		"    "+empty+":\n"+
+		"        order:\n"+
+		"            - kept\n"+
+		"        manual_pin: kept\n"+
+		"    "+mixed+": {}\n")
+
+	err := runUpdateWithOptions(envPath, false, 20, false, io.Discard)
+	if err == nil {
+		t.Fatal("update did not report the failing models")
+	}
+	emptyIndex := strings.Index(err.Error(), empty)
+	mixedIndex := strings.Index(err.Error(), mixed)
+	if emptyIndex < 0 || mixedIndex < 0 || emptyIndex > mixedIndex {
+		t.Fatalf("error = %v, want %s before %s in sorted order", err, empty, mixed)
+	}
+	cfg, loadErr := loadConfig(envPath)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if got := cfg.Models[good].Order; !reflect.DeepEqual(got, []string{"fast"}) {
+		t.Fatalf("successful order was not written: %#v", got)
+	}
+	if got := cfg.Models[empty]; !reflect.DeepEqual(got.Order, []string{"kept"}) || got.ManualPin != "kept" {
+		t.Fatalf("empty-endpoint model lost its order or pin: %#v", got)
+	}
+	if got := cfg.Models[mixed]; len(got.Order) != 0 || !got.UpdatedAt.IsZero() {
+		t.Fatalf("outage model was updated: %#v", got)
+	}
+}
+
+func TestFetchUpdateOrderCacheOnlyRequiresCachingEndpoint(t *testing.T) {
+	params := []string{"tools", "tool_choice"}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		result := endpointList{}
+		result.Data.Endpoints = []modelEndpoint{
+			{Tag: "fast", ProviderName: "Fast", Status: 0, SupportedParameters: params, Throughput: &percentiles{P50: 100}},
+		}
+		_ = json.NewEncoder(w).Encode(result)
+	}))
+	defer upstream.Close()
+
+	result := fetchUpdateOrder(upstream.Client(), upstream.URL, "", "moonshotai/kimi-k3", 20, true)
+	if result.err == nil || !strings.Contains(result.err.Error(), "no cache-capable endpoints") {
+		t.Fatalf("cache-only result = %#v, want a cache-capable error", result)
+	}
+}
+
+func writeTestFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
