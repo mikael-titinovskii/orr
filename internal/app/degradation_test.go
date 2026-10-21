@@ -365,3 +365,156 @@ func TestDegradationNeverMovesAManualPin(t *testing.T) {
 		t.Fatalf("pin after the watch = %q manual=%t, want provider manual", pin, manual)
 	}
 }
+
+// A conviction that arrives while another run holds the model cannot start a
+// second run, but it still has to consume the cooldown: otherwise the watch
+// re-convicts, once per scan throttle, for as long as that other run lasts.
+func TestDegradationConvictionCoalescesIntoRunningBenchmark(t *testing.T) {
+	now := time.Date(2026, time.October, 17, 12, 0, 0, 0, time.Local)
+	p := newDegradationProxy(t, now)
+	var pings atomic.Int32
+	p.dailyTestProvider = func(context.Context, string, string, int) (providerTestSample, error) {
+		pings.Add(1)
+		return pingSample(200, 100*time.Millisecond), nil
+	}
+	// Pooled rounds that predate the collapse; the conviction exists because they
+	// no longer describe the provider, so they must not outvote the new run.
+	p.stats.mu.Lock()
+	p.stats.addBenchmarkSampleLocked(degradationModel, "provider", benchmarkSample{
+		Time: now, TPS: 900, TTFTms: 100,
+	})
+	p.stats.mu.Unlock()
+
+	inFlight := make(chan struct{})
+	p.dailyReady[degradationModel] = inFlight
+	if started := p.startDegradationBenchmark(degradationModel, "provider"); started {
+		t.Fatal("a second run started while one already held the model")
+	}
+	// The conviction is handed to the in-flight run rather than acted on here: the
+	// run drops the stale rounds immediately before its own pings.
+	p.dailyMu.Lock()
+	handed := p.degradationWanted[degradationModel]
+	p.dailyMu.Unlock()
+	if handed != "provider" {
+		t.Fatalf("conviction handed to the in-flight run = %q, want provider", handed)
+	}
+	p.dailyWG.Add(1)
+	closed := make(chan struct{})
+	close(closed)
+	p.runAutomaticBenchmark(degradationModel, closed, inFlight, false, time.Second)
+
+	if pings.Load() == 0 {
+		t.Fatal("the in-flight run measured nothing")
+	}
+	for _, sample := range p.stats.benchmarkPool(degradationModel)["provider"] {
+		if sample.TPS == 900 {
+			t.Fatalf("the convicted provider's stale round survived the run: %#v", sample)
+		}
+	}
+	if remaining := p.degradationCooldownRemaining(degradationModel); remaining <= 0 {
+		t.Fatal("a run that measured the convicted provider did not consume the cooldown")
+	}
+}
+
+// The cooldown means "the bad state was addressed", and what addresses it is the
+// pre-ping clear of the convicted provider's pooled rounds. A run that cleared the
+// pool and re-measured the field consumes the cooldown even when the convicted
+// provider itself failed to answer: leaving it out of the ranking is the answer.
+func TestDegradationConvictionIsAddressedWithoutAnAnswer(t *testing.T) {
+	now := time.Date(2026, time.October, 17, 12, 0, 0, 0, time.Local)
+	p := newDegradationProxy(t, now)
+	p.stats.mu.Lock()
+	p.stats.addBenchmarkSampleLocked(degradationModel, "provider", benchmarkSample{
+		Time: now, TPS: 900, TTFTms: 100,
+	})
+	p.stats.mu.Unlock()
+	p.dailyTestProvider = func(context.Context, string, string, int) (providerTestSample, error) {
+		return providerTestSample{}, errProviderAnswered
+	}
+
+	if started := p.startDegradationBenchmark(degradationModel, "provider"); !started {
+		t.Fatal("the conviction did not start a run")
+	}
+	p.waitForDailyBenchmarks()
+	if samples := p.stats.benchmarkPool(degradationModel)["provider"]; len(samples) != 0 {
+		t.Fatalf("the convicted provider's stale rounds survived: %#v", samples)
+	}
+	if remaining := p.degradationCooldownRemaining(degradationModel); remaining <= 0 {
+		t.Fatal("a run that cleared the pool did not consume the cooldown")
+	}
+}
+
+// A conviction handed to a run that never reaches its pings addresses nothing, so
+// it must not consume the cooldown: the watch has to be free to act on the next
+// scan instead of going blind for the whole cooldown.
+func TestDegradationConvictionSurvivesARunThatNeverMeasured(t *testing.T) {
+	now := time.Date(2026, time.October, 17, 12, 0, 0, 0, time.Local)
+	p := newDegradationProxy(t, now)
+	// An empty order is what a run whose catalog came back unusable looks like.
+	p.routing.mu.Lock()
+	p.routing.models[degradationModel] = providerConfig{UpdatedAt: now}
+	p.routing.mu.Unlock()
+
+	inFlight := make(chan struct{})
+	p.dailyReady[degradationModel] = inFlight
+	if started := p.startDegradationBenchmark(degradationModel, "provider"); started {
+		t.Fatal("a second run started while one already held the model")
+	}
+	p.dailyWG.Add(1)
+	closed := make(chan struct{})
+	close(closed)
+	p.runAutomaticBenchmark(degradationModel, closed, inFlight, false, time.Second)
+
+	if remaining := p.degradationCooldownRemaining(degradationModel); remaining > 0 {
+		t.Fatalf("a run that never pinged consumed the degradation cooldown (%v left)", remaining)
+	}
+	p.dailyMu.Lock()
+	wanted := p.degradationWanted[degradationModel]
+	p.dailyMu.Unlock()
+	if wanted != "" {
+		t.Fatalf("the coalesced conviction was not cleared after the run: %q", wanted)
+	}
+	// Free to act again, and able to: the conviction is re-derived from the client
+	// vitals, which the unproductive run did not change.
+	p.dailyGate = 2 * benchmarkRetryAfterAbort
+	if started := p.startDegradationBenchmark(degradationModel, "provider"); !started {
+		t.Fatal("the watch could not act on the standing conviction")
+	}
+	p.waitForDailyBenchmarks()
+}
+
+// A conviction that arrives while the run is already pinging cannot be answered by
+// that run: its pooled rounds were read before the conviction existed. Crediting it
+// would silence the watch for the whole cooldown while the stale rounds stay in
+// place, so it is dropped and re-derived on the next scan instead.
+func TestDegradationConvictionDuringPingsIsNotCredited(t *testing.T) {
+	now := time.Date(2026, time.October, 17, 12, 0, 0, 0, time.Local)
+	p := newDegradationProxy(t, now)
+	var pings atomic.Int32
+	p.dailyTestProvider = func(context.Context, string, string, int) (providerTestSample, error) {
+		if pings.Add(1) == 1 {
+			p.dailyMu.Lock()
+			p.degradationWanted[degradationModel] = "provider"
+			p.dailyMu.Unlock()
+		}
+		return pingSample(200, 100*time.Millisecond), nil
+	}
+	p.dailyWG.Add(1)
+	closed := make(chan struct{})
+	close(closed)
+	ready := make(chan struct{})
+	p.runAutomaticBenchmark(degradationModel, closed, ready, false, time.Second)
+
+	if pings.Load() == 0 {
+		t.Fatal("the run never pinged")
+	}
+	if remaining := p.degradationCooldownRemaining(degradationModel); remaining > 0 {
+		t.Fatalf("a conviction that arrived after the pool clear was credited (%v left)", remaining)
+	}
+	p.dailyMu.Lock()
+	wanted := p.degradationWanted[degradationModel]
+	p.dailyMu.Unlock()
+	if wanted != "" {
+		t.Fatalf("the late conviction was left behind in the map: %q", wanted)
+	}
+}

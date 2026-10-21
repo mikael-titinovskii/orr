@@ -82,8 +82,8 @@ Keep `ORR_LISTEN` on `127.0.0.1` unless you deliberately want network access.
 | --- | --- |
 | `orr serve` | Start the local proxy and dashboard. |
 | `orr serve --no-tui` | Start the proxy and management API with plain logs. |
-| `orr providers <model>` | List compatible OpenRouter providers. |
-| `orr update` | Refresh provider orders for every known model. |
+| `orr providers <model>` | List compatible OpenRouter providers for a concrete model id. |
+| `orr update` | Refresh provider orders for every known model. Alias models and models without a tool-capable endpoint are skipped. |
 | `orr update --cache-only` | Keep only providers with prompt caching. |
 | `orr reset` | Remove generated provider and stats state; preserves `.env`. |
 | `orr upgrade` | Pull or download the latest source and rebuild the running binary with Go, or Docker when no usable Go toolchain is installed. |
@@ -228,12 +228,19 @@ for how the benchmarks and tool-call errors are measured.
 
 Manual pins stay until removed. Automatic pins select the best measured
 provider, expire after `ORR_PIN_TTL` (one hour by default), and can fail over
-after provider-specific 429s or an unavailable endpoint.
+after provider-specific 429s or an unavailable endpoint. The recovery benchmark a
+failure starts is held to a 30-second cooldown per model, saved in the platform
+stats file, so a restart does not hand the same failing provider a fresh run.
 
 Measurement follows the models clients ask for. A request for a model whose last
 measurement is more than five minutes old starts one catalog refresh and one
 provider benchmark for that model, in the background while the request itself
-rides the stored pin; a model nobody asks for is never measured. The pings get
+rides the stored pin; a model nobody asks for is never measured. A manually
+pinned model is not measured at all: the order under your pin decides nothing, so
+the run would spend billable provider requests on a choice it cannot make.
+Removing the pin brings the catalog refresh back on the next request and the
+benchmark back as soon as that model's last measurement is due, within the same
+five minutes. The pings get
 their own three-second gate after that model's refresh completes, so a slow
 catalog never spends the budget the measurements need, and every provider is
 measured until the gate runs out rather than stopping at a share of the field.

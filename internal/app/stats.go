@@ -197,6 +197,11 @@ type persistedStats struct {
 	BudgetReset   string                  `json:"budget_reset,omitempty"`
 	ProviderPins  map[string]persistedPin `json:"provider_pins,omitempty"`
 	BenchmarkRuns map[string]time.Time    `json:"benchmark_runs,omitempty"`
+	// RecoveryRuns is the last provider-recovery benchmark per model. It is
+	// persisted so the cooldown survives a restart: a process that re-enabled it
+	// on every start would hand the same failing provider a fresh benchmark —
+	// and a fresh bill — minutes apart.
+	RecoveryRuns map[string]time.Time `json:"recovery_runs,omitempty"`
 	// TimeWeight is the speed/price exponent the dashboard's slider was left
 	// at. It is a pointer so the meaningful value 0.0 — price alone — is not
 	// dropped by omitempty and silently restored as the default on restart.
@@ -229,7 +234,11 @@ type stats struct {
 	budgetReset      string
 	providerPins     map[string]persistedPin
 	benchmarkRuns    map[string]time.Time
-	timeWeight       float64
+	recoveryRuns     map[string]time.Time
+	// benchmarkAborts is the last run per model that ended without measuring
+	// anything. It is memory-only: a restart is itself a reason to try again.
+	benchmarkAborts map[string]time.Time
+	timeWeight      float64
 	// degradation is the persisted watchdog switch. degradationSaved records
 	// whether the stats file carried a value, so the .env default only seeds a
 	// state the user has never toggled.
@@ -270,6 +279,8 @@ func newStats() *stats {
 		observed:         make(map[string]map[string]struct{}),
 		providerPins:     make(map[string]persistedPin),
 		benchmarkRuns:    make(map[string]time.Time),
+		recoveryRuns:     make(map[string]time.Time),
+		benchmarkAborts:  make(map[string]time.Time),
 		benchmarkSamples: make(map[string]map[string][]benchmarkSample),
 		timeWeight:       defaultBenchmarkTimeWeight,
 		degradation:      true,
@@ -630,6 +641,7 @@ func (s *stats) save(path string) error {
 		BudgetReset:      s.budgetReset,
 		ProviderPins:     s.providerPins,
 		BenchmarkRuns:    s.benchmarkRuns,
+		RecoveryRuns:     s.recoveryRuns,
 		BenchmarkSamples: s.benchmarkSamples,
 		TimeWeight:       &timeWeight,
 		Degradation:      degradation,
@@ -718,6 +730,19 @@ func (s *stats) load(path string) error {
 	s.benchmarkRuns = saved.BenchmarkRuns
 	if s.benchmarkRuns == nil {
 		s.benchmarkRuns = make(map[string]time.Time)
+	}
+	s.recoveryRuns = saved.RecoveryRuns
+	if s.recoveryRuns == nil {
+		s.recoveryRuns = make(map[string]time.Time)
+	}
+	// A recovery cooldown is read through a 30-second window, so anything older
+	// than a day describes a failure that cannot recur; dropping it keeps the
+	// shareable stats file from accumulating one timestamp per model forever.
+	recoveryCutoff := s.now().Add(-24 * time.Hour)
+	for model, last := range s.recoveryRuns {
+		if last.Before(recoveryCutoff) {
+			delete(s.recoveryRuns, model)
+		}
 	}
 	// Restore the benchmark pool, dropping samples that have aged out while
 	// the proxy was not running.
@@ -817,6 +842,63 @@ func (s *stats) markBenchmarkRun(model string, now time.Time) {
 	}
 	s.mu.Lock()
 	s.benchmarkRuns[model] = now
+	delete(s.benchmarkAborts, model)
+	s.mutations++
+	s.mu.Unlock()
+}
+
+// benchmarkAbortedWithin reports whether model's last run ended without a usable
+// catalog inside window. It is the abort floor: a failure is retried
+// on it instead of on the freshness window, which would hide the model from
+// measurement for five minutes over a one-minute outage.
+func (s *stats) benchmarkAbortedWithin(model string, now time.Time, window time.Duration) bool {
+	if model == "" || window <= 0 {
+		return false
+	}
+	s.mu.RLock()
+	last := s.benchmarkAborts[model]
+	s.mu.RUnlock()
+	return !last.IsZero() && !last.After(now) && now.Sub(last) < window
+}
+
+// markBenchmarkAbort records a run that measured nothing. It deliberately leaves
+// the freshness record alone: an aborted run is not evidence that a real
+// measurement got younger, and deleting it would let an abort pull the next run
+// forward into the five-minute window. A real run supersedes the abort through
+// markBenchmarkRun.
+func (s *stats) markBenchmarkAbort(model string, now time.Time) {
+	if model == "" || now.IsZero() {
+		return
+	}
+	s.mu.Lock()
+	s.benchmarkAborts[model] = now
+	s.mutations++
+	s.mu.Unlock()
+}
+
+// recoveryLastRun reports when a provider-recovery benchmark last ran for model.
+// A timestamp ahead of the wall clock — a stats file written before the clock was
+// stepped back — is reported as zero rather than as a cooldown that outlives the
+// failure it belongs to.
+func (s *stats) recoveryLastRun(model string) time.Time {
+	if model == "" {
+		return time.Time{}
+	}
+	s.mu.RLock()
+	last := s.recoveryRuns[model]
+	s.mu.RUnlock()
+	if last.After(s.now()) {
+		return time.Time{}
+	}
+	return last
+}
+
+func (s *stats) markRecoveryRun(model string, now time.Time) {
+	if model == "" || now.IsZero() {
+		return
+	}
+	s.mu.Lock()
+	s.recoveryRuns[model] = now
 	s.mutations++
 	s.mu.Unlock()
 }

@@ -40,15 +40,20 @@ type proxy struct {
 	dailyReady     map[string]chan struct{}
 	dailyWG        sync.WaitGroup
 	dailyClosed    bool
-	recoveryLast   map[string]time.Time
 	recoveryWanted map[string]bool
 	// degradationMu guards the watchdog's cooldown and scan throttle, which the
 	// request path and the dashboard both touch.
 	degradationMu      sync.Mutex
 	degradationLast    map[string]time.Time
 	degradationChecked map[string]time.Time
-	rateLimitMu        sync.Mutex
-	rateLimitRuns      map[rateLimitKey]int
+	// degradationWanted carries the provider a degradation run must re-measure: set
+	// by the launcher, and also by a conviction that arrives while another run holds
+	// the model. The run drops that provider's pooled rounds before its pings and
+	// consumes the cooldown; a conviction it was too late to answer is dropped and
+	// re-derived by the next scan.
+	degradationWanted map[string]string
+	rateLimitMu       sync.Mutex
+	rateLimitRuns     map[rateLimitKey]int
 	// Test seams for the daily benchmark coordinator. Production uses
 	// testProvider and dailyBenchmarkGate when these are unset.
 	dailyTestProvider func(context.Context, string, string, int) (providerTestSample, error)
@@ -88,10 +93,10 @@ func newProxy(cfg config) (*proxy, error) {
 		routing:            routing,
 		registry:           newModelRegistry(&http.Client{Timeout: 20 * time.Second}, cfg.Upstream, cfg.openRouterKey(), cfg.Listen, registryTTL),
 		dailyReady:         make(map[string]chan struct{}),
-		recoveryLast:       make(map[string]time.Time),
 		recoveryWanted:     make(map[string]bool),
 		degradationLast:    make(map[string]time.Time),
 		degradationChecked: make(map[string]time.Time),
+		degradationWanted:  make(map[string]string),
 		rateLimitRuns:      make(map[rateLimitKey]int),
 		now:                time.Now,
 		client: &http.Client{Transport: &http.Transport{
@@ -350,7 +355,7 @@ func (p *proxy) forward(w http.ResponseWriter, incoming *http.Request) (requestR
 		// for that provider specifically, so the refusal is the answer to the
 		// question they asked; substituting a different provider would hide
 		// it. Only orr's own automatic choice may be reconsidered.
-		if _, manual := p.routing.pinInfo(record.Model); manual {
+		if p.routing.manualPin(record.Model) {
 			break
 		}
 		// The refusal is final for this provider but says nothing about the
@@ -486,17 +491,6 @@ const (
 	providerRecoveryCooldown = 30 * time.Second
 )
 
-// benchmarkKind says why an automatic run was started. It only decides which
-// cooldown the run consumes when it finishes, so a run that fails early cannot
-// be retried in an unbounded loop.
-type benchmarkKind int
-
-const (
-	benchmarkDaily benchmarkKind = iota
-	benchmarkRecovery
-	benchmarkDegradation
-)
-
 // benchmarkFreshness is how old a model's last measurement may be before a
 // request asks for another one. Measurement follows the models clients actually
 // use: a model nobody asked for is never measured, and the one that is asked for
@@ -505,12 +499,32 @@ const (
 // cannot hammer providers.
 const benchmarkFreshness = 5 * time.Minute
 
+// benchmarkRetryAfterAbort is how long a model waits after a run that could not
+// get a usable catalog, and so never reached the pings. It is deliberately short:
+// the cause is usually a catalog or configuration failure that clears quickly, and
+// the freshness window would hide the model from measurement for five minutes over
+// a one-minute outage. It also bounds the retries, so a failure cannot be relaunched
+// by every request.
+const benchmarkRetryAfterAbort = time.Minute
+
 // prepareDailyModel starts the catalog refresh and benchmark a request for model
 // asks for. Work is asynchronous with respect to user requests. The returned
 // channel is used by tests and closes when every provider has finished or the
 // gate has elapsed, whichever happens first; unfinished benchmark requests are
 // then canceled.
+//
+// A manually pinned model has no daily run at all. The order underneath a manual
+// pin decides nothing — orr is not choosing — so measuring the field would only
+// spend provider requests on a pin that cannot move. The catalog refresh this
+// run would carry is not lost by that: unpinning the model re-enters this path on
+// the next request and refreshes then.
 func (p *proxy) prepareDailyModel(model string) <-chan struct{} {
+	// An alias id resolves to a model but exposes no endpoint list of its own, so a
+	// run for it could never refresh or measure anything. Skipping it here keeps it
+	// from cycling a no-op run for as long as a client uses the alias.
+	if p.routing.manualPin(model) || isAliasModel(model) {
+		return nil
+	}
 	p.dailyMu.Lock()
 	if p.dailyClosed {
 		p.dailyMu.Unlock()
@@ -520,14 +534,32 @@ func (p *proxy) prepareDailyModel(model string) <-chan struct{} {
 		p.dailyMu.Unlock()
 		return ready
 	}
+	// The catalog keeps its own once-per-day schedule, independent of the benchmark
+	// freshness window; a request only waits on it when a run is due anyway.
 	refreshDone := p.routing.maybeRefreshModelOrder(model, p.client, p.cfg.Upstream, p.cfg.openRouterKey(), p.cfg.UpdateMaxProviders, p.cfg.UpdateCacheOnly)
-	benchmarkDue := strings.TrimSpace(p.cfg.OpenRouterAPIKey) != "" && !p.stats.benchmarkedWithin(model, p.now(), benchmarkFreshness)
-	if refreshDone == nil && benchmarkDue {
+	key := strings.TrimSpace(p.cfg.OpenRouterAPIKey) != ""
+	now := p.now()
+	measured := p.stats.benchmarkedWithin(model, now, benchmarkFreshness)
+	// A run that could not get a usable catalog is retried on its own short floor.
+	// Without it the next request would relaunch it, and with the freshness window
+	// instead of the floor a model would stay unmeasured for five minutes over a
+	// one-minute outage.
+	retrying := p.stats.benchmarkAbortedWithin(model, now, benchmarkRetryAfterAbort)
+	// Measurement follows the models clients actually use: a model measured inside
+	// the freshness window needs no new run. With a key, that window is the whole
+	// trigger. Without one there is nothing to ping, and only a refreshed catalog
+	// can move the provisional automatic pin, so a stale catalog is the trigger.
+	due := !measured && !retrying && (key || refreshDone != nil)
+	if !due {
+		p.dailyMu.Unlock()
+		return nil
+	}
+	if refreshDone == nil {
 		// The catalog and its endpoint metadata were already refreshed today,
 		// but that does not prove a benchmark ran. Refresh it again to hydrate
 		// this process's endpoint cache before pricing the measurements, while
 		// keeping the benchmark schedule independent from the catalog date.
-		refreshDone = p.routing.launchModelOrderRefresh(model, p.client, p.cfg.Upstream, p.cfg.openRouterKey(), p.cfg.UpdateMaxProviders, p.cfg.UpdateCacheOnly)
+		refreshDone = p.routing.launchModelOrderRefresh(model, p.client, p.cfg.Upstream, p.cfg.openRouterKey(), p.cfg.UpdateMaxProviders, p.cfg.UpdateCacheOnly, false)
 	}
 	if refreshDone == nil {
 		p.dailyMu.Unlock()
@@ -544,8 +576,15 @@ func (p *proxy) prepareDailyModel(model string) <-chan struct{} {
 
 // startProviderRecovery runs the same bounded catalog refresh and benchmark
 // used for automatic discovery, bypassing the once-per-day schedule. dailyReady
-// coalesces it with any other automatic run for this model, while recoveryLast
-// prevents repeated provider failures from starting billable benchmark storms.
+// coalesces it with any other automatic run for this model, while the recovery
+// cooldown prevents repeated provider failures from starting billable benchmark
+// storms. That cooldown lives in the stats file, so a restart does not hand the
+// same failure a fresh allowance.
+//
+// Recovery is deliberately not held back by the abort floor: a provider failure
+// is an active fault, and waiting a minute to look at it is the wrong trade. A
+// recovery run that measures nothing still arms the floor, so a storm of 429s
+// that leaves nothing to ping also keeps the daily and degradation paths quiet.
 func (p *proxy) startProviderRecovery(model string) <-chan struct{} {
 	p.dailyMu.Lock()
 	if p.dailyClosed {
@@ -557,11 +596,12 @@ func (p *proxy) startProviderRecovery(model string) <-chan struct{} {
 		p.dailyMu.Unlock()
 		return ready
 	}
-	if last := p.recoveryLast[model]; !last.IsZero() && p.now().Sub(last) < providerRecoveryCooldown {
+	now := p.now()
+	if last := p.stats.recoveryLastRun(model); !last.IsZero() && !last.After(now) && now.Sub(last) < providerRecoveryCooldown {
 		p.dailyMu.Unlock()
 		return nil
 	}
-	refreshDone := p.routing.launchModelOrderRefresh(model, p.client, p.cfg.Upstream, p.cfg.openRouterKey(), p.cfg.UpdateMaxProviders, p.cfg.UpdateCacheOnly)
+	refreshDone := p.routing.launchModelOrderRefresh(model, p.client, p.cfg.Upstream, p.cfg.openRouterKey(), p.cfg.UpdateMaxProviders, p.cfg.UpdateCacheOnly, false)
 	if refreshDone == nil {
 		p.dailyMu.Unlock()
 		return nil
@@ -571,35 +611,64 @@ func (p *proxy) startProviderRecovery(model string) <-chan struct{} {
 	p.dailyWG.Add(1)
 	p.dailyMu.Unlock()
 
-	go p.runAutomaticBenchmark(model, refreshDone, ready, benchmarkRecovery, p.dailyGate)
+	go p.runAutomaticBenchmark(model, refreshDone, ready, true, p.dailyGate)
 	return ready
 }
 
 // runDailyBenchmark is prepareDailyModel's scheduled run.
 func (p *proxy) runDailyBenchmark(model string, refreshDone <-chan struct{}, ready chan struct{}) {
-	p.runAutomaticBenchmark(model, refreshDone, ready, benchmarkDaily, p.dailyGate)
+	p.runAutomaticBenchmark(model, refreshDone, ready, false, p.dailyGate)
 }
 
 // runAutomaticBenchmark performs one bounded catalog refresh and provider
-// benchmark. kind decides which cooldown the finished run consumes: recovery
-// also honors a recovery that arrived while another kind was running, and a
-// degradation run always consumes its own cooldown so a provider that stays bad
-// is re-tested on a schedule rather than on every request.
-func (p *proxy) runAutomaticBenchmark(model string, refreshDone <-chan struct{}, ready chan struct{}, kind benchmarkKind, gate time.Duration) {
+// benchmark. recovery says the run was started by a provider failure, so it
+// consumes the recovery cooldown and also honors a recovery that arrived while it
+// was running. A degradation conviction is carried in degradationWanted instead.
+//
+// The run settles the schedule on the state of its catalog rather than on what it
+// managed to measure: with today's catalog in hand, the run has already paid for
+// its refresh, so the five-minute freshness window applies whatever the pings
+// returned. A run that could not get a usable catalog never reached the pings, is
+// cheap to attempt again, and takes the short retry floor instead — that is what
+// keeps a one-minute outage from hiding a model for five minutes, while still
+// bounding the retries. A conviction is answered by the run that cleared the
+// convicted provider's pooled rounds, and only that run consumes the cooldown.
+func (p *proxy) runAutomaticBenchmark(model string, refreshDone <-chan struct{}, ready chan struct{}, recovery bool, gate time.Duration) {
+	// catalogFresh records that the run started with today's catalog, which is what
+	// decides whether its cost was spent or it failed cheaply.
+	catalogFresh := false
+	// convicted is the provider this run was asked to re-measure. It is popped once,
+	// before the pings, because clearing the pool after the measurement would defeat
+	// the ranking the clear exists to fix.
+	var convicted string
 	defer func() {
+		now := p.now()
+		if catalogFresh {
+			p.stats.markBenchmarkRun(model, now)
+		} else {
+			p.stats.markBenchmarkAbort(model, now)
+		}
 		p.dailyMu.Lock()
 		delete(p.dailyReady, model)
 		wanted := p.recoveryWanted[model]
 		delete(p.recoveryWanted, model)
-		if kind == benchmarkRecovery || wanted {
-			p.recoveryLast[model] = p.now()
-		}
-		if kind == benchmarkDegradation {
-			p.degradationMu.Lock()
-			p.degradationLast[model] = p.now()
-			p.degradationMu.Unlock()
+		// A conviction that arrived after this run cleared its pool cannot be answered
+		// by it: the run measured while the stale rounds were still in place. Dropping
+		// it is safe — the watch re-convicts from unchanged vitals on its next scan,
+		// and that run clears the pool before its own pings.
+		delete(p.degradationWanted, model)
+		if recovery || wanted {
+			p.stats.markRecoveryRun(model, now)
 		}
 		p.dailyMu.Unlock()
+		if convicted != "" {
+			// The pooled rounds of the convicted provider are gone and this run has
+			// re-measured the field, so the state the cooldown is about was addressed —
+			// whether or not the provider itself answered.
+			p.degradationMu.Lock()
+			p.degradationLast[model] = now
+			p.degradationMu.Unlock()
+		}
 		p.dailyWG.Done()
 	}()
 	if gate <= 0 {
@@ -627,7 +696,8 @@ func (p *proxy) runAutomaticBenchmark(model string, refreshDone <-chan struct{},
 	}
 	deadline := time.Now().Add(gate)
 	cfg, revision, ok := p.routing.modelConfigAtRevision(model)
-	if !ok || cfg.UpdatedAt.Format(time.DateOnly) != p.now().Format(time.DateOnly) {
+	catalogFresh = ok && cfg.UpdatedAt.Format(time.DateOnly) == p.now().Format(time.DateOnly)
+	if !catalogFresh {
 		release()
 		return
 	}
@@ -648,6 +718,18 @@ func (p *proxy) runAutomaticBenchmark(model string, refreshDone <-chan struct{},
 		return
 	}
 
+	// A conviction this run was asked to answer is popped and acted on here, before
+	// any ping: the provider's pooled rounds are stale evidence by definition, and
+	// dropping them before the measurement is what keeps the run that answers the
+	// conviction from merging them back in.
+	p.dailyMu.Lock()
+	convicted = p.degradationWanted[model]
+	delete(p.degradationWanted, model)
+	p.dailyMu.Unlock()
+	if convicted != "" {
+		p.stats.clearBenchmarkSamples(model, convicted)
+	}
+
 	completed, reachedThreshold := p.benchmarkProviders(model, providers, deadline, true, len(providers))
 	if !reachedThreshold {
 		// The request deadline is strict: release it before the providers-file
@@ -655,7 +737,6 @@ func (p *proxy) runAutomaticBenchmark(model string, refreshDone <-chan struct{},
 		release()
 	}
 	p.applyProviderTestResults(model, completed, revision)
-	p.stats.markBenchmarkRun(model, p.now())
 	release()
 }
 
@@ -697,8 +778,7 @@ func (p *proxy) observeProviderFailure(record requestRecord) {
 // candidate instead of spending the client's remaining retries on it.
 func (p *proxy) rateLimitReplacement(model, provider string, force bool) (string, bool) {
 	key := rateLimitKey{model: model, provider: provider}
-	_, manual := p.routing.pinInfo(model)
-	if manual {
+	if p.routing.manualPin(model) {
 		p.rateLimitMu.Lock()
 		delete(p.rateLimitRuns, key)
 		p.rateLimitMu.Unlock()

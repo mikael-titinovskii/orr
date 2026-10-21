@@ -186,14 +186,15 @@ func (s *stats) lastProvider(model string) string {
 
 // degradationTarget resolves the provider the watch should judge: the automatic
 // pin when one exists, otherwise the provider last traffic actually reached.
-// A manual pin is an explicit instruction and is never second-guessed here, so
-// it has no target at all.
+// A manually pinned provider is an explicit instruction and is never
+// second-guessed here, so it has no target at all. The pin is read through the
+// same predicate the other gates use, so the watch and the failure-recovery path
+// cannot disagree about whether a model is pinned.
 func (p *proxy) degradationTarget(model string) string {
-	pinned, manual := p.routing.pinInfo(model)
-	if manual {
+	if p.routing.manualPin(model) {
 		return ""
 	}
-	if pinned != "" {
+	if pinned := p.routing.pinnedProvider(model); pinned != "" {
 		return pinned
 	}
 	return p.stats.lastProvider(model)
@@ -262,7 +263,13 @@ func (p *proxy) degradationCooldownRemaining(model string) time.Duration {
 	if last.IsZero() {
 		return 0
 	}
-	return p.cfg.DegradationCooldown - p.now().Sub(last)
+	now := p.now()
+	if last.After(now) {
+		// A latch ahead of the wall clock — a step back in time — is not a cooldown
+		// that outlives the failure it belongs to.
+		return 0
+	}
+	return p.cfg.DegradationCooldown - now.Sub(last)
 }
 
 // startDegradationBenchmark runs the same bounded refresh and benchmark as
@@ -282,18 +289,32 @@ func (p *proxy) startDegradationBenchmark(model, provider string) bool {
 		p.dailyMu.Unlock()
 		return false
 	}
-	if _, running := p.dailyReady[model]; running {
-		// A refresh is already measuring this model; its result is the answer.
-		p.dailyMu.Unlock()
-		return false
-	}
+	// The cooldown is checked first: a conviction that arrives while the watch is
+	// already waiting must not push the next attempt back, or a stream of
+	// convictions would keep it from ever acting.
 	if remaining := p.degradationCooldownRemaining(model); remaining > 0 {
 		p.dailyMu.Unlock()
 		return false
 	}
-	p.stats.clearBenchmarkSamples(model, provider)
-	refreshDone := p.routing.launchModelOrderRefresh(model, p.client, p.cfg.Upstream, p.cfg.openRouterKey(), p.cfg.UpdateMaxProviders, p.cfg.UpdateCacheOnly)
+	if _, running := p.dailyReady[model]; running {
+		// A refresh is already measuring this model, so its result is the answer and
+		// no second run starts. The conviction is handed to that run only if it has not
+		// cleared its pool yet — its own pre-ping pop decides that, and a conviction it
+		// cannot answer is re-derived from unchanged vitals on the next scan.
+		p.degradationWanted[model] = provider
+		p.dailyMu.Unlock()
+		return false
+	}
+	// The conviction is recorded before the launch so the run cannot reach its pop
+	// first and measure while the stale rounds are still in place.
+	p.degradationWanted[model] = provider
+	refreshDone := p.routing.launchModelOrderRefresh(model, p.client, p.cfg.Upstream, p.cfg.openRouterKey(), p.cfg.UpdateMaxProviders, p.cfg.UpdateCacheOnly, false)
 	if refreshDone == nil {
+		// The catalog refresh is backing off after a failure, so no run starts, no
+		// cooldown is consumed, and the provider keeps its samples: there would be
+		// nothing to repopulate them with. The next attempt past the backoff decides
+		// again.
+		delete(p.degradationWanted, model)
 		p.dailyMu.Unlock()
 		return false
 	}
@@ -302,6 +323,6 @@ func (p *proxy) startDegradationBenchmark(model, provider string) bool {
 	p.dailyWG.Add(1)
 	p.dailyMu.Unlock()
 
-	go p.runAutomaticBenchmark(model, refreshDone, ready, benchmarkDegradation, p.cfg.DegradationTimeout)
+	go p.runAutomaticBenchmark(model, refreshDone, ready, false, p.cfg.DegradationTimeout)
 	return true
 }

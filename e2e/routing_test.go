@@ -138,7 +138,11 @@ models:
 	}
 }
 
-func TestRoutingDailyBenchmarkCannotReplaceManualPin(t *testing.T) {
+// A manual pin is an explicit instruction, so a request for that model never
+// spends provider benchmark pings: the daily run exists to choose a provider, and
+// the user already chose one. The pin is not merely protected from being moved;
+// the checkup itself does not happen.
+func TestRoutingManualPinSkipsProviderBenchmarks(t *testing.T) {
 	providers := `version: 1
 models:
   author/model:
@@ -146,7 +150,9 @@ models:
     manual_pin: manual
     updated_at: 2000-01-01T00:00:00Z
 `
-	liveRequest := make(chan routedRequest, 1)
+	liveRequest := make(chan routedRequest, 2)
+	var benchmarkRequests int
+	var mu sync.Mutex
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			writeRankedEndpointCatalog(w)
@@ -158,12 +164,10 @@ models:
 			return
 		}
 		if _, benchmark := body["max_tokens"]; benchmark {
-			routing := routingFromBody(body)
-			provider := routing.Only[0]
-			if provider == "manual" {
-				time.Sleep(60 * time.Millisecond)
-			}
-			writeCompletion(w, provider)
+			mu.Lock()
+			benchmarkRequests++
+			mu.Unlock()
+			writeCompletion(w, routingFromBody(body).Only[0])
 			return
 		}
 		liveRequest <- routingFromBody(body)
@@ -176,12 +180,27 @@ models:
 	})
 	postCompletion(t, orr.baseURL, "manual pin precedence")
 	assertStrictPin(t, <-liveRequest, "manual")
+
+	// A benchmark run is asynchronous. Give one the chance to reach the upstream
+	// before asserting it was never started, and drive a second request so a run
+	// keyed on the freshness window would have had its trigger.
+	time.Sleep(250 * time.Millisecond)
+	postCompletion(t, orr.baseURL, "manual pin precedence again")
+	assertStrictPin(t, <-liveRequest, "manual")
+	time.Sleep(250 * time.Millisecond)
+
+	mu.Lock()
+	gotBenchmarkRequests := benchmarkRequests
+	mu.Unlock()
+	if gotBenchmarkRequests != 0 {
+		t.Fatalf("benchmark requests = %d, want none for a manually pinned model", gotBenchmarkRequests)
+	}
 	persisted, err := os.ReadFile(orr.providersPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(persisted), "manual_pin: manual") {
-		t.Fatalf("daily benchmark removed manual pin:\n%s", persisted)
+		t.Fatalf("provider checkup removed manual pin:\n%s", persisted)
 	}
 }
 

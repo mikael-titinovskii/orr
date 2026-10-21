@@ -17,6 +17,11 @@ import (
 
 const openRouterAPI = "https://openrouter.ai/api/v1"
 
+// OpenRouter alias ids (~author/family-latest) resolve to a model but expose no endpoint list of their own.
+func isAliasModel(model string) bool {
+	return strings.HasPrefix(model, "~")
+}
+
 // decimal unmarshals JSON numbers that may be encoded as strings (e.g.
 // OpenRouter pricing fields such as "0.00000066"). JSON null is treated as
 // zero, matching a missing pricing field.
@@ -104,6 +109,9 @@ func runProvidersWithOptions(envPath string, preferEnvFile bool, rawModel string
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return fmt.Errorf("model must use the OpenRouter author/model format")
 	}
+	if isAliasModel(model) {
+		return fmt.Errorf("%s is an alias model and exposes no endpoint list; use the concrete model id", model)
+	}
 
 	fileEnv, err := readDotEnv(envPath)
 	if err != nil {
@@ -174,6 +182,15 @@ func compatibleEndpoints(endpoints []modelEndpoint) []modelEndpoint {
 		}
 	}
 	return rankEndpoints(compatible, false)
+}
+
+func supportsTools(endpoints []modelEndpoint) bool {
+	for _, endpoint := range endpoints {
+		if supports(endpoint, "tools") && supports(endpoint, "tool_choice") {
+			return true
+		}
+	}
+	return false
 }
 
 // rankEndpoints orders endpoints by throughput, cache-read price, and latency.
