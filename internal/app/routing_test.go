@@ -7,13 +7,10 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
 // pingSample builds a provider benchmark outcome the way a real
@@ -60,12 +57,10 @@ func TestAutoPinnedProviderExpiresAfterTTL(t *testing.T) {
 func TestManualPinSurvivesAutomaticChangesErrorsBlocksTimeAndRestart(t *testing.T) {
 	const model = "author/model"
 	now := time.Date(2026, time.September, 3, 23, 55, 0, 0, time.Local)
-	path := filepath.Join(t.TempDir(), "providers.yaml")
-	routing := newRoutingState(map[string]providerConfig{model: {
+	routing, db := testRoutingWithStore(t, map[string]providerConfig{model: {
 		Order: []string{"manual", "measured", "fallback"},
-	}}, time.Hour)
+	}})
 	routing.now = func() time.Time { return now }
-	routing.setProvidersPath(path)
 	routing.endpointCache[model] = []endpointMeta{
 		{Tag: "manual", Pricing: testPricing(1, 4, .1)},
 		{Tag: "measured", Pricing: testPricing(.5, 2, .05)},
@@ -99,15 +94,11 @@ func TestManualPinSurvivesAutomaticChangesErrorsBlocksTimeAndRestart(t *testing.
 		t.Fatalf("pin after TTL/day change = %q manual=%v", provider, manual)
 	}
 
-	data, err := os.ReadFile(path)
+	saved, err := db.Models()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var saved providersFile
-	if err := yaml.Unmarshal(data, &saved); err != nil {
-		t.Fatal(err)
-	}
-	restarted := newRoutingState(saved.Models, time.Hour)
+	restarted := newRoutingState(saved, time.Hour)
 	restarted.now = func() time.Time { return now }
 	if provider, manual := restarted.pinInfo(model); provider != "manual" || !manual {
 		t.Fatalf("restarted pin = %q manual=%v, want unchanged manual pin", provider, manual)
@@ -392,9 +383,7 @@ func TestRefreshModelOrderDoesNotOverwriteNewerManualUpdate(t *testing.T) {
 	}))
 	defer server.Close()
 
-	path := filepath.Join(t.TempDir(), "providers.yaml")
-	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"manual-order"}}}, time.Hour)
-	routing.setProvidersPath(path)
+	routing, db := testRoutingWithStore(t, map[string]providerConfig{model: {Order: []string{"manual-order"}}})
 	client := &http.Client{Timeout: 5 * time.Second}
 	done := make(chan struct{})
 	go func() {
@@ -412,37 +401,27 @@ func TestRefreshModelOrderDoesNotOverwriteNewerManualUpdate(t *testing.T) {
 	if len(cfg.Order) != 1 || cfg.Order[0] != "manual-order" {
 		t.Fatalf("stale refresh overwrote manual order: %#v", cfg.Order)
 	}
-	data, err := os.ReadFile(path)
+	saved, err := db.Models()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var saved providersFile
-	if err := yaml.Unmarshal(data, &saved); err != nil {
-		t.Fatal(err)
-	}
-	if got := saved.Models[model].Order; len(got) != 1 || got[0] != "manual-order" {
+	if got := saved[model].Order; len(got) != 1 || got[0] != "manual-order" {
 		t.Fatalf("stale refresh overwrote persisted order: %#v", got)
 	}
 }
 
-func TestManualPinRoundTripsThroughProvidersFile(t *testing.T) {
+func TestManualPinRoundTripsThroughStore(t *testing.T) {
 	const model = "a/b"
-	path := filepath.Join(t.TempDir(), "providers.yaml")
-	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"fireworks", "together"}}}, time.Hour)
-	routing.setProvidersPath(path)
+	routing, db := testRoutingWithStore(t, map[string]providerConfig{model: {Order: []string{"fireworks", "together"}}})
 	if err := routing.setManualPin(model, "together"); err != nil {
 		t.Fatal(err)
 	}
 
-	data, err := os.ReadFile(path)
+	saved, err := db.Models()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var saved providersFile
-	if err := yaml.Unmarshal(data, &saved); err != nil {
-		t.Fatal(err)
-	}
-	restarted := newRoutingState(saved.Models, time.Hour)
+	restarted := newRoutingState(saved, time.Hour)
 	if provider, manual := restarted.pinInfo(model); provider != "together" || !manual {
 		t.Fatalf("restored manual pin = %q manual=%v", provider, manual)
 	}
@@ -456,17 +435,19 @@ func TestManualPinRoundTripsThroughProvidersFile(t *testing.T) {
 
 func TestManualPinRejectsUnresolvedProvider(t *testing.T) {
 	const model = "a/b"
-	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"fireworks"}}}, time.Hour)
-	path := filepath.Join(t.TempDir(), "providers.yaml")
-	routing.setProvidersPath(path)
+	routing, db := testRoutingWithStore(t, map[string]providerConfig{model: {Order: []string{"fireworks"}}})
 	if err := routing.setManualPin(model, "Unknown Provider"); err == nil {
 		t.Fatal("unresolved provider accepted")
 	}
 	if got := routing.pinnedProvider(model); got != "" {
 		t.Fatalf("unresolved provider was pinned: %q", got)
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("provider file changed after rejected pin: %v", err)
+	saved, err := db.Models()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, persisted := saved[model]; persisted {
+		t.Fatalf("rejected pin persisted a model row: %#v", saved)
 	}
 }
 
@@ -610,9 +591,7 @@ func TestRefreshModelOrderPopulatesOrderAndCache(t *testing.T) {
 	}))
 	defer server.Close()
 
-	path := filepath.Join(t.TempDir(), "providers.yaml")
-	routing := newRoutingState(map[string]providerConfig{model: {}}, time.Hour)
-	routing.setProvidersPath(path)
+	routing, db := testRoutingWithStore(t, map[string]providerConfig{model: {}})
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	routing.refreshModelOrder(model, client, server.URL, "", 20, false)
@@ -629,18 +608,14 @@ func TestRefreshModelOrderPopulatesOrderAndCache(t *testing.T) {
 		t.Fatalf("expected 3 cached endpoints, got %d", len(endpoints))
 	}
 
-	data, err := os.ReadFile(path)
+	saved, err := db.Models()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var saved providersFile
-	if err := yaml.Unmarshal(data, &saved); err != nil {
-		t.Fatal(err)
-	}
-	if got := saved.Models[model].Order; len(got) != 2 || got[0] != "fast" || got[1] != "slow" {
+	if got := saved[model].Order; len(got) != 2 || got[0] != "fast" || got[1] != "slow" {
 		t.Fatalf("order not persisted: %#v", got)
 	}
-	if saved.Models[model].UpdatedAt.IsZero() {
+	if saved[model].UpdatedAt.IsZero() {
 		t.Fatal("updated_at was not persisted")
 	}
 }
@@ -657,9 +632,7 @@ func TestRefreshModelOrderPreservesManualPin(t *testing.T) {
 	}))
 	defer server.Close()
 
-	path := filepath.Join(t.TempDir(), "providers.yaml")
 	routing := newRoutingState(map[string]providerConfig{model: {ManualPin: "pinned"}}, time.Hour)
-	routing.setProvidersPath(path)
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	routing.refreshModelOrder(model, client, server.URL, "", 20, false)
@@ -1042,9 +1015,10 @@ func TestManualPinPersistenceFailureLeavesPreviousPinAuthoritative(t *testing.T)
 		Order:     []string{"original", "replacement"},
 		ManualPin: "original",
 	}}, time.Hour)
-	// Atomic replacement cannot replace a directory with the providers file.
 	// The failed write must not commit a different in-memory instruction.
-	routing.setProvidersPath(t.TempDir())
+	routing.setPersistModels(func(map[string]providerConfig) error {
+		return fmt.Errorf("database unavailable")
+	})
 	if err := routing.setManualPin(model, "replacement"); err == nil {
 		t.Fatal("manual pin update unexpectedly survived a persistence failure")
 	}
@@ -1115,12 +1089,10 @@ func TestSelectionDropsAPinnedProviderThatStopsBeingViable(t *testing.T) {
 
 func TestSelectionPersistsOrderAndRefreshesAutoPin(t *testing.T) {
 	const model = "author/model"
-	path := filepath.Join(t.TempDir(), "providers.yaml")
-	routing := newRoutingState(map[string]providerConfig{model: {
+	routing, db := testRoutingWithStore(t, map[string]providerConfig{model: {
 		Order:     []string{"old", "expensive", "best-deal"},
 		UpdatedAt: time.Now(),
-	}}, time.Hour)
-	routing.setProvidersPath(path)
+	}})
 	routing.endpointCache[model] = []endpointMeta{
 		{Tag: "expensive", Pricing: testPricing(2.00, 8.00, 0.20)},
 		{Tag: "best-deal", Pricing: testPricing(1.00, 4.00, 0.10)},
@@ -1148,15 +1120,11 @@ func TestSelectionPersistsOrderAndRefreshesAutoPin(t *testing.T) {
 		t.Fatalf("pin = %q manual=%v, want refreshed auto pin", provider, manual)
 	}
 
-	data, err := os.ReadFile(path)
+	saved, err := db.Models()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var saved providersFile
-	if err := yaml.Unmarshal(data, &saved); err != nil {
-		t.Fatal(err)
-	}
-	if got := saved.Models[model].Order; !equalSlices(got, want) {
+	if got := saved[model].Order; !equalSlices(got, want) {
 		t.Fatalf("persisted benchmark order = %v, want %v", got, want)
 	}
 }
@@ -1622,12 +1590,12 @@ func TestBenchmarkPoolSurvivesSaveAndLoad(t *testing.T) {
 		Duration: 800 * time.Millisecond, TTFT: 9 * time.Second, CompletionTokens: 64, Benchmark: true,
 	})
 
-	path := filepath.Join(t.TempDir(), "stats.json")
-	if err := s.save(path); err != nil {
+	db := openTestStore(t)
+	if err := s.save(db); err != nil {
 		t.Fatal(err)
 	}
 	restored := newStats()
-	if err := restored.load(path); err != nil {
+	if err := restored.load(db); err != nil {
 		t.Fatal(err)
 	}
 	pool := restored.benchmarkPool(model)
@@ -1971,18 +1939,18 @@ func TestRerankAutomaticPinFollowsTimeWeight(t *testing.T) {
 	const model = "author/model"
 	now := time.Date(2026, time.September, 30, 12, 0, 0, 0, time.UTC)
 	configured := map[string]providerConfig{model: {Order: []string{"cheap", "mid", "fast"}}}
-	path := filepath.Join(t.TempDir(), "providers.yaml")
-	if err := writeProvidersFileAtomic(path, configured); err != nil {
+	db := openTestStore(t)
+	if err := db.SaveModels(configured); err != nil {
 		t.Fatal(err)
 	}
-	before, err := os.ReadFile(path)
+	before, err := db.Models()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	routing := newRoutingState(configured, time.Hour)
 	routing.now = func() time.Time { return now }
-	routing.setProvidersPath(path)
+	routing.setPersistModels(db.SaveModels)
 	routing.endpointCache[model] = []endpointMeta{
 		{Tag: "cheap", Pricing: testPricing(0.4, 1.6, 0.04)},
 		{Tag: "mid", Pricing: testPricing(0.8, 3.2, 0.08)},
@@ -2019,12 +1987,12 @@ func TestRerankAutomaticPinFollowsTimeWeight(t *testing.T) {
 		}
 	}
 
-	after, err := os.ReadFile(path)
+	after, err := db.Models()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(before) != string(after) {
-		t.Fatalf("a slider move rewrote the provider order:\n%s", after)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("a slider move rewrote the provider order:\n%#v", after)
 	}
 	if got := routing.modelRevision(model); got != revision {
 		t.Fatalf("a slider move advanced the model revision from %d to %d", revision, got)
@@ -2162,7 +2130,6 @@ func TestEndpointRefreshBacksOffAfterFailure(t *testing.T) {
 func TestAutomaticCatalogRefreshBacksOffAfterFailure(t *testing.T) {
 	const model = "author/model"
 	routing := newRoutingState(map[string]providerConfig{model: {}}, time.Hour)
-	routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	now := time.Date(2026, time.October, 17, 12, 0, 0, 0, time.Local)
 	routing.now = func() time.Time { return now }
 	var fetches atomic.Int32
@@ -2212,7 +2179,6 @@ func TestAutomaticCatalogRefreshBacksOffAfterFailure(t *testing.T) {
 func TestForceRefreshModelOrderBypassesTheFailureBackoff(t *testing.T) {
 	const model = "author/model"
 	routing := newRoutingState(map[string]providerConfig{model: {}}, time.Hour)
-	routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	now := time.Date(2026, time.October, 17, 12, 0, 0, 0, time.Local)
 	routing.now = func() time.Time { return now }
 	var fetches atomic.Int32
@@ -2261,7 +2227,7 @@ func TestAliasModelsNeverFetchProviderEndpoints(t *testing.T) {
 
 // An alias id (~author/family-latest) resolves to a model but has no endpoint
 // list of its own, so the request every refresh would make can never succeed.
-// The order refresh and orr update already skip it; the per-request endpoint
+// The order refresh already skips it; the per-request endpoint
 // cache refresh must too, and must not arm a retry that would keep asking.
 func TestAliasModelSkipsEndpointRefresh(t *testing.T) {
 	const model = "~author/family-latest"
@@ -2295,7 +2261,6 @@ func TestAliasModelSkipsEndpointRefresh(t *testing.T) {
 func TestSuccessfulCatalogRefreshClearsTheFailureFloor(t *testing.T) {
 	const model = "author/model"
 	routing := newRoutingState(map[string]providerConfig{model: {}}, time.Hour)
-	routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	now := time.Date(2026, time.October, 17, 12, 0, 0, 0, time.Local)
 	routing.now = func() time.Time { return now }
 	failing := true

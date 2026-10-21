@@ -1,7 +1,8 @@
 # orr
 
 `orr` is a local OpenRouter proxy. It keeps the model selected by your client
-and applies provider preferences from `providers.yaml` to generation requests.
+and applies the provider preferences stored in its database to generation
+requests.
 
 It gives you provider routing, manual pins, live performance and spend data, and
 a terminal dashboard without recording prompts or API keys.
@@ -48,8 +49,9 @@ http://127.0.0.1:8787/v1
 
 ## Configure routing
 
-Keep secrets and runtime options in `.env`; keep provider order and manual pins
-in `providers.yaml`. Both are ignored by Git.
+Keep secrets and runtime options in `.env`, which is ignored by Git. Provider
+order, manual pins, and measurement history live in one SQLite database that
+`orr` creates and migrates itself.
 
 ```dotenv
 # .env
@@ -58,21 +60,22 @@ ORR_LISTEN=127.0.0.1:8787
 ORR_TUI=true
 ```
 
-```yaml
-# providers.yaml
-version: 1
-models:
-  moonshotai/kimi-k3:
-    order:
-      - fireworks
-      - deepinfra
-    allow_fallbacks: false
-```
+The database is `orr.db` in the platform data directory
+(`%LocalAppData%\orr` on Windows, `$XDG_DATA_HOME/orr` or
+`~/.local/share/orr` elsewhere). Point `ORR_DB_FILE` at another path to keep
+several installations apart. A relative value resolves against the dotenv
+file's directory.
 
-The model key is its exact OpenRouter ID. Providers are tried in order.
-`allow_fallbacks: false` prevents OpenRouter from using providers outside this
-list. `orr` creates an empty entry for a new model and refreshes compatible
-providers automatically.
+Routing rows are written by the dashboard, the management API, and background
+refreshes; the database is not meant to be edited by hand. `orr` creates an
+empty entry for a new model and refreshes its compatible providers
+automatically, and it imports a `stats.json` left by an older version once, then
+renames it to `stats.json.imported`. `providers.yaml` from an older version is
+not migrated; delete it.
+
+Run one `orr serve` per database. Two processes on the same file serialise on
+SQLite's write lock, and the second one's startup can fail while the first holds
+it; give each its own `ORR_DB_FILE` instead.
 
 Keep `ORR_LISTEN` on `127.0.0.1` unless you deliberately want network access.
 
@@ -83,9 +86,7 @@ Keep `ORR_LISTEN` on `127.0.0.1` unless you deliberately want network access.
 | `orr serve` | Start the local proxy and dashboard. |
 | `orr serve --no-tui` | Start the proxy and management API with plain logs. |
 | `orr providers <model>` | List compatible OpenRouter providers for a concrete model id. |
-| `orr update` | Refresh provider orders for every known model. Alias models and models without a tool-capable endpoint are skipped. |
-| `orr update --cache-only` | Keep only providers with prompt caching. |
-| `orr reset` | Remove generated provider and stats state; preserves `.env`. |
+| `orr reset` | Remove the database; preserves `.env`. |
 | `orr upgrade` | Pull or download the latest source and rebuild the running binary with Go, or Docker when no usable Go toolchain is installed. |
 | `orr completion <shell>` | Print completion setup for bash, zsh, fish, or PowerShell. |
 
@@ -97,7 +98,7 @@ Use a different dotenv file when needed:
 
 ```sh
 orr serve --env ./local.env
-orr update --max 3 --env ./local.env
+orr providers moonshotai/kimi-k3 --env ./local.env
 ```
 
 Process environment variables override values from the dotenv file by default.
@@ -106,7 +107,7 @@ defines:
 
 ```sh
 orr serve --prefer-env-file
-orr update --env ./local.env --prefer-env-file
+orr providers moonshotai/kimi-k3 --env ./local.env --prefer-env-file
 ```
 
 ## Management API
@@ -120,7 +121,7 @@ upstream requests. Poll the job URL returned in the `Location` header.
 
 See the [REST API specification](docs/rest-api.md) for endpoints, JSON fields,
 examples, limits, and errors. Management changes share the dashboard's live
-routing state and persist manual pins to `providers.yaml`.
+routing state and persist manual pins to the database.
 
 The management API is accessible to anyone who can reach `ORR_LISTEN`, so keep
 the default loopback address for local use.
@@ -156,8 +157,8 @@ The useful controls are:
 | `s` | Start or stop the spend stopwatch. |
 | `q` / `Ctrl+C` | Stop the proxy cleanly. |
 
-`o` reorders the rows on screen only: the routing order, the pin, and
-`providers.yaml` stay as they are, so requests keep following the same route.
+`o` reorders the rows on screen only: the routing order, the pin, and the
+stored provider order stay as they are, so requests keep following the same route.
 The `Order` field in the routing pane names the active column, the column's own
 name is highlighted in the table, and each press of `o` moves to the next column
 before returning to `Default`. Prices sort cheapest first, `Tp`/`mTp`, `GPQA`, and
@@ -169,8 +170,8 @@ every provider that reports one.
 already knows and, once the OpenRouter catalog arrives, every model the catalog
 publishes, matched by id or display name; ↑/↓ moves the cursor and `Enter` opens
 the highlighted model. The model joins the tab list even if nothing has
-requested it yet, and its `providers.yaml` entry is created so its compatible
-providers can be listed and pinned. `x` closes the displayed tab and moves to
+requested it yet, and its routing entry is created in the database so its
+compatible providers can be listed and pinned. `x` closes the displayed tab and moves to
 the next one; a request that completes for the closed model afterwards brings it
 back, so closing a tab whose traffic is still in flight is temporary.
 
@@ -229,8 +230,8 @@ for how the benchmarks and tool-call errors are measured.
 Manual pins stay until removed. Automatic pins select the best measured
 provider, expire after `ORR_PIN_TTL` (one hour by default), and can fail over
 after provider-specific 429s or an unavailable endpoint. The recovery benchmark a
-failure starts is held to a 30-second cooldown per model, saved in the platform
-stats file, so a restart does not hand the same failing provider a fresh run.
+failure starts is held to a 30-second cooldown per model, saved in the database,
+so a restart does not hand the same failing provider a fresh run.
 
 Measurement follows the models clients ask for. A request for a model whose last
 measurement is more than five minutes old starts one catalog refresh and one
@@ -273,10 +274,10 @@ Every keypress re-picks the automatic pin from the measurements already held, so
 the pane answers immediately instead of waiting for the next benchmark. The
 decision rules are the benchmark's, including the 5% switch threshold, so a move
 cannot hand the pin to a provider a benchmark run would have refused at that
-weight. The provider order in `providers.yaml` is left alone — only the pin moves — and
-catches up on the next benchmark run. The chosen stop is saved in the platform
-stats file, so it survives a restart. A manual pin remains authoritative and is
-never overridden by the control.
+weight. The provider order in the database is left alone — only the pin moves — and
+catches up on the next benchmark run. The chosen stop is saved alongside the rest
+of the routing state, so it survives a restart. A manual pin remains authoritative
+and is never overridden by the control.
 
 ### Degradation recovery
 
@@ -321,7 +322,7 @@ Press `d` to turn degradation recovery on or off; the Routing pane shows the
 switch under the speed/price control, with its threshold and window while it is
 on. `ORR_DEGRADATION` seeds the state on every start until you press `d`; from
 then on the saved switch wins, the same rule the speed/price stop follows. Until
-it has been toggled it is not written to the stats file at all, so the variable
+it has been toggled it is not written to the database at all, so the variable
 keeps working on installs that never press the key. On a fresh state degradation
 recovery starts on.
 
@@ -464,8 +465,8 @@ unusably slow choices, and keeps a small margin to prevent pin churn. Manual
 pins always win.
 
 Benchmarks make real, billable OpenRouter requests. The dashboard stores stats,
-automatic pins, and benchmark results outside the repository; `orr reset`
-removes that generated state.
+automatic pins, and benchmark results in the database outside the repository;
+`orr reset` removes it.
 
 ## Development
 

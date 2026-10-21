@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -22,18 +23,34 @@ func runResetWithOptions(envPath string, preferEnvFile bool, output io.Writer) e
 	if err != nil {
 		return err
 	}
-	providersPath := configuredProvidersPathWithOptions(envPath, fileEnv, preferEnvFile)
-	statsPath, err := statsFilePath()
+	dbPath, err := configuredDBPathWithOptions(envPath, fileEnv, preferEnvFile)
 	if err != nil {
-		return fmt.Errorf("locate statistics file: %w", err)
+		return fmt.Errorf("locate database: %w", err)
 	}
 
+	// SQLite keeps these beside the database while it is open; removing the
+	// database alone would leave a WAL that a later start could replay. The
+	// legacy stats files go too, but only when this installation owns them: they
+	// live in the platform data directory, and a relocated database never
+	// imports them, so they belong to the installation whose database is there.
 	targets := []resetTarget{
-		{label: "providers", path: providersPath},
-		{label: "statistics", path: statsPath},
+		{label: "database", path: dbPath},
+		{label: "database write-ahead log", path: dbPath + "-wal"},
+		{label: "database shared-memory file", path: dbPath + "-shm"},
 	}
-	// ORR_PROVIDERS_FILE is user-configurable. Refuse any path collision that
-	// would violate reset's promise to preserve the dotenv file.
+	if legacy, ok := legacyStatsPath(dbPath); ok {
+		targets = append(targets,
+			resetTarget{label: "legacy statistics file", path: legacy},
+			resetTarget{label: "imported legacy statistics file", path: legacy + ".imported"},
+		)
+	} else if platform, ok := platformLegacyStats(); ok {
+		if _, err := os.Stat(platform); err == nil {
+			log.Printf("left %s in place: it belongs to the installation whose database is in %s",
+				platform, filepath.Dir(platform))
+		}
+	}
+	// ORR_DB_FILE is user-configurable. Refuse any path collision that would
+	// violate reset's promise to preserve the dotenv file.
 	for _, target := range targets {
 		same, err := sameFilePath(target.path, envPath)
 		if err != nil {
@@ -43,8 +60,8 @@ func runResetWithOptions(envPath string, preferEnvFile bool, output io.Writer) e
 			return fmt.Errorf("%s path points to the dotenv file; refusing to delete it", target.label)
 		}
 	}
-	// Validate every target before deleting either one so an invalid directory
-	// target cannot leave a half-reset installation.
+	// Validate every target before deleting any of them so an invalid target
+	// cannot leave a half-reset installation.
 	for _, target := range targets {
 		if err := validateResetTarget(target); err != nil {
 			return err
@@ -52,13 +69,12 @@ func runResetWithOptions(envPath string, preferEnvFile bool, output io.Writer) e
 	}
 	for _, target := range targets {
 		if err := os.Remove(target.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove %s file %s: %w", target.label, target.path, err)
+			return fmt.Errorf("remove %s %s: %w", target.label, target.path, err)
 		}
 	}
 
 	fmt.Fprintln(output, "Reset complete. If 'orr serve' was running, stop it and run reset again.")
-	fmt.Fprintf(output, "  removed providers: %s\n", providersPath)
-	fmt.Fprintf(output, "  removed statistics: %s\n", statsPath)
+	fmt.Fprintf(output, "  removed database: %s\n", dbPath)
 	fmt.Fprintf(output, "  preserved dotenv: %s\n", filepath.Clean(envPath))
 	return nil
 }
@@ -74,7 +90,7 @@ func validateResetTarget(target resetTarget) error {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("inspect %s file %s: %w", target.label, target.path, err)
+		return fmt.Errorf("inspect %s %s: %w", target.label, target.path, err)
 	}
 	if info.IsDir() {
 		return fmt.Errorf("%s path is a directory, refusing to remove it: %s", target.label, target.path)

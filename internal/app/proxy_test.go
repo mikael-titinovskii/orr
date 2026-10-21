@@ -8,8 +8,6 @@ import (
 	"math"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,7 +15,6 @@ import (
 	"time"
 
 	"github.com/charmbracelet/x/ansi"
-	"gopkg.in/yaml.v3"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -265,9 +262,7 @@ func TestUnconfiguredModelPreservesProviderAndInjectsUsage(t *testing.T) {
 
 func TestUnknownModelIsPersistedWithoutChangingFirstRequest(t *testing.T) {
 	models := map[string]providerConfig{"known/model": {Order: []string{"fireworks"}}}
-	routing := newRoutingState(models, time.Hour)
-	providersPath := filepath.Join(t.TempDir(), "providers.yaml")
-	routing.setProvidersPath(providersPath)
+	routing, db := testRoutingWithStore(t, models)
 	original := `{"model":"new/model","provider":{"order":["client-choice"]}}`
 	body, _, _, _, _, _, _, err := prepareRequest(strings.NewReader(original), routing, "/v1/chat/completions")
 	if err != nil {
@@ -281,12 +276,12 @@ func TestUnknownModelIsPersistedWithoutChangingFirstRequest(t *testing.T) {
 	if provider["order"].([]any)[0] != "client-choice" {
 		t.Fatalf("first request provider changed: %s", body)
 	}
-	data, err := os.ReadFile(providersPath)
+	saved, err := db.Models()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "new/model:") {
-		t.Fatalf("unknown model was not persisted:\n%s", data)
+	if _, ok := saved["new/model"]; !ok {
+		t.Fatalf("unknown model was not persisted: %#v", saved)
 	}
 }
 
@@ -1146,8 +1141,8 @@ func TestProviderRecoveryCooldownSurvivesRestart(t *testing.T) {
 	if p.stats.recoveryLastRun(model).IsZero() {
 		t.Fatal("recovery run did not consume its cooldown")
 	}
-	statsPath := filepath.Join(t.TempDir(), "stats.json")
-	if err := p.stats.save(statsPath); err != nil {
+	db := openTestStore(t)
+	if err := p.stats.save(db); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1155,7 +1150,7 @@ func TestProviderRecoveryCooldownSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := restarted.stats.load(statsPath); err != nil {
+	if err := restarted.stats.load(db); err != nil {
 		t.Fatal(err)
 	}
 	if again := restarted.startProviderRecovery(model); again != nil {
@@ -1179,7 +1174,6 @@ func TestConfiguredConsecutive429sFailOverAndRunFastRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	// Keep the ordinary daily scheduler out of this test: the 429 threshold,
 	// not a due daily run, must be what launches discovery.
 	p.stats.markBenchmarkRun(model, time.Now())
@@ -1309,7 +1303,6 @@ func TestUnavailableAutomaticProviderFailsOverImmediatelyAndRecovers(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	p.stats.markBenchmarkRun(model, time.Now())
 
 	var mu sync.Mutex
@@ -2021,12 +2014,12 @@ func TestDailyBenchmarkTimeoutPersistsCompletedPartialResults(t *testing.T) {
 		Order:     []string{"slow-one", "winner", "slow-two"},
 		UpdatedAt: time.Now(),
 	}}
+	db := openTestStore(t)
+	cfg.db = db
 	p, err := newProxy(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(t.TempDir(), "providers.yaml")
-	p.routing.setProvidersPath(path)
 	p.routing.endpointCache[model] = []endpointMeta{{Tag: "winner", Pricing: testPricing(1, 4, .1)}}
 	p.dailyGate = 30 * time.Millisecond
 	p.dailyTestProvider = func(ctx context.Context, _, provider string, _ int) (providerTestSample, error) {
@@ -2060,15 +2053,11 @@ func TestDailyBenchmarkTimeoutPersistsCompletedPartialResults(t *testing.T) {
 	if len(updated.Order) == 0 || updated.Order[0] != "winner" {
 		t.Fatalf("partial order = %v, want completed winner first", updated.Order)
 	}
-	data, err := os.ReadFile(path)
+	saved, err := db.Models()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var saved providersFile
-	if err := yaml.Unmarshal(data, &saved); err != nil {
-		t.Fatal(err)
-	}
-	if order := saved.Models[model].Order; len(order) == 0 || order[0] != "winner" {
+	if order := saved[model].Order; len(order) == 0 || order[0] != "winner" {
 		t.Fatalf("persisted partial order = %v", order)
 	}
 	if provider, manual := p.routing.pinInfo(model); provider != "winner" || manual {
@@ -2590,7 +2579,6 @@ func TestUnpinningRestoresAutomaticMeasurement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Method == http.MethodGet {
 			catalog := endpointList{}

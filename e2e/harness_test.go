@@ -15,6 +15,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/mikael-titinovskii/orr/internal/store"
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -73,14 +76,14 @@ func removeAllWithRetry(dir string, attempts int, delay time.Duration) error {
 
 // server is a real orr subprocess with an isolated config and user directory.
 type server struct {
-	baseURL       string
-	providersPath string
-	tempDir       string
-	cancel        context.CancelFunc
-	exited        chan struct{}
-	waitErr       error
-	stopOnce      sync.Once
-	output        *lockedBuffer
+	baseURL  string
+	dbPath   string
+	tempDir  string
+	cancel   context.CancelFunc
+	exited   chan struct{}
+	waitErr  error
+	stopOnce sync.Once
+	output   *lockedBuffer
 }
 
 type lockedBuffer struct {
@@ -129,19 +132,18 @@ func restartServer(t *testing.T, previous *server, upstreamURL string, extraEnv 
 
 func startServerInDirectory(t *testing.T, tempDir, upstreamURL string, providers *string, extraEnv map[string]string) *server {
 	t.Helper()
-	providersPath := filepath.Join(tempDir, "providers.yaml")
+	// The database lives in the platform data directory the way a default install
+	// does, so the startup import sees the same layout users get.
+	dbPath := filepath.Join(tempDir, "orr", "orr.db")
 	if providers != nil {
-		contents := strings.ReplaceAll(*providers, "UPDATED_AT", time.Now().Format(time.RFC3339))
-		if err := os.WriteFile(providersPath, []byte(contents), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	} else if _, err := os.Stat(providersPath); err != nil {
-		t.Fatalf("restart providers file: %v", err)
+		seedModels(t, dbPath, *providers)
+	} else if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("restart database: %v", err)
 	}
 
 	address := unusedAddress(t)
 	envPath := filepath.Join(tempDir, ".env")
-	env := fmt.Sprintf("ORR_LISTEN=%s\nORR_UPSTREAM=%s\nORR_PROVIDERS_FILE=%s\nORR_LOG_REQUESTS=true\nORR_TUI=false\n", address, upstreamURL, providersPath)
+	env := fmt.Sprintf("ORR_LISTEN=%s\nORR_UPSTREAM=%s\nORR_DB_FILE=%s\nORR_LOG_REQUESTS=true\nORR_TUI=false\n", address, upstreamURL, dbPath)
 	for name, value := range extraEnv {
 		env += name + "=" + value + "\n"
 	}
@@ -163,12 +165,12 @@ func startServerInDirectory(t *testing.T, tempDir, upstreamURL string, providers
 	exited := make(chan struct{})
 
 	s := &server{
-		baseURL:       "http://" + address,
-		providersPath: providersPath,
-		tempDir:       tempDir,
-		cancel:        cancel,
-		exited:        exited,
-		output:        output,
+		baseURL: "http://" + address,
+		dbPath:  dbPath,
+		tempDir: tempDir,
+		cancel:  cancel,
+		exited:  exited,
+		output:  output,
 	}
 	go func() {
 		s.waitErr = command.Wait()
@@ -244,4 +246,165 @@ func isolatedEnvironment(configDir string) []string {
 		"XDG_DATA_HOME="+configDir,
 		"HOME="+configDir,
 	)
+}
+
+// seedFile is the test fixture language the e2e suite uses to describe routing
+// state. It mirrors the providers file orr used to keep, so fixtures stay
+// readable; the harness writes the parsed entries into the database.
+type seedFile struct {
+	Version int                  `yaml:"version"`
+	Models  map[string]seedModel `yaml:"models"`
+}
+
+type seedModel struct {
+	Order             []string      `yaml:"order"`
+	Only              []string      `yaml:"only"`
+	Ignore            []string      `yaml:"ignore"`
+	AllowFallbacks    *bool         `yaml:"allow_fallbacks"`
+	RequireParameters *bool         `yaml:"require_parameters"`
+	DataCollection    string        `yaml:"data_collection"`
+	ZDR               *bool         `yaml:"zdr"`
+	Sort              string        `yaml:"sort"`
+	ManualPin         string        `yaml:"manual_pin"`
+	UpdatedAt         time.Time     `yaml:"updated_at"`
+	Blocked           []seedBlocked `yaml:"blocked"`
+}
+
+type seedBlocked struct {
+	Provider   string    `yaml:"provider"`
+	Reason     string    `yaml:"reason"`
+	DetectedAt time.Time `yaml:"detected_at"`
+}
+
+const seedUpdatedAtPlaceholder = "UPDATED_AT"
+
+// seedModels writes the fixture's models into the database at path.
+func seedModels(t *testing.T, path, contents string) {
+	t.Helper()
+	contents = strings.ReplaceAll(contents, seedUpdatedAtPlaceholder, time.Now().Format(time.RFC3339))
+	var parsed seedFile
+	if err := yaml.Unmarshal([]byte(contents), &parsed); err != nil {
+		t.Fatalf("parse seeded models: %v", err)
+	}
+	models := make(map[string]store.Model, len(parsed.Models))
+	for name, seed := range parsed.Models {
+		entry := store.Model{
+			Order:             seed.Order,
+			Only:              seed.Only,
+			Ignore:            seed.Ignore,
+			AllowFallbacks:    seed.AllowFallbacks,
+			RequireParameters: seed.RequireParameters,
+			DataCollection:    seed.DataCollection,
+			ZDR:               seed.ZDR,
+			Sort:              seed.Sort,
+			ManualPin:         seed.ManualPin,
+			UpdatedAt:         seed.UpdatedAt,
+		}
+		for _, blocked := range seed.Blocked {
+			entry.Blocked = append(entry.Blocked, store.Blocked{
+				Provider:   blocked.Provider,
+				Reason:     blocked.Reason,
+				DetectedAt: blocked.DetectedAt,
+			})
+		}
+		models[name] = entry
+	}
+	db, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open seeded database: %v", err)
+	}
+	defer db.Close()
+	if err := db.SaveModels(models); err != nil {
+		t.Fatalf("seed models: %v", err)
+	}
+}
+
+// persistedModels reads the routing state another process is serving. The
+// database is opened read-only, so the server's own writes are never blocked by
+// the assertion.
+func persistedModels(t *testing.T, path string) map[string]store.Model {
+	t.Helper()
+	db, err := store.OpenReadOnly(path)
+	if err != nil {
+		t.Fatalf("open persisted database: %v", err)
+	}
+	defer db.Close()
+	models, err := db.Models()
+	if err != nil {
+		t.Fatalf("read persisted models: %v", err)
+	}
+	return models
+}
+
+// waitForFreshModels polls until every named model has a refreshed catalog and
+// a non-empty provider order.
+func waitForFreshModels(t *testing.T, s *server, names ...string) map[string]store.Model {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		models := persistedModels(t, s.dbPath)
+		fresh := true
+		for _, name := range names {
+			entry, found := models[name]
+			if !found || len(entry.Order) == 0 || strings.HasPrefix(entry.UpdatedAt.Format(time.DateOnly), "2000-01-01") {
+				fresh = false
+				break
+			}
+		}
+		if fresh {
+			return models
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("models %v were not refreshed: %+v", names, models)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// waitForPersistedOrder polls until some model's persisted order contains the
+// providers in the given sequence and its catalog has been refreshed away from
+// the fixture's placeholder date.
+func waitForPersistedOrder(t *testing.T, s *server, providers ...string) store.Model {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var last map[string]store.Model
+	for {
+		last = persistedModels(t, s.dbPath)
+		for _, model := range last {
+			if !strings.HasPrefix(model.UpdatedAt.Format(time.DateOnly), "2000-01-01") && orderContains(model.Order, providers) {
+				return model
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("provider order did not become %v: %+v", providers, last)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func orderContains(order, providers []string) bool {
+	position := 0
+	for _, provider := range order {
+		if position < len(providers) && provider == providers[position] {
+			position++
+		}
+	}
+	return position == len(providers)
+}
+
+// containsAll reports whether order holds every one of wanted.
+func containsAll(order []string, wanted ...string) bool {
+	for _, want := range wanted {
+		found := false
+		for _, provider := range order {
+			if provider == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }

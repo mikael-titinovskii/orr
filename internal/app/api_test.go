@@ -6,24 +6,33 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mikael-titinovskii/orr/internal/store"
 )
 
 func testManagementAPI(t *testing.T) *managementAPI {
 	t.Helper()
+	a, _ := testManagementAPIWithStore(t)
+	return a
+}
+
+// testManagementAPIWithStore returns the management API along with the database
+// its routing configuration is persisted into.
+func testManagementAPIWithStore(t *testing.T) (*managementAPI, *store.Store) {
+	t.Helper()
+	db := openTestStore(t)
 	p, err := newProxy(config{Upstream: "https://example.invalid", OpenRouterAPIKey: "test-secret",
-		PinTTL: time.Hour, Models: map[string]providerConfig{"author/model": {Order: []string{"first", "second"}}}})
+		PinTTL: time.Hour, Models: map[string]providerConfig{"author/model": {Order: []string{"first", "second"}}},
+		db: db})
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	a := &managementAPI{p: p}
 	t.Cleanup(func() { a.stop(); a.wg.Wait() })
-	return a
+	return a, db
 }
 
 func apiRequest(a *managementAPI, method, path, body string) *httptest.ResponseRecorder {
@@ -79,16 +88,19 @@ func TestAPIResourcesWithoutClientCredentials(t *testing.T) {
 }
 
 func TestAPIPinsPersistAndRestoreAutomaticWinner(t *testing.T) {
-	a := testManagementAPI(t)
+	a, db := testManagementAPIWithStore(t)
 	a.p.routing.autoPin("author/model", "first")
 	a.p.stats.setAutoPin("author/model", "first")
 	w := apiRequest(a, "PUT", "pin?model=author/model", `{"provider":"second"}`)
 	if w.Code != 200 {
 		t.Fatalf("pin: %d %s", w.Code, w.Body)
 	}
-	data, err := os.ReadFile(a.p.routing.providersPath)
-	if err != nil || !strings.Contains(string(data), "manual_pin: second") {
-		t.Fatalf("persist: %s %v", data, err)
+	models, err := db.Models()
+	if err != nil {
+		t.Fatalf("read persisted models: %v", err)
+	}
+	if got := models["author/model"].ManualPin; got != "second" {
+		t.Fatalf("persisted manual pin = %q, want second", got)
 	}
 	if pin, manual := a.p.routing.pinInfo("author/model"); pin != "second" || !manual {
 		t.Fatalf("pin = %s %v", pin, manual)
@@ -102,9 +114,12 @@ func TestAPIPinsPersistAndRestoreAutomaticWinner(t *testing.T) {
 			t.Fatalf("restored pin = %s %v", pin, manual)
 		}
 	}
-	data, err = os.ReadFile(a.p.routing.providersPath)
-	if err != nil || strings.Contains(string(data), "manual_pin") {
-		t.Fatalf("clear: %s %v", data, err)
+	models, err = db.Models()
+	if err != nil {
+		t.Fatalf("read persisted models: %v", err)
+	}
+	if got := models["author/model"].ManualPin; got != "" {
+		t.Fatalf("persisted manual pin after clear = %q, want none", got)
 	}
 }
 
@@ -126,7 +141,9 @@ func TestAPIRejectsInvalidPinBodies(t *testing.T) {
 		t.Fatalf("media type: %d", w.Code)
 	}
 	// Persistence failure leaves the active routing state unchanged.
-	a.p.routing.setProvidersPath(t.TempDir())
+	a.p.routing.setPersistModels(func(map[string]providerConfig) error {
+		return errors.New("database unavailable")
+	})
 	w = apiRequest(a, "PUT", "pin?model=author/model", `{"provider":"second"}`)
 	if w.Code != 500 {
 		t.Fatalf("persistence: %d %s", w.Code, w.Body)

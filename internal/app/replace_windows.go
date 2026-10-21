@@ -14,8 +14,8 @@ import (
 // anything else momentarily holds the destination — a virus scanner, the
 // search indexer, a backup agent, or a reader that opened it without
 // FILE_SHARE_DELETE. The failure is transient and clears in milliseconds, but
-// without a retry it loses the write, and for the providers file that means
-// losing a freshly measured provider order and its pin.
+// without a retry it loses the write, and for `orr upgrade` that means leaving
+// the running binary in place instead of replacing it.
 const replaceAttempts = 5
 const replaceRetryDelay = 5 * time.Millisecond
 

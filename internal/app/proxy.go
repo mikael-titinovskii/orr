@@ -85,7 +85,9 @@ func newProxy(cfg config) (*proxy, error) {
 		log.Printf("warning: forwarding the OpenRouter API key over plain http to %s", u.Host)
 	}
 	routing := newRoutingState(cfg.Models, cfg.PinTTL)
-	routing.setProvidersPath(cfg.providersPath)
+	if cfg.db != nil {
+		routing.setPersistModels(cfg.db.SaveModels)
+	}
 	p := &proxy{
 		cfg:                cfg,
 		upstream:           u,
@@ -578,7 +580,7 @@ func (p *proxy) prepareDailyModel(model string) <-chan struct{} {
 // used for automatic discovery, bypassing the once-per-day schedule. dailyReady
 // coalesces it with any other automatic run for this model, while the recovery
 // cooldown prevents repeated provider failures from starting billable benchmark
-// storms. That cooldown lives in the stats file, so a restart does not hand the
+// storms. That cooldown lives in the database, so a restart does not hand the
 // same failure a fresh allowance.
 //
 // Recovery is deliberately not held back by the abort floor: a provider failure
@@ -1112,7 +1114,7 @@ func prepareRequest(body io.Reader, routing *routingState, path string) ([]byte,
 	// one candidate to blame. A pin names one provider with fallbacks off; an
 	// unpinned request names its whole order.
 	namedEndpoints := 0
-	if configured && (provider.hasRouting() || selected != "") {
+	if configured && (hasRouting(provider) || selected != "") {
 		if selected != "" {
 			provider.Order = nil
 			provider.Only = []string{selected}

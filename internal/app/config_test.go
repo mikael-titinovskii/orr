@@ -9,7 +9,7 @@ import (
 
 var runtimeEnvNames = []string{
 	"OPENROUTER_API_KEY", "ORR_LISTEN", "ORR_UPSTREAM", "ORR_LOG_REQUESTS",
-	"ORR_TUI", "ORR_PIN_TTL", "ORR_PROVIDERS_FILE",
+	"ORR_TUI", "ORR_PIN_TTL", "ORR_DB_FILE",
 	"ORR_UPDATE_MAX_PROVIDERS", "ORR_UPDATE_CACHE_ONLY",
 	"ORR_429_FAILOVER_THRESHOLD",
 	"ORR_DEGRADATION", "ORR_DEGRADATION_THRESHOLD", "ORR_DEGRADATION_WINDOW",
@@ -34,19 +34,6 @@ func clearRuntimeEnv(t *testing.T) {
 	}
 }
 
-func writeProvidersFile(t *testing.T, path string) {
-	t.Helper()
-	content := `version: 1
-models:
-  moonshotai/kimi-k3:
-    order: [fireworks, deepinfra]
-    allow_fallbacks: false
-`
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestLoadDotEnvConfig(t *testing.T) {
 	clearRuntimeEnv(t)
 	dir := t.TempDir()
@@ -56,14 +43,13 @@ ORR_UPSTREAM=https://example.test/v1
 ORR_LOG_REQUESTS=false
 ORR_TUI=false
 ORR_PIN_TTL=2h
-ORR_PROVIDERS_FILE=routes.yaml
+ORR_DB_FILE=routes.db
 ORR_429_FAILOVER_THRESHOLD=4
 OPENROUTER_API_KEY=test-key
 `
 	if err := os.WriteFile(envPath, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeProvidersFile(t, filepath.Join(dir, "routes.yaml"))
 
 	cfg, err := loadConfig(envPath)
 	if err != nil {
@@ -81,8 +67,8 @@ OPENROUTER_API_KEY=test-key
 	if cfg.RateLimitFailoverThreshold != 4 {
 		t.Fatalf("429 failover threshold = %d, want 4", cfg.RateLimitFailoverThreshold)
 	}
-	if got := cfg.Models["moonshotai/kimi-k3"].Order; len(got) != 2 || got[0] != "fireworks" {
-		t.Fatalf("providers file not loaded: %#v", cfg.Models)
+	if want := filepath.Join(dir, "routes.db"); cfg.dbPath != want {
+		t.Fatalf("database path = %q, want %q", cfg.dbPath, want)
 	}
 }
 
@@ -96,7 +82,6 @@ ORR_UPDATE_CACHE_ONLY=true
 	if err := os.WriteFile(envPath, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeProvidersFile(t, filepath.Join(dir, "providers.yaml"))
 
 	cfg, err := loadConfig(envPath)
 	if err != nil {
@@ -110,7 +95,6 @@ ORR_UPDATE_CACHE_ONLY=true
 func TestUpdateSettingsDefaultsAndValidation(t *testing.T) {
 	clearRuntimeEnv(t)
 	dir := t.TempDir()
-	writeProvidersFile(t, filepath.Join(dir, "providers.yaml"))
 	cfg, err := loadConfig(filepath.Join(dir, ".env"))
 	if err != nil {
 		t.Fatal(err)
@@ -136,7 +120,6 @@ func TestUpdateSettingsDefaultsAndValidation(t *testing.T) {
 			if err := os.WriteFile(envPath, []byte(content), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			writeProvidersFile(t, filepath.Join(dir, "providers.yaml"))
 			if _, err := loadConfig(envPath); err == nil {
 				t.Fatalf("invalid update setting accepted: %q", content)
 			}
@@ -147,64 +130,12 @@ func TestUpdateSettingsDefaultsAndValidation(t *testing.T) {
 func TestDotEnvDefaultsAndOptionalFile(t *testing.T) {
 	clearRuntimeEnv(t)
 	dir := t.TempDir()
-	writeProvidersFile(t, filepath.Join(dir, "providers.yaml"))
 	cfg, err := loadConfig(filepath.Join(dir, ".env"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Listen != "127.0.0.1:8787" || cfg.Upstream != openRouterAPI || !cfg.LogRequests || cfg.PinTTL != time.Hour {
 		t.Fatalf("defaults not applied: %#v", cfg)
-	}
-}
-
-func TestLoadConfigCreatesMissingProvidersFile(t *testing.T) {
-	clearRuntimeEnv(t)
-	dir := t.TempDir()
-	providersPath := filepath.Join(dir, "providers.yaml")
-	cfg, err := loadConfig(filepath.Join(dir, ".env"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.providersPath != providersPath || len(cfg.Models) != 0 {
-		t.Fatalf("unexpected empty providers config: %#v", cfg)
-	}
-	if _, err := os.Stat(providersPath); err != nil {
-		t.Fatalf("providers file was not created: %v", err)
-	}
-}
-
-func TestLoadConfigRejectsUnversionedProvidersFile(t *testing.T) {
-	clearRuntimeEnv(t)
-	dir := t.TempDir()
-	providersPath := filepath.Join(dir, "providers.yaml")
-	if err := os.WriteFile(providersPath, []byte("models:\n  a/b: {}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := loadConfig(filepath.Join(dir, ".env")); err == nil {
-		t.Fatal("unversioned providers file accepted")
-	}
-}
-
-func TestLoadConfigRejectsUnsupportedProvidersVersion(t *testing.T) {
-	clearRuntimeEnv(t)
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "providers.yaml"), []byte("version: 2\nmodels: {}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := loadConfig(filepath.Join(dir, ".env")); err == nil {
-		t.Fatal("unsupported providers version accepted")
-	}
-}
-
-func TestLoadConfigRejectsUnknownProviderField(t *testing.T) {
-	clearRuntimeEnv(t)
-	dir := t.TempDir()
-	content := "version: 1\nmodels:\n  a/b:\n    allow_fallback: false\n"
-	if err := os.WriteFile(filepath.Join(dir, "providers.yaml"), []byte(content), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := loadConfig(filepath.Join(dir, ".env")); err == nil {
-		t.Fatal("unknown provider field accepted")
 	}
 }
 
@@ -215,7 +146,6 @@ func TestProcessEnvironmentOverridesDotEnv(t *testing.T) {
 	if err := os.WriteFile(envPath, []byte("ORR_LISTEN=127.0.0.1:1111\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeProvidersFile(t, filepath.Join(dir, "providers.yaml"))
 	t.Setenv("ORR_LISTEN", "127.0.0.1:2222")
 
 	cfg, err := loadConfig(envPath)
@@ -231,13 +161,12 @@ func TestDotEnvCanOverrideProcessEnvironment(t *testing.T) {
 	clearRuntimeEnv(t)
 	dir := t.TempDir()
 	envPath := filepath.Join(dir, ".env")
-	content := "ORR_LISTEN=127.0.0.1:1111\nORR_PROVIDERS_FILE=file-providers.yaml\n"
+	content := "ORR_LISTEN=127.0.0.1:1111\nORR_DB_FILE=file-orr.db\n"
 	if err := os.WriteFile(envPath, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeProvidersFile(t, filepath.Join(dir, "file-providers.yaml"))
 	t.Setenv("ORR_LISTEN", "127.0.0.1:2222")
-	t.Setenv("ORR_PROVIDERS_FILE", "environment-providers.yaml")
+	t.Setenv("ORR_DB_FILE", "environment-orr.db")
 	t.Setenv("ORR_UPSTREAM", "https://environment.example/v1")
 
 	cfg, err := loadConfigWithOptions(envPath, true)
@@ -247,8 +176,8 @@ func TestDotEnvCanOverrideProcessEnvironment(t *testing.T) {
 	if cfg.Listen != "127.0.0.1:1111" {
 		t.Fatalf("dotenv listen did not win: %q", cfg.Listen)
 	}
-	if cfg.providersPath != filepath.Join(dir, "file-providers.yaml") {
-		t.Fatalf("dotenv providers path did not win: %q", cfg.providersPath)
+	if cfg.dbPath != filepath.Join(dir, "file-orr.db") {
+		t.Fatalf("dotenv database path did not win: %q", cfg.dbPath)
 	}
 	if cfg.Upstream != "https://environment.example/v1" {
 		t.Fatalf("missing dotenv value did not fall back to process environment: %q", cfg.Upstream)
@@ -262,7 +191,6 @@ func TestPreferredEmptyDotEnvValueOverridesProcessEnvironment(t *testing.T) {
 	if err := os.WriteFile(envPath, []byte("OPENROUTER_API_KEY=\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeProvidersFile(t, filepath.Join(dir, "providers.yaml"))
 	t.Setenv("OPENROUTER_API_KEY", "from-environment")
 
 	cfg, err := loadConfigWithOptions(envPath, true)
@@ -301,7 +229,6 @@ func TestRejectsInvalidDotEnvSettings(t *testing.T) {
 			if err := os.WriteFile(envPath, []byte(content), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			writeProvidersFile(t, filepath.Join(dir, "providers.yaml"))
 			if _, err := loadConfig(envPath); err == nil {
 				t.Fatalf("invalid setting accepted: %q", content)
 			}
@@ -323,7 +250,6 @@ ORR_DEGRADATION_TIMEOUT=4s
 	if err := os.WriteFile(envPath, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeProvidersFile(t, filepath.Join(dir, "providers.yaml"))
 	cfg, err := loadConfig(envPath)
 	if err != nil {
 		t.Fatal(err)
@@ -379,7 +305,6 @@ func TestDegradationRejectsInvalidSettings(t *testing.T) {
 			if err := os.WriteFile(envPath, []byte(content), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			writeProvidersFile(t, filepath.Join(dir, "providers.yaml"))
 			if _, err := loadConfig(envPath); err == nil {
 				t.Fatalf("invalid setting accepted: %q", content)
 			}
@@ -401,6 +326,26 @@ func TestPinTTLDefaultAndValidation(t *testing.T) {
 	cfg.PinTTL = -1
 	if err := cfg.validate(); err == nil {
 		t.Fatal("negative pin TTL accepted")
+	}
+}
+
+func TestValidateModelsRejectsUnsupportedValues(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		model providerConfig
+	}{
+		{"sort", providerConfig{Sort: "pricey"}},
+		{"data_collection", providerConfig{DataCollection: "maybe"}},
+	} {
+		if err := validateModels(map[string]providerConfig{"author/model": tc.model}); err == nil {
+			t.Fatalf("%s accepted", tc.name)
+		}
+	}
+	if err := validateModels(map[string]providerConfig{"author/model": {Sort: "price", DataCollection: "deny"}}); err != nil {
+		t.Fatalf("valid routing rejected: %v", err)
+	}
+	if err := validateModels(map[string]providerConfig{"bad-id": {}}); err == nil {
+		t.Fatal("model id without author/model form accepted")
 	}
 }
 

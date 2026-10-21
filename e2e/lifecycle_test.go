@@ -14,21 +14,18 @@ import (
 	"time"
 )
 
-func TestServeRejectsIncompatiblePersistedStats(t *testing.T) {
+func TestServeRejectsIncompatibleLegacyStats(t *testing.T) {
 	tempDir := t.TempDir()
-	statsPath := filepath.Join(tempDir, "orr", "stats.json")
-	if err := os.MkdirAll(filepath.Dir(statsPath), 0o700); err != nil {
+	dbPath := filepath.Join(tempDir, "orr", "orr.db")
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	statsPath := filepath.Join(tempDir, "orr", "stats.json")
 	if err := os.WriteFile(statsPath, []byte(`{"version":99}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	providersPath := filepath.Join(tempDir, "providers.yaml")
-	if err := os.WriteFile(providersPath, []byte("version: 1\nmodels: {}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	envPath := filepath.Join(tempDir, ".env")
-	env := fmt.Sprintf("ORR_LISTEN=%s\nORR_UPSTREAM=http://127.0.0.1:1/api/v1\nORR_PROVIDERS_FILE=%s\nORR_TUI=false\n", unusedAddress(t), providersPath)
+	env := fmt.Sprintf("ORR_LISTEN=%s\nORR_UPSTREAM=http://127.0.0.1:1/api/v1\nORR_DB_FILE=%s\nORR_TUI=false\n", unusedAddress(t), dbPath)
 	if err := os.WriteFile(envPath, []byte(env), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -79,12 +76,8 @@ models:
 	restarted := restartServer(t, orr, upstream.URL+"/api/v1", env)
 	postCompletion(t, restarted.baseURL, "after restart")
 	assertStrictPin(t, <-requests, "manual")
-	data, err := os.ReadFile(restarted.providersPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(data), "manual_pin: manual") {
-		t.Fatalf("manual pin did not survive restart:\n%s", data)
+	if pin := persistedModels(t, restarted.dbPath)["author/model"].ManualPin; pin != "manual" {
+		t.Fatalf("manual pin did not survive restart: %q", pin)
 	}
 }
 
@@ -105,6 +98,9 @@ func testRestoredPin(t *testing.T, pinnedAt time.Time, want string) {
 	defer upstream.Close()
 
 	setup := func(tempDir string) {
+		// A legacy stats file in the platform data directory beside the database is
+		// imported on startup, which is what restores the automatic pin this test
+		// exercises.
 		statsPath := filepath.Join(tempDir, "orr", "stats.json")
 		if err := os.MkdirAll(filepath.Dir(statsPath), 0o700); err != nil {
 			t.Fatal(err)

@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -15,7 +13,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
-	"gopkg.in/yaml.v3"
 )
 
 // guardrailBody is the response OpenRouter returns when a request names one
@@ -173,10 +170,10 @@ func TestBlockedSetExpiresStaleRefusals(t *testing.T) {
 func TestBlockedProviderTTLBoundary(t *testing.T) {
 	detected := time.Date(2026, time.September, 3, 12, 0, 0, 0, time.Local)
 	block := blockedProvider{Provider: "provider", DetectedAt: detected}
-	if !block.fresh(detected.Add(blockedProviderTTL - time.Nanosecond)) {
+	if !blockedFresh(block, detected.Add(blockedProviderTTL-time.Nanosecond)) {
 		t.Fatal("provider block expired before its 24-hour TTL")
 	}
-	if block.fresh(detected.Add(blockedProviderTTL)) {
+	if blockedFresh(block, detected.Add(blockedProviderTTL)) {
 		t.Fatal("provider block remained active at the 24-hour boundary")
 	}
 }
@@ -225,11 +222,9 @@ func TestBenchmarkRoundsStayOutOfProviderErrorRates(t *testing.T) {
 
 func TestMarkBlockedDemotesProviderAndPromotesAutoPin(t *testing.T) {
 	const model = "author/model"
-	path := filepath.Join(t.TempDir(), "providers.yaml")
-	routing := newRoutingState(map[string]providerConfig{model: {
+	routing, db := testRoutingWithStore(t, map[string]providerConfig{model: {
 		Order: []string{"blocked", "second", "third"},
-	}}, time.Hour)
-	routing.setProvidersPath(path)
+	}})
 	routing.autoPin(model, "blocked")
 
 	discovered, err := routing.markBlocked(model, "blocked", "zdr-violation-by-guardrail")
@@ -248,21 +243,17 @@ func TestMarkBlockedDemotesProviderAndPromotesAutoPin(t *testing.T) {
 		t.Fatalf("auto pin = %q, want the next ranked provider", got)
 	}
 
-	// Repeating the same refusal is not news and must not churn the file.
+	// Repeating the same refusal is not news and must not churn the database.
 	discovered, err = routing.markBlocked(model, "blocked", "zdr-violation-by-guardrail")
 	if err != nil || discovered {
 		t.Fatalf("repeat refusal: discovered=%v err=%v", discovered, err)
 	}
 
-	data, err := os.ReadFile(path)
+	saved, err := db.Models()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var saved providersFile
-	if err := yaml.Unmarshal(data, &saved); err != nil {
-		t.Fatal(err)
-	}
-	blocked := saved.Models[model].Blocked
+	blocked := saved[model].Blocked
 	if len(blocked) != 1 || blocked[0].Provider != "blocked" || blocked[0].Reason != "zdr-violation-by-guardrail" {
 		t.Fatalf("refusal not persisted: %#v", blocked)
 	}
@@ -293,7 +284,7 @@ func TestRenewedExpiredBlockIsDemotedAgain(t *testing.T) {
 	if want := []string{"healthy", "blocked"}; !equalSlices(cfg.Order, want) {
 		t.Fatalf("order = %v, want %v after renewing the expired block", cfg.Order, want)
 	}
-	if len(cfg.Blocked) != 1 || !cfg.Blocked[0].fresh(time.Now()) {
+	if len(cfg.Blocked) != 1 || !blockedFresh(cfg.Blocked[0], time.Now()) {
 		t.Fatalf("renewed block is not fresh: %#v", cfg.Blocked)
 	}
 }
@@ -450,7 +441,6 @@ func TestRefreshModelOrderHoldsBlockedProvidersOutOfTheBudget(t *testing.T) {
 	defer server.Close()
 
 	routing := newRoutingState(map[string]providerConfig{model: {}}, time.Hour)
-	routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	// The two fastest endpoints are refused for this account.
 	for _, provider := range []string{"p0", "p1"} {
 		if _, err := routing.markBlocked(model, provider, "zdr-violation-by-guardrail"); err != nil {
@@ -483,7 +473,6 @@ func TestRefreshModelOrderKeepsTheRankingWhenEverythingIsBlocked(t *testing.T) {
 	defer server.Close()
 
 	routing := newRoutingState(map[string]providerConfig{model: {}}, time.Hour)
-	routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	for _, provider := range []string{"a", "b"} {
 		if _, err := routing.markBlocked(model, provider, "zdr-violation-by-guardrail"); err != nil {
 			t.Fatal(err)
@@ -597,7 +586,6 @@ func TestProviderTestRecordsRefusalAndStopsRetrying(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	rounds := 0
 	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		rounds++
@@ -641,7 +629,6 @@ func TestBenchmarkSkipsBlockedProviders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	if _, err := p.routing.markBlocked(model, "blocked", "zdr-violation-by-guardrail"); err != nil {
 		t.Fatal(err)
 	}
@@ -677,7 +664,6 @@ func TestBenchmarkStillProbesWhenEveryProviderIsBlocked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	if _, err := p.routing.markBlocked(model, "only", "zdr-violation-by-guardrail"); err != nil {
 		t.Fatal(err)
 	}
@@ -701,7 +687,6 @@ func TestSuccessfulRoundClearsRecordedRefusal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	if _, err := p.routing.markBlocked(model, "fireworks", "zdr-violation-by-guardrail"); err != nil {
 		t.Fatal(err)
 	}
@@ -731,7 +716,6 @@ func TestClientRequestReroutesAcrossConsecutiveBlockedProviders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	p.routing.endpointCache[model] = []endpointMeta{{Tag: "blocked-one"}, {Tag: "blocked-two"}, {Tag: "healthy"}}
 	// An automatic pin makes the request name exactly one endpoint, which is
 	// what lets the refusal be attributed to that provider — and it is orr's
@@ -809,7 +793,6 @@ func TestClientRequestDoesNotRetryOrdinaryFailures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	attempts := 0
 	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		attempts++
@@ -844,7 +827,6 @@ func TestRefusalDiscoveredMidBenchmarkKeepsTheMeasurements(t *testing.T) {
 	routing := newRoutingState(map[string]providerConfig{model: {
 		Order: []string{"doomed", "cheap", "pricey"},
 	}}, time.Hour)
-	routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	routing.endpointCache[model] = []endpointMeta{
 		{Tag: "doomed", Pricing: testPricing(0.10, 0.25, 0.01)},
 		{Tag: "cheap", Pricing: testPricing(1.00, 4.00, 0.10)},
@@ -897,7 +879,6 @@ func TestClientRequestNeverRoutesAroundAManualPin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	p.routing.endpointCache[model] = []endpointMeta{{Tag: "chosen"}, {Tag: "healthy"}}
 	if err := p.routing.setManualPin(model, "chosen"); err != nil {
 		t.Fatal(err)
@@ -998,7 +979,6 @@ func TestProviderAnsweringWithErrorsLosesThePin(t *testing.T) {
 	routing := newRoutingState(map[string]providerConfig{model: {
 		Order: []string{"failing", "working"},
 	}}, time.Hour)
-	routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	routing.endpointCache[model] = []endpointMeta{
 		{Tag: "failing", Pricing: testPricing(0.10, 0.25, 0.01)},
 		{Tag: "working", Pricing: testPricing(1.00, 4.00, 0.10)},
@@ -1033,12 +1013,9 @@ func TestProviderAnsweringWithErrorsLosesThePin(t *testing.T) {
 func TestBlockAppliesEvenWhenItCannotBePersisted(t *testing.T) {
 	const model = "author/model"
 	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"a", "b"}}}, time.Hour)
-	// A directory where a file must go makes the atomic write fail.
-	unwritable := filepath.Join(t.TempDir(), "providers.yaml")
-	if err := os.Mkdir(unwritable, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	routing.setProvidersPath(unwritable)
+	routing.setPersistModels(func(map[string]providerConfig) error {
+		return fmt.Errorf("database unavailable")
+	})
 	routing.autoPin(model, "a")
 
 	discovered, err := routing.markBlocked(model, "a", "zdr-violation-by-guardrail")
@@ -1126,7 +1103,6 @@ func TestSuccessfulRequestClearsABlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	p.routing.endpointCache[model] = []endpointMeta{{Tag: "healthy"}}
 	if _, err := p.routing.markBlocked(model, "healthy", "zdr-violation-by-guardrail"); err != nil {
 		t.Fatal(err)
@@ -1161,7 +1137,6 @@ func TestAutomaticPinRefusalsAreAttributedAndExhaustFallbacks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	p.routing.endpointCache[model] = []endpointMeta{{Tag: "first"}, {Tag: "second"}}
 
 	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -1252,7 +1227,6 @@ func TestStreamedRefusalIsRecordedAndDoesNotClearBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	p.routing.endpointCache[model] = []endpointMeta{{Tag: "blocked"}, {Tag: "healthy"}}
 	p.routing.autoPin(model, "blocked")
 	p.stats.setAutoPin(model, "blocked")
@@ -1289,7 +1263,6 @@ func TestProviderBenchmarkDetectsStreamedRefusal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.routing.setProvidersPath(filepath.Join(t.TempDir(), "providers.yaml"))
 	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		return response(http.StatusOK, "data: "+guardrailBody+"\n\ndata: [DONE]\n"), nil
 	})

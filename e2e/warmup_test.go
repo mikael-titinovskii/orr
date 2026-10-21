@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -102,21 +100,19 @@ func TestFreshStartMeasuresEveryProviderInsideThePingGate(t *testing.T) {
 	// one comes first there.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		data, err := os.ReadFile(orr.providersPath)
-		if err == nil {
-			last := ""
-			for _, line := range strings.Split(string(data), "\n") {
-				trimmed := strings.TrimSpace(line)
-				if name, ok := strings.CutPrefix(trimmed, "- "); ok {
-					last = strings.TrimSpace(name)
-				}
-			}
-			if last == "slow" && strings.Contains(string(data), "- fast-8") && strings.Contains(string(data), "- fast-9") {
+		models := persistedModels(t, orr.dbPath)
+		measured := false
+		for _, model := range models {
+			if order := model.Order; len(order) > 0 && order[len(order)-1] == "slow" && containsAll(order, "fast-8", "fast-9") {
+				measured = true
 				break
 			}
 		}
+		if measured {
+			break
+		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the never-answering provider was not pushed last, so the field was not fully measured:\n%s", data)
+			t.Fatalf("the never-answering provider was not pushed last, so the field was not fully measured: %+v", models)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

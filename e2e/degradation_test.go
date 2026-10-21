@@ -2,11 +2,9 @@ package e2e_test
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -14,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mikael-titinovskii/orr/internal/store"
 )
 
 // The watchdog judges a provider against its own earlier traffic, so an e2e
@@ -65,26 +65,26 @@ func degradationEnv(overrides map[string]string) map[string]string {
 	return env
 }
 
-// seedBenchmarkRunForToday records a benchmark for the model in the stats file
-// the app is about to load, so the once-per-day automatic run does not fire and
-// every benchmark request the upstream sees came from the watchdog. The stats
-// path follows the platform's user cache directory, and the harness points
-// every one of those variables at the test directory.
+// seedBenchmarkRunForToday records a benchmark for the model in the database the
+// app is about to load, so the once-per-day automatic run does not fire and
+// every benchmark request the upstream sees came from the watchdog.
 func seedBenchmarkRunForToday(t *testing.T, dir, model string) {
 	t.Helper()
-	body := fmt.Sprintf(`{"version":1,"benchmark_runs":{%q:%q}}`, model, time.Now().Format(time.RFC3339))
-	for _, path := range []string{
-		filepath.Join(dir, "orr", "stats.json"),
-		filepath.Join(dir, ".cache", "orr", "stats.json"),
-		filepath.Join(dir, ".local", "share", "orr", "stats.json"),
-		filepath.Join(dir, "Library", "Caches", "orr", "stats.json"),
-	} {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-			t.Fatal(err)
-		}
+	db, err := store.Open(filepath.Join(dir, "orr", "orr.db"))
+	if err != nil {
+		t.Fatalf("open seeded database: %v", err)
+	}
+	defer db.Close()
+	stats, err := db.LoadStats()
+	if err != nil {
+		t.Fatalf("read seeded stats: %v", err)
+	}
+	if stats.BenchmarkRuns == nil {
+		stats.BenchmarkRuns = make(map[string]time.Time)
+	}
+	stats.BenchmarkRuns[model] = time.Now()
+	if err := db.SaveStats(stats); err != nil {
+		t.Fatalf("seed benchmark run: %v", err)
 	}
 }
 

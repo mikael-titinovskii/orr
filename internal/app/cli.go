@@ -1,15 +1,14 @@
 package app
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sort"
 
+	"github.com/mikael-titinovskii/orr/internal/store"
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
 )
 
 func newRootCommand(output io.Writer) *cobra.Command {
@@ -25,7 +24,6 @@ func newRootCommand(output io.Writer) *cobra.Command {
 	root.AddCommand(
 		newServeCommand(),
 		newProvidersCommand(output),
-		newUpdateCommand(output),
 		newResetCommand(output),
 		newUpgradeCommand(output),
 		newIntegrateCommand(output),
@@ -113,27 +111,6 @@ func newProvidersCommand(output io.Writer) *cobra.Command {
 	return cmd
 }
 
-func newUpdateCommand(output io.Writer) *cobra.Command {
-	var (
-		envPath       string
-		preferEnvFile bool
-		maxProviders  int
-		cacheOnly     bool
-	)
-	cmd := &cobra.Command{
-		Use:   "update",
-		Short: "refresh every model provider order",
-		Args:  noPositionalArgs("update"),
-		RunE: func(*cobra.Command, []string) error {
-			return runUpdateWithOptions(envPath, preferEnvFile, maxProviders, cacheOnly, output)
-		},
-	}
-	addEnvFlags(cmd, &envPath, &preferEnvFile)
-	cmd.Flags().IntVar(&maxProviders, "max", 20, "maximum providers per model")
-	cmd.Flags().BoolVar(&cacheOnly, "cache-only", false, "only select endpoints that support prompt caching")
-	return cmd
-}
-
 func newResetCommand(output io.Writer) *cobra.Command {
 	var (
 		envPath       string
@@ -141,7 +118,7 @@ func newResetCommand(output io.Writer) *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "reset",
-		Short: "delete generated routing state",
+		Short: "delete the local database",
 		Args:  noPositionalArgs("reset"),
 		RunE: func(*cobra.Command, []string) error {
 			return runResetWithOptions(envPath, preferEnvFile, output)
@@ -200,28 +177,31 @@ func noPositionalArgs(name string) cobra.PositionalArgs {
 	}
 }
 
-// Read directly: loadConfig creates the providers file when absent.
-func configuredModels(envPath string) []string {
-	return configuredModelsWithOptions(envPath, false)
-}
-
+// configuredModelsWithOptions lists the configured models for shell completion.
+// It opens the database read-only and never creates it: completion runs on every
+// tab press, and a missing file simply offers nothing.
 func configuredModelsWithOptions(envPath string, preferEnvFile bool) []string {
 	fileEnv, err := readDotEnv(envPath)
 	if err != nil {
 		return nil
 	}
-	data, err := os.ReadFile(configuredProvidersPathWithOptions(envPath, fileEnv, preferEnvFile))
+	path, err := configuredDBPathWithOptions(envPath, fileEnv, preferEnvFile)
 	if err != nil {
 		return nil
 	}
-	var saved providersFile
-	if err := yaml.NewDecoder(bytes.NewReader(data)).Decode(&saved); err != nil {
+	db, err := store.OpenReadOnly(path)
+	if err != nil {
 		return nil
 	}
-	models := make([]string, 0, len(saved.Models))
-	for model := range saved.Models {
-		models = append(models, model)
+	defer db.Close()
+	models, err := db.Models()
+	if err != nil {
+		return nil
 	}
-	sort.Strings(models)
-	return models
+	names := make([]string, 0, len(models))
+	for model := range models {
+		names = append(names, model)
+	}
+	sort.Strings(names)
+	return names
 }

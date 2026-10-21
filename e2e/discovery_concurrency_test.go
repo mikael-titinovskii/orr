@@ -6,13 +6,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"github.com/mikael-titinovskii/orr/internal/store"
 )
 
 func TestUnknownModelPreservesFirstRoutingThenUsesDiscoveredProvider(t *testing.T) {
@@ -45,15 +44,20 @@ func TestUnknownModelPreservesFirstRoutingThenUsesDiscoveredProvider(t *testing.
 	}
 
 	deadline := time.Now().Add(2 * time.Second)
-	var latest []byte
+	var latest map[string]store.Model
 	for {
-		data, err := os.ReadFile(orr.providersPath)
-		latest = data
-		if err == nil && strings.Contains(string(data), "discovered") {
+		latest = persistedModels(t, orr.dbPath)
+		found := false
+		for _, model := range latest {
+			if strings.Contains(strings.Join(model.Order, ","), "discovered") {
+				found = true
+			}
+		}
+		if found {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("discovered provider was not persisted: %v\n%s\nprocess output:\n%s", err, latest, orr.output.String())
+			t.Fatalf("discovered provider was not persisted: %+v\nprocess output:\n%s", latest, orr.output.String())
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -126,13 +130,10 @@ models:
 		assertStrictPin(t, got.routing, want)
 	}
 
-	data, err := os.ReadFile(orr.providersPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var decoded map[string]any
-	if err := yaml.Unmarshal(data, &decoded); err != nil {
-		t.Fatalf("providers file became invalid under concurrency: %v\n%s", err, data)
+	// Read a consistent snapshot while concurrent pin writes may replace rows.
+	models := persistedModels(t, orr.dbPath)
+	if len(models) != 2 || len(models["author/one"].Order) == 0 || len(models["author/two"].Order) == 0 {
+		t.Fatalf("concurrent pins produced unexpected state: %+v", models)
 	}
 }
 
@@ -200,18 +201,10 @@ func TestConcurrentUnknownModelsAreCreatedAtomicallyAndStayIsolated(t *testing.T
 		}
 	}
 
-	// Read a successful snapshot while background refreshes may atomically replace
-	// the file. Windows can temporarily deny reads during that replacement.
-	data := waitForPersistedOrder(t, orr.providersPath, "one-provider", "two-provider")
-	var decoded struct {
-		Version int            `yaml:"version"`
-		Models  map[string]any `yaml:"models"`
-	}
-	if err := yaml.Unmarshal(data, &decoded); err != nil {
-		t.Fatalf("providers file became invalid under concurrent creation: %v\n%s", err, data)
-	}
-	if decoded.Version != 1 || len(decoded.Models) != 2 || decoded.Models["author/one"] == nil || decoded.Models["author/two"] == nil {
-		t.Fatalf("concurrent model creation produced unexpected file:\n%s", data)
+	// Read a successful snapshot while background refreshes replace rows.
+	models := waitForFreshModels(t, orr, "author/one", "author/two")
+	if len(models) != 2 || len(models["author/one"].Order) == 0 || len(models["author/two"].Order) == 0 {
+		t.Fatalf("concurrent model creation produced unexpected state: %+v", models)
 	}
 	for _, model := range []string{"author/one", "author/two"} {
 		if err := sendCompletion(orr.baseURL, fmt.Sprintf(`{"model":%q,"messages":[]}`, model)); err != nil {

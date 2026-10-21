@@ -1,17 +1,13 @@
 package app
 
 import (
-	"bytes"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
-	"os"
-	"path/filepath"
-	"runtime"
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/mikael-titinovskii/orr/internal/store"
 )
 
 const maxRequestRecords = 200
@@ -19,7 +15,6 @@ const maxMetricsRecords = 5000
 const maxWindowRecords = 10000
 const measuredMetricsTTL = 30 * time.Minute
 const spendWindowRetention = 8 * time.Hour
-const statsFileVersion = 1
 
 var diagnosticWindows = []time.Duration{
 	1 * time.Minute,
@@ -186,36 +181,6 @@ type benchmarkSample struct {
 const benchmarkSamplesPerProvider = 15
 const benchmarkSampleTTL = 7 * 24 * time.Hour
 
-type persistedStats struct {
-	Version       int                     `json:"version"`
-	DailyCosts    map[string]float64      `json:"daily_costs,omitempty"`
-	DailyTokens   map[string]int64        `json:"daily_tokens,omitempty"`
-	RequestCount  uint64                  `json:"request_count"`
-	CreditSpend   float64                 `json:"credit_spend,omitempty"`
-	CreditMonth   string                  `json:"credit_month,omitempty"`
-	Budget        float64                 `json:"budget,omitempty"`
-	BudgetReset   string                  `json:"budget_reset,omitempty"`
-	ProviderPins  map[string]persistedPin `json:"provider_pins,omitempty"`
-	BenchmarkRuns map[string]time.Time    `json:"benchmark_runs,omitempty"`
-	// RecoveryRuns is the last provider-recovery benchmark per model. It is
-	// persisted so the cooldown survives a restart: a process that re-enabled it
-	// on every start would hand the same failing provider a fresh benchmark —
-	// and a fresh bill — minutes apart.
-	RecoveryRuns map[string]time.Time `json:"recovery_runs,omitempty"`
-	// TimeWeight is the speed/price exponent the dashboard's slider was left
-	// at. It is a pointer so the meaningful value 0.0 — price alone — is not
-	// dropped by omitempty and silently restored as the default on restart.
-	TimeWeight *float64 `json:"time_weight,omitempty"`
-	// Degradation is the watchdog switch the dashboard's `d` key left behind.
-	// It is a pointer so a deliberate "off" is not dropped by omitempty and
-	// silently restored as the default on restart.
-	Degradation *bool `json:"degradation,omitempty"`
-	// BenchmarkSamples is keyed by model, then by provider. It is persisted so
-	// the pool survives a restart; without that, every restart would put
-	// selection back to judging providers on a single run's measurement.
-	BenchmarkSamples map[string]map[string][]benchmarkSample `json:"benchmark_samples,omitempty"`
-}
-
 type stats struct {
 	mu               sync.RWMutex
 	saveMu           sync.Mutex
@@ -240,7 +205,7 @@ type stats struct {
 	benchmarkAborts map[string]time.Time
 	timeWeight      float64
 	// degradation is the persisted watchdog switch. degradationSaved records
-	// whether the stats file carried a value, so the .env default only seeds a
+	// whether the database carried a value, so the .env default only seeds a
 	// state the user has never toggled.
 	degradation      bool
 	degradationSaved bool
@@ -316,7 +281,7 @@ func (s *stats) setDegradation(enabled bool) {
 	s.mu.Unlock()
 }
 
-// seedDegradation applies the configured default only while the stats file has
+// seedDegradation applies the configured default only while the database has
 // never recorded a toggle. A switch the user pressed is the last word, which is
 // the same rule the speed/price stop follows.
 func (s *stats) seedDegradation(value bool) {
@@ -617,91 +582,71 @@ func percentile(values []time.Duration, p float64) time.Duration {
 	return values[index]
 }
 
-func (s *stats) save(path string) error {
+func (s *stats) save(db *store.Store) error {
 	s.saveMu.Lock()
 	defer s.saveMu.Unlock()
 
 	s.mu.RLock()
-	timeWeight := s.timeWeight
-	// Only a switch the user actually toggled is saved. Writing the seeded value
-	// on every save would freeze it in the stats file on the first run and make
-	// ORR_DEGRADATION unchangeable from then on.
-	var degradation *bool
-	if s.degradationSaved {
-		degradation = &s.degradation
-	}
-	data, err := json.MarshalIndent(persistedStats{
-		Version:          statsFileVersion,
-		DailyCosts:       s.dailyCosts,
-		DailyTokens:      s.dailyTokens,
+	snapshot := store.Stats{
+		DailyCosts:       make(map[string]float64, len(s.dailyCosts)),
+		DailyTokens:      make(map[string]int64, len(s.dailyTokens)),
 		RequestCount:     s.requestCount,
 		CreditSpend:      s.creditSpend,
 		CreditMonth:      s.creditMonth,
 		Budget:           s.budget,
 		BudgetReset:      s.budgetReset,
-		ProviderPins:     s.providerPins,
-		BenchmarkRuns:    s.benchmarkRuns,
-		RecoveryRuns:     s.recoveryRuns,
-		BenchmarkSamples: s.benchmarkSamples,
-		TimeWeight:       &timeWeight,
-		Degradation:      degradation,
-	}, "", "  ")
+		ProviderPins:     make(map[string]store.Pin, len(s.providerPins)),
+		BenchmarkRuns:    make(map[string]time.Time, len(s.benchmarkRuns)),
+		RecoveryRuns:     make(map[string]time.Time, len(s.recoveryRuns)),
+		BenchmarkSamples: make(map[string]map[string][]store.Sample, len(s.benchmarkSamples)),
+	}
+	timeWeight := s.timeWeight
+	snapshot.TimeWeight = &timeWeight
+	// Only a switch the user actually toggled is saved. Writing the seeded value
+	// on every save would freeze it in the database on the first run and make
+	// ORR_DEGRADATION unchangeable from then on.
+	if s.degradationSaved {
+		degradation := s.degradation
+		snapshot.Degradation = &degradation
+	}
+	for day, cost := range s.dailyCosts {
+		snapshot.DailyCosts[day] = cost
+	}
+	for day, tokens := range s.dailyTokens {
+		snapshot.DailyTokens[day] = tokens
+	}
+	for model, pin := range s.providerPins {
+		snapshot.ProviderPins[model] = store.Pin{Provider: pin.Provider, PinnedAt: pin.PinnedAt}
+	}
+	for model, ranAt := range s.benchmarkRuns {
+		snapshot.BenchmarkRuns[model] = ranAt
+	}
+	for model, ranAt := range s.recoveryRuns {
+		snapshot.RecoveryRuns[model] = ranAt
+	}
+	for model, providers := range s.benchmarkSamples {
+		pool := make(map[string][]store.Sample, len(providers))
+		for provider, samples := range providers {
+			converted := make([]store.Sample, len(samples))
+			for i, sample := range samples {
+				converted[i] = store.Sample{Time: sample.Time, TPS: sample.TPS, TTFTMs: sample.TTFTms}
+			}
+			pool[provider] = converted
+		}
+		snapshot.BenchmarkSamples[model] = pool
+	}
 	s.mu.RUnlock()
-	if err != nil {
-		return fmt.Errorf("encode stats: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create stats directory: %w", err)
-	}
-	temp, err := os.CreateTemp(filepath.Dir(path), ".stats-*")
-	if err != nil {
-		return fmt.Errorf("create stats file: %w", err)
-	}
-	tempPath := temp.Name()
-	defer os.Remove(tempPath)
-	if err := temp.Chmod(0o600); err != nil {
-		temp.Close()
-		return fmt.Errorf("chmod temporary stats file: %w", err)
-	}
-	if _, err := temp.Write(append(data, '\n')); err != nil {
-		temp.Close()
-		return fmt.Errorf("write temporary stats file: %w", err)
-	}
-	if err := temp.Sync(); err != nil {
-		temp.Close()
-		return fmt.Errorf("sync temporary stats file: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		return fmt.Errorf("close temporary stats file: %w", err)
-	}
-	if err := replaceFile(tempPath, path); err != nil {
-		return fmt.Errorf("replace stats file: %w", err)
+
+	if err := db.SaveStats(snapshot); err != nil {
+		return fmt.Errorf("save stats: %w", err)
 	}
 	return nil
 }
 
-func (s *stats) load(path string) error {
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+func (s *stats) load(db *store.Store) error {
+	saved, err := db.LoadStats()
 	if err != nil {
-		return fmt.Errorf("read stats: %w", err)
-	}
-	var saved persistedStats
-	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
-		return fmt.Errorf("decode stats: top-level null is invalid")
-	}
-	if err := json.Unmarshal(data, &saved); err != nil {
-		return fmt.Errorf("decode stats: %w", err)
-	}
-	// Version 0 is the pre-versioning format, which is byte-compatible with
-	// version 1; anything else is an incompatible schema.
-	if saved.Version != 0 && saved.Version != statsFileVersion {
-		return fmt.Errorf("decode stats: unsupported version %d (expected %d)", saved.Version, statsFileVersion)
-	}
-	if saved.CreditSpend != 0 && saved.CreditMonth == "" {
-		return fmt.Errorf("decode stats: credit_month is required when credit_spend is set")
+		return fmt.Errorf("load stats: %w", err)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -723,9 +668,9 @@ func (s *stats) load(path string) error {
 	}
 	s.budget = saved.Budget
 	s.budgetReset = saved.BudgetReset
-	s.providerPins = saved.ProviderPins
-	if s.providerPins == nil {
-		s.providerPins = make(map[string]persistedPin)
+	s.providerPins = make(map[string]persistedPin, len(saved.ProviderPins))
+	for model, pin := range saved.ProviderPins {
+		s.providerPins[model] = persistedPin{Provider: pin.Provider, PinnedAt: pin.PinnedAt}
 	}
 	s.benchmarkRuns = saved.BenchmarkRuns
 	if s.benchmarkRuns == nil {
@@ -737,7 +682,7 @@ func (s *stats) load(path string) error {
 	}
 	// A recovery cooldown is read through a 30-second window, so anything older
 	// than a day describes a failure that cannot recur; dropping it keeps the
-	// shareable stats file from accumulating one timestamp per model forever.
+	// database from accumulating one timestamp per model forever.
 	recoveryCutoff := s.now().Add(-24 * time.Hour)
 	for model, last := range s.recoveryRuns {
 		if last.Before(recoveryCutoff) {
@@ -755,7 +700,7 @@ func (s *stats) load(path string) error {
 				if sample.Time.Before(cutoff) || sample.TPS <= 0 {
 					continue
 				}
-				kept = append(kept, sample)
+				kept = append(kept, benchmarkSample{Time: sample.Time, TPS: sample.TPS, TTFTms: sample.TTFTMs})
 			}
 			if len(kept) == 0 {
 				continue
@@ -769,9 +714,9 @@ func (s *stats) load(path string) error {
 			s.benchmarkSamples[model][provider] = kept
 		}
 	}
-	// An absent field keeps the default; a present one is clamped into the
-	// slider's range, so a hand-edited file cannot land the control on a value
-	// it cannot be moved back from.
+	// An absent value keeps the default; a present one is clamped into the
+	// slider's range, so a hand-edited database cannot land the control on a
+	// value it cannot be moved back from.
 	if saved.TimeWeight != nil {
 		s.timeWeight = clampTimeWeight(*saved.TimeWeight)
 	}
@@ -823,7 +768,7 @@ func (s *stats) benchmarkRanToday(model string, now time.Time) bool {
 // what the startup warm-up asks: a fresh process holds no measurements of its
 // own, so a run minutes before the restart still leaves the routing pane and the
 // pin resting on data this process has never seen. A latch ahead of the wall
-// clock — a stats file written before the clock was stepped back — is stale, not
+// clock — a timestamp written before the clock was stepped back — is stale, not
 // fresh: its negative age would otherwise sit inside every window until the
 // clock caught up.
 func (s *stats) benchmarkedWithin(model string, now time.Time, window time.Duration) bool {
@@ -877,8 +822,8 @@ func (s *stats) markBenchmarkAbort(model string, now time.Time) {
 }
 
 // recoveryLastRun reports when a provider-recovery benchmark last ran for model.
-// A timestamp ahead of the wall clock — a stats file written before the clock was
-// stepped back — is reported as zero rather than as a cooldown that outlives the
+// A timestamp ahead of the wall clock — written before the clock was stepped
+// back — is reported as zero rather than as a cooldown that outlives the
 // failure it belongs to.
 func (s *stats) recoveryLastRun(model string) time.Time {
 	if model == "" {
@@ -954,24 +899,6 @@ func (s *stats) mutationsCount() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.mutations
-}
-
-func statsFilePath() (string, error) {
-	if runtime.GOOS != "windows" {
-		if base := os.Getenv("XDG_DATA_HOME"); base != "" {
-			return filepath.Join(base, "orr", "stats.json"), nil
-		}
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		return filepath.Join(home, ".local", "share", "orr", "stats.json"), nil
-	}
-	base, err := os.UserCacheDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(base, "orr", "stats.json"), nil
 }
 
 func monthSpend(daily map[string]float64, now time.Time) float64 {
