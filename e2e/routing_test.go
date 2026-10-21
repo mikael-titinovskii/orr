@@ -5,7 +5,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -119,7 +118,7 @@ models:
 	})
 	postCompletion(t, orr.baseURL, "trigger daily benchmark")
 	assertStrictPin(t, <-liveRequest, "slow")
-	waitForPersistedOrder(t, orr.providersPath, "fast", "slow")
+	waitForPersistedOrder(t, orr, "fast", "slow")
 	postCompletion(t, orr.baseURL, "use daily benchmark winner")
 	assertStrictPin(t, <-liveRequest, "fast")
 
@@ -129,12 +128,9 @@ models:
 	if gotBenchmarkRequests != 6 {
 		t.Fatalf("benchmark requests = %d, want 3 rounds for each of 2 providers", gotBenchmarkRequests)
 	}
-	persisted, err := os.ReadFile(orr.providersPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fast := strings.Index(string(persisted), "- fast"); fast < 0 || strings.Index(string(persisted), "- slow") < fast {
-		t.Fatalf("daily winner was not persisted first:\n%s", persisted)
+	persisted := persistedModels(t, orr.dbPath)["author/model"]
+	if order := persisted.Order; len(order) < 2 || order[0] != "fast" || order[1] != "slow" {
+		t.Fatalf("daily winner was not persisted first: %v", order)
 	}
 }
 
@@ -195,12 +191,9 @@ models:
 	if gotBenchmarkRequests != 0 {
 		t.Fatalf("benchmark requests = %d, want none for a manually pinned model", gotBenchmarkRequests)
 	}
-	persisted, err := os.ReadFile(orr.providersPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(persisted), "manual_pin: manual") {
-		t.Fatalf("provider checkup removed manual pin:\n%s", persisted)
+	persisted := persistedModels(t, orr.dbPath)["author/model"]
+	if persisted.ManualPin != "manual" {
+		t.Fatalf("provider checkup removed manual pin: %+v", persisted)
 	}
 }
 
@@ -274,48 +267,15 @@ models:
 			if test.want == "fast" {
 				other = "cheap"
 			}
-			waitForPersistedOrder(t, orr.providersPath, test.want, other)
+			waitForPersistedOrder(t, orr, test.want, other)
 			postCompletion(t, orr.baseURL, "use measured price and speed winner")
 			assertStrictPin(t, <-liveRequest, test.want)
 
-			persisted, err := os.ReadFile(orr.providersPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			winner := strings.Index(string(persisted), "- "+test.want)
-			if winner < 0 || strings.Index(string(persisted), "- "+other) < winner {
-				t.Fatalf("winner %q was not persisted first:\n%s", test.want, persisted)
+			persisted := persistedModels(t, orr.dbPath)["author/model"]
+			if order := persisted.Order; len(order) < 2 || order[0] != test.want || order[1] != other {
+				t.Fatalf("winner %q was not persisted first: %v", test.want, order)
 			}
 		})
-	}
-}
-
-func waitForPersistedOrder(t *testing.T, path string, providers ...string) []byte {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	var last []byte
-	for {
-		data, err := os.ReadFile(path)
-		last = data
-		if err == nil {
-			matches := true
-			previous := -1
-			for _, provider := range providers {
-				index := strings.Index(string(data), "- "+provider)
-				if index < 0 || index <= previous {
-					matches = false
-					break
-				}
-				previous = index
-			}
-			if matches && !strings.Contains(string(data), "2000-01-01") {
-				return data
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("provider order did not become %v:\n%s", providers, last)
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 

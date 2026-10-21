@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/spf13/pflag"
+
+	"github.com/mikael-titinovskii/orr/internal/store"
 )
 
 func executeCommand(t *testing.T, args ...string) error {
@@ -77,7 +79,7 @@ func TestCompletionOffersEverySubcommand(t *testing.T) {
 }
 
 func TestCompletionOffersEveryFlagOfACommand(t *testing.T) {
-	for _, name := range []string{"serve", "providers", "update", "reset", "integrate"} {
+	for _, name := range []string{"serve", "providers", "reset", "integrate"} {
 		var want []string
 		for _, cmd := range newRootCommand(io.Discard).Commands() {
 			if cmd.Name() != name {
@@ -95,7 +97,7 @@ func TestCompletionOffersEveryFlagOfACommand(t *testing.T) {
 }
 
 func TestDotEnvCommandsOfferPreferEnvFileFlag(t *testing.T) {
-	for _, name := range []string{"serve", "providers", "update", "reset", "integrate"} {
+	for _, name := range []string{"serve", "providers", "reset", "integrate"} {
 		for _, cmd := range newRootCommand(io.Discard).Commands() {
 			if cmd.Name() == name && cmd.Flags().Lookup("prefer-env-file") == nil {
 				t.Errorf("%s does not offer --prefer-env-file", name)
@@ -106,12 +108,21 @@ func TestDotEnvCommandsOfferPreferEnvFileFlag(t *testing.T) {
 
 func TestCompletionOffersConfiguredModelsForProviders(t *testing.T) {
 	root := t.TempDir()
-	providersPath := filepath.Join(root, "providers.yaml")
-	if err := os.WriteFile(providersPath, []byte("version: 1\nmodels:\n  author/one: {}\n  author/two: {}\n"), 0o600); err != nil {
+	db, err := store.Open(filepath.Join(root, "orr.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SaveModels(map[string]providerConfig{
+		"author/one": {},
+		"author/two": {},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 	envPath := filepath.Join(root, ".env")
-	if err := os.WriteFile(envPath, []byte("ORR_PROVIDERS_FILE="+providersPath+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(envPath, []byte("ORR_DB_FILE="+filepath.Join(root, "orr.db")+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -123,17 +134,18 @@ func TestCompletionOffersConfiguredModelsForProviders(t *testing.T) {
 	}
 }
 
-func TestCompletionDoesNotCreateAProvidersFile(t *testing.T) {
+func TestCompletionDoesNotCreateADatabase(t *testing.T) {
 	root := t.TempDir()
+	dbPath := filepath.Join(root, "orr.db")
 	envPath := filepath.Join(root, ".env")
-	if err := os.WriteFile(envPath, []byte("OPENROUTER_API_KEY=key\n"), 0o600); err != nil {
+	if err := os.WriteFile(envPath, []byte("OPENROUTER_API_KEY=key\nORR_DB_FILE="+dbPath+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	completionCandidates(t, "providers", "--env", envPath, "")
 
-	if _, err := os.Stat(filepath.Join(root, "providers.yaml")); !os.IsNotExist(err) {
-		t.Fatalf("completing a model created the providers file: %v", err)
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("completing a model created the database: %v", err)
 	}
 }
 

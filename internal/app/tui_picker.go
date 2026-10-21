@@ -119,7 +119,8 @@ func (m *dashboardModel) movePicker(delta int) {
 
 // knownModels lists the models orr already knows, in the order the tab list
 // prefers them: watched models, then models seen in the request log, then the
-// rest of providers.yaml. They head the picker even before a catalog arrives.
+// rest of the stored routing configuration. They head the picker even before a
+// catalog arrives.
 func (m dashboardModel) knownModels() []string {
 	models := make([]string, 0, len(m.watchedModels)+len(m.activeModels)+8)
 	seen := make(map[string]bool)
@@ -227,7 +228,7 @@ func (m dashboardModel) pickerRows() []catalogModel {
 }
 
 // pickModel switches the panel to model and keeps it on the tab list from now
-// on. The model becomes a providers.yaml entry the way a first request for it
+// on. The model becomes a stored routing entry the way a first request for it
 // would, and its compatible providers are fetched when it has none yet, so a
 // model nothing has requested still shows a table to pin.
 func (m *dashboardModel) pickModel(model string) error {

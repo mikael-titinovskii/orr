@@ -568,7 +568,7 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "o":
 			// Cycle the table's display order. Only the rows move: the routing
-			// order requests follow, the pin, and the providers file stay as they
+			// order requests follow, the pin, and the stored order stay as they
 			// are. The cursor stays on the same provider.
 			selected := ""
 			providers := m.providers()

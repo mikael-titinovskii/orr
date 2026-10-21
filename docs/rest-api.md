@@ -33,7 +33,7 @@ The reference page only fetches the schema; it does not execute API operations.
 Models must already be known to the running proxy. Model identifiers are query
 parameters because model IDs and provider tags can contain slashes. Pin providers
 must appear in the model's current provider list. Manual pins are persisted only
-to `providers.yaml`; the dotenv file is never changed. Refreshes preserve manual
+to the database; the dotenv file is never changed. Refreshes preserve manual
 pins; benchmarks retain revision checks and automatic-pin persistence rules.
 
 Model objects contain `id`, `order`, `providers`, `active_provider`, and

@@ -215,7 +215,7 @@ type routingState struct {
 	pins                   map[string]pinnedProvider
 	pinTTL                 time.Duration
 	models                 map[string]providerConfig
-	providersPath          string
+	persistModels          func(map[string]providerConfig) error
 	endpointCache          map[string][]endpointMeta
 	endpointFetchedAt      map[string]time.Time
 	endpointRetryAt        map[string]time.Time
@@ -283,10 +283,35 @@ func cloneProviderConfigs(models map[string]providerConfig) map[string]providerC
 	return cloned
 }
 
-func (r *routingState) setProvidersPath(path string) {
+// setPersistModels installs the writer that stores routing configuration. A nil
+// writer leaves changes in memory only, which is what tests that do not care
+// about persistence want.
+func (r *routingState) setPersistModels(persist func(map[string]providerConfig) error) {
 	r.mu.Lock()
-	r.providersPath = path
+	r.persistModels = persist
 	r.mu.Unlock()
+}
+
+// containsString reports whether values holds wanted.
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+// persistModelsSnapshot hands models to the installed writer. A nil writer
+// leaves the change in memory only.
+func (r *routingState) persistModelsSnapshot(models map[string]providerConfig) error {
+	r.mu.RLock()
+	persist := r.persistModels
+	r.mu.RUnlock()
+	if persist == nil {
+		return nil
+	}
+	return persist(models)
 }
 
 // currentTimeWeight is the live speed/price exponent. It is read on every
@@ -355,9 +380,9 @@ func (r *routingState) modelConfigAtRevision(model string) (providerConfig, uint
 	return provider, r.modelRevisions[model], ok
 }
 
-// ensureModel adds model to the routing state and the providers file when it is
+// ensureModel adds model to the routing state and the database when it is
 // not configured yet, returning whether the model was newly added. The
-// providers-file write and the in-memory commit are serialized under persistMu
+// database write and the in-memory commit are serialized under persistMu
 // and guarded by a revision counter, so a concurrent mutation can never be
 // clobbered by a stale write.
 func (r *routingState) ensureModel(model string) (bool, error) {
@@ -382,11 +407,9 @@ func (r *routingState) ensureModel(model string) (bool, error) {
 
 		// Persist before committing so a failed write leaves no trace, but do
 		// not hold the routing lock during disk I/O.
-		if r.providersPath != "" {
-			if err := writeProvidersFileAtomic(r.providersPath, next); err != nil {
-				r.persistMu.Unlock()
-				return false, fmt.Errorf("add model %s: %w", model, err)
-			}
+		if err := r.persistModelsSnapshot(next); err != nil {
+			r.persistMu.Unlock()
+			return false, fmt.Errorf("add model %s: %w", model, err)
 		}
 
 		r.mu.Lock()
@@ -439,11 +462,9 @@ func (r *routingState) setManualPin(model, provider string) error {
 		r.mu.Unlock()
 
 		// Persist before committing, outside the routing lock.
-		if r.providersPath != "" {
-			if err := writeProvidersFileAtomic(r.providersPath, next); err != nil {
-				r.persistMu.Unlock()
-				return fmt.Errorf("persist manual provider pin: %w", err)
-			}
+		if err := r.persistModelsSnapshot(next); err != nil {
+			r.persistMu.Unlock()
+			return fmt.Errorf("persist manual provider pin: %w", err)
 		}
 
 		r.mu.Lock()
@@ -496,10 +517,8 @@ func (r *routingState) mutateModelConfig(model string, mutate func(*providerConf
 		// already known to refuse it. Losing it costs one rediscovery after a
 		// restart; discarding it costs a failed request now.
 		var persistErr error
-		if r.providersPath != "" {
-			if err := writeProvidersFileAtomic(r.providersPath, next); err != nil {
-				persistErr = fmt.Errorf("persist provider config for %s: %w", model, err)
-			}
+		if err := r.persistModelsSnapshot(next); err != nil {
+			persistErr = fmt.Errorf("persist provider config for %s: %w", model, err)
 		}
 
 		r.mu.Lock()
@@ -549,7 +568,7 @@ func (r *routingState) markBlocked(model, provider, reason string) (bool, error)
 			if entry.Provider != provider {
 				continue
 			}
-			if entry.Reason == reason && entry.fresh(now) {
+			if entry.Reason == reason && blockedFresh(entry, now) {
 				return false
 			}
 			cfg.Blocked[i] = blockedProvider{Provider: provider, Reason: reason, DetectedAt: now}
@@ -856,7 +875,7 @@ func isBlockedLocked(cfg providerConfig, provider string, now time.Time) bool {
 func blockedEntryLocked(cfg providerConfig, provider string, now time.Time) (blockedProvider, bool) {
 	for _, entry := range cfg.Blocked {
 		if entry.Provider == provider {
-			return entry, entry.fresh(now)
+			return entry, blockedFresh(entry, now)
 		}
 	}
 	return blockedProvider{}, false
@@ -997,7 +1016,7 @@ func (r *routingState) restorePins(pins map[string]persistedPin) {
 		}
 		if pin.PinnedAt.IsZero() {
 			// A pin persisted without a timestamp (for example from an older
-			// stats file) would otherwise look expired immediately.
+			// stats.json import) would otherwise look expired immediately.
 			pin.PinnedAt = r.now()
 		}
 		provider, resolved := r.resolveProviderLocked(model, pin.Provider)
@@ -1201,9 +1220,9 @@ func (r *routingState) endpoints(model string) []endpointMeta {
 func (r *routingState) refreshEndpoints(model string, client *http.Client, upstream, apiKey string) {
 	if isAliasModel(model) {
 		// An alias id resolves to a model but exposes no endpoint list of its own,
-		// so this request could never succeed. The guard matches the order refresh
-		// and `orr update`: nothing is fetched, and the alias keeps whatever order
-		// and measurements it already has.
+		// so this request could never succeed. The guard matches the order refresh:
+		// nothing is fetched, and the alias keeps whatever order and measurements it
+		// already has.
 		return
 	}
 	r.mu.Lock()
@@ -1263,7 +1282,7 @@ func (r *routingState) refreshModelOrder(model string, client *http.Client, upst
 		return err
 	}
 	endpoints := compatibleEndpoints(result.Data.Endpoints)
-	endpoints = rankUpdateEndpoints(endpoints, cacheOnly)
+	endpoints = rankEndpoints(endpoints, cacheOnly)
 	if len(endpoints) == 0 {
 		return errors.New("no compatible endpoints")
 	}
@@ -1318,11 +1337,9 @@ func (r *routingState) refreshModelOrder(model string, client *http.Client, upst
 	r.resolvePendingPins(model)
 	// Persist outside the routing lock; a failed write only loses the refresh
 	// until the next one, so log it instead of failing the request.
-	if r.providersPath != "" {
-		if err := writeProvidersFileAtomic(r.providersPath, snapshot); err != nil {
-			log.Printf("persist provider order for %s: %v", model, err)
-			return err
-		}
+	if err := r.persistModelsSnapshot(snapshot); err != nil {
+		log.Printf("persist provider order for %s: %v", model, err)
+		return err
 	}
 	return nil
 }
@@ -1589,10 +1606,8 @@ func (r *routingState) applyProviderTestResultsAtRevision(model string, results 
 	}
 	next[model] = cfg
 	r.mu.Unlock()
-	if r.providersPath != "" {
-		if err := writeProvidersFileAtomic(r.providersPath, next); err != nil {
-			return "", false, fmt.Errorf("persist benchmarked provider order for %s: %w", model, err)
-		}
+	if err := r.persistModelsSnapshot(next); err != nil {
+		return "", false, fmt.Errorf("persist benchmarked provider order for %s: %w", model, err)
 	}
 
 	r.mu.Lock()
@@ -1740,9 +1755,9 @@ func rankSelectableProviders(results []providerTestResult, profile requestProfil
 // rerankAutomaticPin re-selects the automatic pin from measurements already
 // held, under the current speed/price weight. It is what the dashboard's
 // slider drives, so it deliberately does less than a benchmark: no provider
-// order is written to providers.yaml and no model revision is advanced. A
+// order is written to the database and no model revision is advanced. A
 // slider is dialed keystroke by keystroke, and no intermediate position may
-// rewrite the file or cancel a benchmark already in flight. The persisted order
+// rewrite the stored order or cancel a benchmark already in flight. The persisted order
 // catches up on the next benchmark run, while the pin — the provider requests
 // actually follow — moves immediately.
 //
@@ -1971,7 +1986,7 @@ func (r *routingState) launchModelOrderRefresh(model string, client *http.Client
 }
 
 // waitForRefreshes blocks until in-flight provider-order refreshes finish, so
-// shutdown does not race a providers.yaml write.
+// shutdown does not race a database write.
 func (r *routingState) waitForRefreshes() {
 	r.refreshWG.Wait()
 }

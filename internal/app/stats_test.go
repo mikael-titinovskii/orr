@@ -3,9 +3,10 @@ package app
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
+
+	"github.com/mikael-titinovskii/orr/internal/store"
 )
 
 // The startup warm-up asks a different question from the daily schedule: not
@@ -143,17 +144,17 @@ func TestStatsInFlight(t *testing.T) {
 }
 
 func TestStatsSaveLoadRoundTrip(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "orr", "stats.json")
+	db := openTestStore(t)
 	now := time.Now()
 	s := newStats()
 	s.record(requestRecord{Time: now.AddDate(0, 0, -2), Status: 200, PromptTokens: 1_000_000, CompletionTokens: 250_000, Cost: 1.25})
 	s.record(requestRecord{Time: now.AddDate(0, 0, -1), Status: 200, PromptTokens: 2_000_000, CompletionTokens: 500_000, Cost: 2.50})
 	s.record(requestRecord{Time: now, Status: 200, PromptTokens: 3_000_000, CompletionTokens: 750_000, Cost: 3.75})
-	if err := s.save(path); err != nil {
+	if err := s.save(db); err != nil {
 		t.Fatal(err)
 	}
 	loaded := newStats()
-	if err := loaded.load(path); err != nil {
+	if err := loaded.load(db); err != nil {
 		t.Fatal(err)
 	}
 	snap := loaded.snapshot()
@@ -183,14 +184,14 @@ func TestStatsSaveLoadRoundTrip(t *testing.T) {
 // restart. Zero is the trap: it means "price alone" and is a real setting, so a
 // plain omitempty field would drop it and silently restore the default.
 func TestTimeWeightRoundTrip(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "orr", "stats.json")
+	db := openTestStore(t)
 	s := newStats()
 	s.setTimeWeight(benchmarkTimeWeightMin)
-	if err := s.save(path); err != nil {
+	if err := s.save(db); err != nil {
 		t.Fatal(err)
 	}
 	loaded := newStats()
-	if err := loaded.load(path); err != nil {
+	if err := loaded.load(db); err != nil {
 		t.Fatal(err)
 	}
 	if got := loaded.currentTimeWeight(); got != benchmarkTimeWeightMin {
@@ -203,22 +204,22 @@ func TestTimeWeightRoundTrip(t *testing.T) {
 // user has toggled it, so ORR_DEGRADATION can keep seeding every start until
 // then.
 func TestDegradationRoundTripAndSeeding(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "orr", "stats.json")
+	db := openTestStore(t)
 	// A process that never pressed `d` must not freeze the seeded value into the
-	// stats file, or the environment variable could never seed it again.
+	// database, or the environment variable could never seed it again.
 	untouched := newStats()
-	if err := untouched.save(path); err != nil {
+	if err := untouched.save(db); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(path)
+	saved, err := db.LoadStats()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "degradation") {
-		t.Fatalf("an untouched switch was persisted: %s", data)
+	if saved.Degradation != nil {
+		t.Fatalf("an untouched switch was persisted: %v", *saved.Degradation)
 	}
 	seeded := newStats()
-	if err := seeded.load(path); err != nil {
+	if err := seeded.load(db); err != nil {
 		t.Fatal(err)
 	}
 	seeded.seedDegradation(false)
@@ -229,11 +230,11 @@ func TestDegradationRoundTripAndSeeding(t *testing.T) {
 	// After a press, the saved switch is the last word.
 	pressed := newStats()
 	pressed.setDegradation(false)
-	if err := pressed.save(path); err != nil {
+	if err := pressed.save(db); err != nil {
 		t.Fatal(err)
 	}
 	loaded := newStats()
-	if err := loaded.load(path); err != nil {
+	if err := loaded.load(db); err != nil {
 		t.Fatal(err)
 	}
 	if loaded.degradationEnabled() {
@@ -250,25 +251,31 @@ func TestDegradationRoundTripAndSeeding(t *testing.T) {
 	}
 }
 
-// A file written before the field existed, and a hand-edited value outside what
-// the slider can express, both land on a position the control can show.
+// A value outside what the slider can express, however it reached the database,
+// lands on a position the control can show.
 func TestTimeWeightLoadDefaultsAndClamps(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "stats.json")
 	for _, test := range []struct {
-		name string
-		body string
-		want float64
+		name       string
+		timeWeight float64
+		saved      bool
+		want       float64
 	}{
-		{"absent", `{"version":1}`, defaultBenchmarkTimeWeight},
-		{"out of range", `{"version":1,"time_weight":9}`, benchmarkTimeWeightMax},
-		{"off a stop", `{"version":1,"time_weight":1.4}`, 1},
+		{"absent", 0, false, defaultBenchmarkTimeWeight},
+		{"out of range", 9, true, benchmarkTimeWeightMax},
+		{"off a stop", 1.4, true, 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if err := os.WriteFile(path, []byte(test.body), 0o600); err != nil {
+			db := openTestStore(t)
+			saved := store.Stats{}
+			if test.saved {
+				weight := test.timeWeight
+				saved.TimeWeight = &weight
+			}
+			if err := db.SaveStats(saved); err != nil {
 				t.Fatal(err)
 			}
 			loaded := newStats()
-			if err := loaded.load(path); err != nil {
+			if err := loaded.load(db); err != nil {
 				t.Fatal(err)
 			}
 			if got := loaded.currentTimeWeight(); got != test.want {
@@ -279,15 +286,15 @@ func TestTimeWeightLoadDefaultsAndClamps(t *testing.T) {
 }
 
 func TestCreditSpendRoundTripKeepsCurrentMonth(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "orr", "stats.json")
+	db := openTestStore(t)
 	s := newStats()
 	s.updateKeyInfo(12.5, true, 75, "monthly")
-	if err := s.save(path); err != nil {
+	if err := s.save(db); err != nil {
 		t.Fatal(err)
 	}
 
 	loaded := newStats()
-	if err := loaded.load(path); err != nil {
+	if err := loaded.load(db); err != nil {
 		t.Fatal(err)
 	}
 	if got := loaded.snapshot().CreditSpend; got != 12.5 {
@@ -399,14 +406,14 @@ func TestMetricsRecordsSurviveGeneralHistoryLimit(t *testing.T) {
 }
 
 func TestAutoPinSurvivesRestartAndManualPinWins(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "orr", "stats.json")
+	db := openTestStore(t)
 	auto := newStats()
 	auto.setAutoPin("moonshotai/kimi-k3", "fireworks")
-	if err := auto.save(path); err != nil {
+	if err := auto.save(db); err != nil {
 		t.Fatal(err)
 	}
 	loaded := newStats()
-	if err := loaded.load(path); err != nil {
+	if err := loaded.load(db); err != nil {
 		t.Fatal(err)
 	}
 	pins := loaded.providerPinsSnapshot()
@@ -418,16 +425,16 @@ func TestAutoPinSurvivesRestartAndManualPinWins(t *testing.T) {
 
 func TestBenchmarkRunDateSurvivesRestart(t *testing.T) {
 	const model = "moonshotai/kimi-k3"
-	path := filepath.Join(t.TempDir(), "orr", "stats.json")
+	db := openTestStore(t)
 	now := time.Now()
 	original := newStats()
 	original.markBenchmarkRun(model, now)
-	if err := original.save(path); err != nil {
+	if err := original.save(db); err != nil {
 		t.Fatal(err)
 	}
 
 	loaded := newStats()
-	if err := loaded.load(path); err != nil {
+	if err := loaded.load(db); err != nil {
 		t.Fatal(err)
 	}
 	if !loaded.benchmarkRanToday(model, now) {
@@ -501,14 +508,14 @@ func TestStatsPersistsTheRecoveryCooldown(t *testing.T) {
 	s := newStats()
 	s.now = func() time.Time { return now }
 	s.markRecoveryRun(model, now)
-	path := filepath.Join(t.TempDir(), "stats.json")
-	if err := s.save(path); err != nil {
+	db := openTestStore(t)
+	if err := s.save(db); err != nil {
 		t.Fatal(err)
 	}
 
 	loaded := newStats()
 	loaded.now = func() time.Time { return now }
-	if err := loaded.load(path); err != nil {
+	if err := loaded.load(db); err != nil {
 		t.Fatal(err)
 	}
 	if got := loaded.recoveryLastRun(model); !got.Equal(now) {
@@ -523,8 +530,8 @@ func TestStatsPersistsTheRecoveryCooldown(t *testing.T) {
 	}
 }
 
-// A stats file written before the recovery cooldown existed must still load: the
-// field is additive, and a missing one means "no cooldown yet", not a decode
+// A stats file written before the recovery cooldown existed must still import:
+// the field is additive, and a missing one means "no cooldown yet", not a decode
 // error that would cost the user their spend and pin history on upgrade.
 func TestStatsLoadsWithoutRecoveryRuns(t *testing.T) {
 	const model = "author/model"
@@ -541,10 +548,18 @@ func TestStatsLoadsWithoutRecoveryRuns(t *testing.T) {
 	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	db := openTestStore(t)
+	imported, err := db.ImportLegacyStats(path)
+	if err != nil {
+		t.Fatalf("legacy stats file did not import: %v", err)
+	}
+	if !imported {
+		t.Fatal("legacy stats file was not imported")
+	}
 	s := newStats()
 	s.now = func() time.Time { return now }
-	if err := s.load(path); err != nil {
-		t.Fatalf("legacy stats file did not load: %v", err)
+	if err := s.load(db); err != nil {
+		t.Fatalf("imported stats did not load: %v", err)
 	}
 	if !s.benchmarkedWithin(model, now, 2*time.Hour) {
 		t.Fatal("legacy benchmark run was not restored")
@@ -555,8 +570,19 @@ func TestStatsLoadsWithoutRecoveryRuns(t *testing.T) {
 	if got := s.recoveryLastRun(model); !got.IsZero() {
 		t.Fatalf("absent recovery_runs reported a cooldown: %v", got)
 	}
-	// The file can be written back in the new shape without losing anything.
-	if err := s.save(filepath.Join(t.TempDir(), "saved.json")); err != nil {
+	// The state can be written back in the new shape without losing anything.
+	if err := s.save(db); err != nil {
 		t.Fatalf("stats with a legacy history did not save: %v", err)
+	}
+	reloaded := newStats()
+	reloaded.now = func() time.Time { return now }
+	if err := reloaded.load(db); err != nil {
+		t.Fatal(err)
+	}
+	if !reloaded.benchmarkedWithin(model, now, 2*time.Hour) {
+		t.Fatal("saved benchmark run was lost")
+	}
+	if pin := reloaded.providerPinsSnapshot()[model]; pin.Provider != "pinned" {
+		t.Fatalf("reloaded pin = %#v, want pinned", pin)
 	}
 }

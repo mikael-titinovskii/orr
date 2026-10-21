@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/mikael-titinovskii/orr/internal/store"
 )
 
 var creditPollInterval = 5 * time.Minute
@@ -129,7 +131,7 @@ func pollCredits(ctx context.Context, client *http.Client, upstream, apiKey stri
 	}
 }
 
-func saveStatsPeriodically(ctx context.Context, s *stats, path string, done chan<- struct{}) {
+func saveStatsPeriodically(ctx context.Context, s *stats, db *store.Store, done chan<- struct{}) {
 	defer close(done)
 	ticker := time.NewTicker(statsSaveInterval)
 	defer ticker.Stop()
@@ -138,7 +140,7 @@ func saveStatsPeriodically(ctx context.Context, s *stats, path string, done chan
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := s.save(path); err != nil {
+			if err := s.save(db); err != nil {
 				log.Printf("periodic stats save: %v", err)
 			}
 		}

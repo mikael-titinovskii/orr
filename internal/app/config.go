@@ -2,18 +2,16 @@ package app
 
 import (
 	"bufio"
-	"bytes"
 	"errors"
 	"fmt"
 	"math"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"github.com/mikael-titinovskii/orr/internal/store"
 )
 
 type config struct {
@@ -33,7 +31,8 @@ type config struct {
 	DegradationMinSamples      int
 	DegradationCooldown        time.Duration
 	DegradationTimeout         time.Duration
-	providersPath              string
+	db                         *store.Store
+	dbPath                     string
 	preferEnvFile              bool
 }
 
@@ -50,31 +49,11 @@ const (
 	defaultDegradationTimeout    = 10 * time.Second
 )
 
-type providersFile struct {
-	Version int                       `yaml:"version"`
-	Models  map[string]providerConfig `yaml:"models"`
-}
+// providerConfig is the routing configuration the application works with; the
+// store owns its definition and its persistence.
+type providerConfig = store.Model
 
-const providersFileVersion = 1
-
-type providerConfig struct {
-	Order             []string  `json:"order,omitempty" yaml:"order,omitempty"`
-	Only              []string  `json:"only,omitempty" yaml:"only,omitempty"`
-	Ignore            []string  `json:"ignore,omitempty" yaml:"ignore,omitempty"`
-	AllowFallbacks    *bool     `json:"allow_fallbacks,omitempty" yaml:"allow_fallbacks,omitempty"`
-	RequireParameters *bool     `json:"require_parameters,omitempty" yaml:"require_parameters,omitempty"`
-	DataCollection    string    `json:"data_collection,omitempty" yaml:"data_collection,omitempty"`
-	ZDR               *bool     `json:"zdr,omitempty" yaml:"zdr,omitempty"`
-	Sort              string    `json:"sort,omitempty" yaml:"sort,omitempty"`
-	ManualPin         string    `json:"-" yaml:"manual_pin,omitempty"`
-	UpdatedAt         time.Time `json:"-" yaml:"updated_at,omitempty"`
-	// Blocked are the providers OpenRouter refuses to route to for this
-	// account, discovered from a routing refusal. It is orr's own bookkeeping
-	// and never part of the upstream provider block, hence `json:"-"`.
-	Blocked []blockedProvider `json:"-" yaml:"blocked,omitempty"`
-}
-
-func (p providerConfig) hasRouting() bool {
+func hasRouting(p providerConfig) bool {
 	return len(p.Order) > 0 || len(p.Only) > 0 || len(p.Ignore) > 0 || p.AllowFallbacks != nil ||
 		p.RequireParameters != nil || p.DataCollection != "" || p.ZDR != nil || p.Sort != ""
 }
@@ -197,54 +176,17 @@ func loadConfigWithOptions(envPath string, preferEnvFile bool) (config, error) {
 	}
 	cfg.OpenRouterAPIKey = value("OPENROUTER_API_KEY")
 
-	providersPath := configuredProvidersPathWithOptions(envPath, fileEnv, preferEnvFile)
-	providerData, providerErr := os.ReadFile(providersPath)
-	if errors.Is(providerErr, os.ErrNotExist) {
-		if err := writeProvidersFileAtomic(providersPath, map[string]providerConfig{}); err != nil {
-			return config{}, err
-		}
-		providerData, providerErr = os.ReadFile(providersPath)
+	cfg.Models = make(map[string]providerConfig)
+	dbPath, err := configuredDBPathWithOptions(envPath, fileEnv, preferEnvFile)
+	if err != nil {
+		return config{}, fmt.Errorf("locate database: %w", err)
 	}
-	if providerErr != nil {
-		return config{}, fmt.Errorf("read providers file %s: %w", providersPath, providerErr)
-	}
-	var saved providersFile
-	decoder := yaml.NewDecoder(bytes.NewReader(providerData))
-	decoder.KnownFields(true)
-	if err := decoder.Decode(&saved); err != nil {
-		return config{}, fmt.Errorf("parse providers file %s: %w", providersPath, err)
-	}
-	if saved.Version != providersFileVersion {
-		return config{}, fmt.Errorf("unsupported providers file version %d (expected %d)", saved.Version, providersFileVersion)
-	}
-	cfg.Models = saved.Models
-	if cfg.Models == nil {
-		cfg.Models = make(map[string]providerConfig)
-	}
-	cfg.providersPath = providersPath
+	cfg.dbPath = dbPath
 
 	if err := cfg.validate(); err != nil {
 		return config{}, fmt.Errorf("invalid config: %w", err)
 	}
 	return cfg, nil
-}
-
-// configuredProvidersPath resolves the providers file without loading or
-// creating it. Commands such as reset need the same environment precedence as
-// serve while leaving the file untouched until they intentionally act on it.
-func configuredProvidersPath(envPath string, fileEnv map[string]string) string {
-	return configuredProvidersPathWithOptions(envPath, fileEnv, false)
-}
-
-func configuredProvidersPathWithOptions(envPath string, fileEnv map[string]string, preferEnvFile bool) string {
-	providersPath := envValue(fileEnv, "ORR_PROVIDERS_FILE", preferEnvFile)
-	if providersPath == "" {
-		providersPath = "providers.yaml"
-	}
-	if !filepath.IsAbs(providersPath) {
-		providersPath = filepath.Join(filepath.Dir(envPath), providersPath)
-	}
-	return filepath.Clean(providersPath)
 }
 
 func readDotEnv(path string) (map[string]string, error) {
@@ -385,16 +327,23 @@ func (c config) validate() error {
 	if c.DegradationTimeout <= 0 {
 		return fmt.Errorf("ORR_DEGRADATION_TIMEOUT must be positive")
 	}
-	for model, provider := range c.Models {
+	return validateModels(c.Models)
+}
+
+// validateModels rejects stored routing values the upstream API would refuse, so
+// a hand-edited row fails at startup instead of turning every request for that
+// model into a 400.
+func validateModels(models map[string]providerConfig) error {
+	for model, provider := range models {
 		parts := strings.SplitN(model, "/", 2)
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 			return fmt.Errorf("model %q must use author/model format", model)
 		}
 		if provider.DataCollection != "" && provider.DataCollection != "allow" && provider.DataCollection != "deny" {
-			return fmt.Errorf("models.%s.data_collection must be allow or deny", model)
+			return fmt.Errorf("model %s: data_collection must be allow or deny", model)
 		}
 		if provider.Sort != "" && provider.Sort != "price" && provider.Sort != "throughput" && provider.Sort != "latency" {
-			return fmt.Errorf("models.%s.sort must be price, throughput, or latency", model)
+			return fmt.Errorf("model %s: sort must be price, throughput, or latency", model)
 		}
 	}
 	return nil

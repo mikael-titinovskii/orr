@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/mikael-titinovskii/orr/internal/app"
+	"github.com/mikael-titinovskii/orr/internal/store"
 )
 
 func TestVersionCommand(t *testing.T) {
@@ -51,21 +52,24 @@ func TestUnknownCommandFails(t *testing.T) {
 
 func TestResetCommandRemovesStateAndPreservesConfiguration(t *testing.T) {
 	root := t.TempDir()
-	providersPath := filepath.Join(root, "state", "providers.yaml")
-	statsPath := filepath.Join(root, "orr", "stats.json")
+	dbPath := filepath.Join(root, "state", "orr.db")
 	envPath := filepath.Join(root, ".env")
-	dotenv := "OPENROUTER_API_KEY=do-not-print\nORR_PROVIDERS_FILE=state/providers.yaml\n"
-	for path, contents := range map[string]string{
-		providersPath: "version: 1\nmodels: {}\n",
-		statsPath:     `{"version":1}`,
-		envPath:       dotenv,
-	} {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
-			t.Fatal(err)
-		}
+	dotenv := "OPENROUTER_API_KEY=do-not-print\nORR_DB_FILE=state/orr.db\n"
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open seeded database: %v", err)
+	}
+	if err := db.SaveModels(map[string]store.Model{"author/one": {}}); err != nil {
+		t.Fatalf("seed models: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close seeded database: %v", err)
+	}
+	if err := os.WriteFile(envPath, []byte(dotenv), 0o600); err != nil {
+		t.Fatal(err)
 	}
 
 	command := exec.Command(orrBinary, "reset", "--env", envPath)
@@ -78,7 +82,7 @@ func TestResetCommandRemovesStateAndPreservesConfiguration(t *testing.T) {
 	if strings.Contains(string(output), "do-not-print") {
 		t.Fatalf("reset output exposed dotenv contents: %s", output)
 	}
-	for _, path := range []string{providersPath, statsPath} {
+	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("reset left generated state at %s: %v", path, err)
 		}

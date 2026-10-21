@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/mikael-titinovskii/orr/internal/store"
 )
 
 // A provider can be unroutable for this account without being unhealthy. The
@@ -25,18 +27,14 @@ import (
 const blockedProviderTTL = 24 * time.Hour
 
 // blockedProvider is one provider OpenRouter refused to route to, recorded per
-// model in the providers file so a restart does not spend a client request
+// model in the database so a restart does not spend a client request
 // rediscovering it.
-type blockedProvider struct {
-	Provider   string    `yaml:"provider"`
-	Reason     string    `yaml:"reason,omitempty"`
-	DetectedAt time.Time `yaml:"detected_at,omitempty"`
-}
+type blockedProvider = store.Blocked
 
-// fresh reports whether the refusal is recent enough to still act on. An entry
-// without a timestamp is treated as fresh so a hand-written providers file can
-// block a provider permanently.
-func (b blockedProvider) fresh(now time.Time) bool {
+// blockedFresh reports whether the refusal is recent enough to still act on. An
+// entry without a timestamp is treated as fresh so a refusal recorded before
+// timestamps existed blocks a provider permanently.
+func blockedFresh(b blockedProvider, now time.Time) bool {
 	return b.DetectedAt.IsZero() || now.Sub(b.DetectedAt) < blockedProviderTTL
 }
 
@@ -227,7 +225,7 @@ func blockedSet(cfg providerConfig, now time.Time) map[string]blockedProvider {
 	}
 	set := make(map[string]blockedProvider, len(cfg.Blocked))
 	for _, entry := range cfg.Blocked {
-		if entry.Provider != "" && entry.fresh(now) {
+		if entry.Provider != "" && blockedFresh(entry, now) {
 			set[entry.Provider] = entry
 		}
 	}

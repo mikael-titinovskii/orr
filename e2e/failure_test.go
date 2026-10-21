@@ -4,13 +4,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
 const e2eGuardrailBody = `{"error":{"code":404,"metadata":{"input_endpoint_count":1,"ineligibility_reasons":[{"reason":"zdr-violation-by-guardrail"}],"failed_routing_step":"Filter by Guardrails"}}}`
@@ -97,22 +95,7 @@ models:
 		t.Fatalf("first request attempts = %v, want %v", firstAttempts, want)
 	}
 
-	data, err := os.ReadFile(orr.providersPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var saved struct {
-		Models map[string]struct {
-			Order   []string `yaml:"order"`
-			Blocked []struct {
-				Provider string `yaml:"provider"`
-			} `yaml:"blocked"`
-		} `yaml:"models"`
-	}
-	if err := yaml.Unmarshal(data, &saved); err != nil {
-		t.Fatalf("parse persisted providers: %v\n%s", err, data)
-	}
-	model := saved.Models["author/model"]
+	model := persistedModels(t, orr.dbPath)["author/model"]
 	if len(model.Order) != 3 || model.Order[0] != "healthy" || len(model.Blocked) != 2 {
 		t.Fatalf("persisted refusal state = %+v", model)
 	}
@@ -173,7 +156,7 @@ func TestDailyBenchmarkSelectsHealthyProviderWhenAnotherFails(t *testing.T) {
 	// not warmed at startup, and the request itself rides the stored order while
 	// the run happens behind it.
 	postCompletion(t, orr.baseURL, "trigger the benchmark")
-	waitForPersistedOrder(t, orr.providersPath, "healthy", "broken")
+	waitForPersistedOrder(t, orr, "healthy", "broken")
 	// Requests that raced the run are not the ones under test.
 	for len(live) > 0 {
 		<-live
@@ -208,13 +191,10 @@ func TestDailyBenchmarkAllFailuresKeepPreviousWinner(t *testing.T) {
 	// Every benchmark failed, so the refreshed catalog order retains the
 	// previous winner and its head becomes the automatic pin.
 	assertStrictPin(t, <-live, "original")
-	waitForPersistedOrder(t, orr.providersPath, "original", "backup")
-	persisted, err := os.ReadFile(orr.providersPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if original := strings.Index(string(persisted), "- original"); original < 0 || strings.Index(string(persisted), "- backup") < original {
-		t.Fatalf("all-failure benchmark replaced previous order:\n%s", persisted)
+	waitForPersistedOrder(t, orr, "original", "backup")
+	persisted := persistedModels(t, orr.dbPath)["author/model"]
+	if order := persisted.Order; len(order) < 2 || order[0] != "original" || order[1] != "backup" {
+		t.Fatalf("all-failure benchmark replaced previous order: %v", order)
 	}
 }
 
@@ -283,19 +263,13 @@ func TestMalformedCatalogLeavesProviderFileAndOrderIntact(t *testing.T) {
 	defer upstream.Close()
 
 	orr := startServer(t, upstream.URL+"/api/v1", providers)
-	before, err := os.ReadFile(orr.providersPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	before := persistedModels(t, orr.dbPath)["author/model"]
 	postCompletion(t, orr.baseURL, "malformed catalog")
 	routing := <-live
 	assertStrictPin(t, routing, "original")
-	after, err := os.ReadFile(orr.providersPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(after) != string(before) {
-		t.Fatalf("malformed catalog changed providers file:\nbefore:\n%s\nafter:\n%s", before, after)
+	after := persistedModels(t, orr.dbPath)["author/model"]
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("malformed catalog changed routing state:\nbefore: %+v\nafter:  %+v", before, after)
 	}
 }
 

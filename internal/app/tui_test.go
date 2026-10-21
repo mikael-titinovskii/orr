@@ -1243,7 +1243,7 @@ func TestClearingOnlyManualPinReturnsToDiscoveryMode(t *testing.T) {
 		t.Fatalf("pin after clear = %q manual=%v, want discovery mode", provider, manual)
 	}
 	cfg, _ := routing.modelConfig(model)
-	if cfg.ManualPin != "" || cfg.hasRouting() {
+	if cfg.ManualPin != "" || hasRouting(cfg) {
 		t.Fatalf("config after clear = %+v, want empty routing awaiting discovery", cfg)
 	}
 

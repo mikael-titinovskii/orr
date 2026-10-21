@@ -3,7 +3,9 @@
 /orr.exe~
 /dist/
 /.env
-/providers.yaml
+/orr.db
+/orr.db-wal
+/orr.db-shm
 /.idea/
 *.test
 /orr.log

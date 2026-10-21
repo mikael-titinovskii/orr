@@ -16,19 +16,35 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mikael-titinovskii/orr/internal/store"
 	"golang.org/x/term"
 )
 
 func serve(cfg config) error {
+	path := cfg.dbPath
+	db, err := store.Open(path)
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+	if err := importLegacyStats(db, path); err != nil {
+		return err
+	}
+	models, err := db.Models()
+	if err != nil {
+		return fmt.Errorf("load models: %w", err)
+	}
+	if err := validateModels(models); err != nil {
+		return fmt.Errorf("invalid stored routing configuration: %w", err)
+	}
+	cfg.Models = models
+	cfg.db = db
+
 	p, err := newProxy(cfg)
 	if err != nil {
 		return err
 	}
-	path, err := statsFilePath()
-	if err != nil {
-		return fmt.Errorf("locate stats file: %w", err)
-	}
-	if err := p.stats.load(path); err != nil {
+	if err := p.stats.load(db); err != nil {
 		return fmt.Errorf("load stats: %w", err)
 	}
 	p.routing.restorePins(p.stats.providerPinsSnapshot())
@@ -64,7 +80,7 @@ func serve(cfg config) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	statsDone := make(chan struct{})
-	go saveStatsPeriodically(ctx, p.stats, path, statsDone)
+	go saveStatsPeriodically(ctx, p.stats, db, statsDone)
 	go pollCredits(ctx, &http.Client{Timeout: 20 * time.Second}, cfg.Upstream, cfg.openRouterKey(), p.stats)
 	go prefetchEndpoints(ctx, p)
 
@@ -115,7 +131,7 @@ func serve(cfg config) error {
 	api.wg.Wait()
 	p.routing.waitForRefreshes()
 	p.waitForDailyBenchmarks()
-	saveErr := p.stats.save(path)
+	saveErr := p.stats.save(db)
 	if err != nil {
 		return err
 	}
@@ -134,11 +150,11 @@ func prefetchEndpoints(ctx context.Context, p *proxy) {
 	}
 }
 
-// openServeLog creates the log file the TUI mode writes to, next to the stats
-// file. The standard logger is redirected there so log writes cannot corrupt
-// the alternate-screen dashboard.
-func openServeLog(statsPath string) (*os.File, error) {
-	dir := filepath.Dir(statsPath)
+// openServeLog creates the log file the TUI mode writes to, next to the
+// database. The standard logger is redirected there so log writes cannot
+// corrupt the alternate-screen dashboard.
+func openServeLog(dbPath string) (*os.File, error) {
+	dir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
