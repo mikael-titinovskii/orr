@@ -233,6 +233,12 @@ after provider-specific 429s or an unavailable endpoint. The recovery benchmark 
 failure starts is held to a 30-second cooldown per model, saved in the database,
 so a restart does not hand the same failing provider a fresh run.
 
+A conversation that replays encrypted reasoning can only continue on the
+provider that produced it. When the automatic pin has moved since, orr retries
+that request once on the producing provider and leaves the pin where it is. With
+a manual pin, OpenRouter's error reaches the client unchanged. In both cases the
+error is not counted against the pinned provider.
+
 Measurement follows the models clients ask for. A request for a model whose last
 measurement is more than five minutes old starts one catalog refresh and one
 provider benchmark for that model, in the background while the request itself

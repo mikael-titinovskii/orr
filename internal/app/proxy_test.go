@@ -1425,6 +1425,109 @@ func TestUnavailableManualProviderRemainsPinned(t *testing.T) {
 	}
 }
 
+func encryptedContentBody(creator string) string {
+	return `{"error":{"message":"Your request contains encrypted reasoning or compaction content that can only be processed by the provider that created it (` + creator + `), but your request's provider.only preference excludes that provider. Allow ` + creator + ` or start a new conversation without the encrypted items.","code":400}}`
+}
+
+func newEncryptedContentProxy(t *testing.T, models map[string]providerConfig, attempts *[]string) *proxy {
+	t.Helper()
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.Models = models
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.stopDailyBenchmarks()
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		provider := routingOnly(body)[0]
+		*attempts = append(*attempts, provider)
+		if provider != "azure/eu" {
+			return response(http.StatusBadRequest, encryptedContentBody("azure/eu")), nil
+		}
+		return response(http.StatusOK, `{"id":"ok"}`), nil
+	})
+	return p
+}
+
+func TestEncryptedContentRetriesOnCreatingProviderWithoutMovingAutomaticPin(t *testing.T) {
+	const model = "author/model"
+	var attempts []string
+	p := newEncryptedContentProxy(t, map[string]providerConfig{model: {
+		Order:     []string{"bedrock", "azure/eu"},
+		UpdatedAt: time.Now(),
+	}}, &attempts)
+
+	req, _ := http.NewRequest(http.MethodPost, "http://proxy.test/v1/responses", strings.NewReader(`{"model":"author/model","input":[]}`))
+	res := newMemoryResponseWriter()
+	p.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("response = %d, want retried success: %s", res.Code, res.Body.String())
+	}
+	if want := []string{"bedrock", "azure/eu"}; !equalSlices(attempts, want) {
+		t.Fatalf("attempts = %v, want %v", attempts, want)
+	}
+	if provider := p.routing.pinnedProvider(model); provider != "bedrock" {
+		t.Fatalf("automatic pin = %q, want bedrock", provider)
+	}
+	if rates := providerAPIErrorRates(p.stats.snapshot().Records, model, time.Now()); rates["bedrock"] != 0 || rates["azure/eu"] != 0 {
+		t.Fatalf("API error rates = %v, want no errors", rates)
+	}
+}
+
+func TestEncryptedContentKeepsManualPinAndSparesItsErrorRate(t *testing.T) {
+	const model = "author/model"
+	var attempts []string
+	p := newEncryptedContentProxy(t, map[string]providerConfig{model: {
+		Order:     []string{"bedrock", "azure/eu"},
+		ManualPin: "bedrock",
+		UpdatedAt: time.Now(),
+	}}, &attempts)
+
+	req, _ := http.NewRequest(http.MethodPost, "http://proxy.test/v1/responses", strings.NewReader(`{"model":"author/model","input":[]}`))
+	res := newMemoryResponseWriter()
+	p.ServeHTTP(res, req)
+	if res.Code != http.StatusBadRequest || len(attempts) != 1 {
+		t.Fatalf("manual response = %d after %v, want 400 after one attempt", res.Code, attempts)
+	}
+	if rates := providerAPIErrorRates(p.stats.snapshot().Records, model, time.Now()); rates["bedrock"] != 0 {
+		t.Fatalf("bedrock API error rate = %v, want none", rates["bedrock"])
+	}
+}
+
+func TestEncryptedContentKeepsClientRoutingWithoutPin(t *testing.T) {
+	const model = "author/model"
+	var attempts []string
+	p := newEncryptedContentProxy(t, map[string]providerConfig{model: {UpdatedAt: time.Now()}}, &attempts)
+
+	req, _ := http.NewRequest(http.MethodPost, "http://proxy.test/v1/responses", strings.NewReader(`{"model":"author/model","input":[],"provider":{"only":["bedrock"]}}`))
+	res := newMemoryResponseWriter()
+	p.ServeHTTP(res, req)
+	if res.Code != http.StatusBadRequest || !equalSlices(attempts, []string{"bedrock"}) {
+		t.Fatalf("response = %d after %v, want 400 after one bedrock attempt", res.Code, attempts)
+	}
+}
+
+func TestEncryptedContentRetryPreservesJSONNumbers(t *testing.T) {
+	const model = "author/model"
+	var attempts []string
+	p := newEncryptedContentProxy(t, map[string]providerConfig{model: {
+		Order:     []string{"bedrock", "azure/eu"},
+		UpdatedAt: time.Now(),
+	}}, &attempts)
+	if !p.routing.ensureAutoPin(model, "bedrock") {
+		t.Fatal("automatic pin was not created")
+	}
+
+	retry := p.encryptedContentRetry([]byte(`{"model":"author/model","tools":[{"enum":[9007199254740993]}]}`), model, "bedrock", "azure/eu")
+	if !strings.Contains(string(retry), "9007199254740993") {
+		t.Fatalf("retry body = %s, want the client's number unchanged", retry)
+	}
+}
+
 func TestGeneric404DoesNotFailOverAutomaticProvider(t *testing.T) {
 	const model = "author/model"
 	cfg := testConfig("https://upstream.test/api/v1")
