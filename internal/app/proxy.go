@@ -299,6 +299,22 @@ func (p *proxy) forward(w http.ResponseWriter, incoming *http.Request) (requestR
 		// The body is left open: unless the request is re-routed below, its
 		// remainder is streamed to the client after the drained prefix.
 		errorBody, _ = io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		if creator, ok := parseEncryptedContentProvider(errorBody); resp.StatusCode == http.StatusBadRequest && ok {
+			retry := p.encryptedContentRetry(modified, record.Model, record.Provider, creator)
+			if retry == nil {
+				// The conversation's history, not the selected provider, caused
+				// this, so it must not count against that provider's health.
+				record.Provider = ""
+				break
+			}
+			resp.Body.Close()
+			modified = retry
+			namedEndpoints = 1
+			body = bytes.NewReader(modified)
+			record.Provider = creator
+			errorBody = nil
+			continue
+		}
 		refusal, blocked := parseBlockedReason(errorBody)
 		if !blocked {
 			attributable := namedEndpoints == 1 && record.Model != "" && record.Provider != ""
@@ -740,6 +756,37 @@ func (p *proxy) runAutomaticBenchmark(model string, refreshDone <-chan struct{},
 	}
 	p.applyProviderTestResults(model, completed, revision)
 	release()
+}
+
+// encryptedContentRetry re-pins body to creator only when orr's automatic pin, not the user, chose the refused provider.
+func (p *proxy) encryptedContentRetry(body []byte, model, selected, creator string) []byte {
+	if body == nil || creator == selected {
+		return nil
+	}
+	if pinned, manual := p.routing.pinInfo(model); manual || pinned == "" || pinned != selected {
+		return nil
+	}
+	var payload map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if decoder.Decode(&payload) != nil {
+		return nil
+	}
+	provider, _ := payload["provider"].(map[string]any)
+	if provider == nil {
+		provider = map[string]any{}
+	}
+	delete(provider, "order")
+	provider["only"] = []string{creator}
+	provider["allow_fallbacks"] = false
+	payload["provider"] = provider
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	if encoder.Encode(payload) != nil {
+		return nil
+	}
+	return buf.Bytes()
 }
 
 // observeProviderFailure maintains one bounded consecutive-429 counter per

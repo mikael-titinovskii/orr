@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"encoding/json"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -95,6 +96,22 @@ func parseProviderUnavailable(body []byte) bool {
 		}
 	}
 	return false
+}
+
+var encryptedContentProviderPattern = regexp.MustCompile(`(?i)can only be processed by the provider that created it \(([^()\s]+)\)`)
+
+// parseEncryptedContentProvider reports the provider whose encrypted reasoning the request replays but provider.only excludes.
+func parseEncryptedContentProvider(body []byte) (string, bool) {
+	for _, candidate := range errorCandidates(body) {
+		var envelope openRouterErrorEnvelope
+		if json.Unmarshal(candidate, &envelope) != nil {
+			continue
+		}
+		if match := encryptedContentProviderPattern.FindStringSubmatch(envelope.Error.Message); match != nil {
+			return match[1], true
+		}
+	}
+	return "", false
 }
 
 // blockedRefusal is OpenRouter declining to route a request on policy grounds.
