@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -356,6 +357,70 @@ func TestRestoredProviderPinIsActiveAndListed(t *testing.T) {
 	}
 }
 
+// A loop is recorded as its shape — flags and counts — and nothing else. The
+// repetition itself never enters the record, so it can never reach a saved stat
+// or a dashboard cell, and a request that answered normally keeps every loop
+// field at its zero value, which is what lets the log stay blank for it.
+func TestLoopRecordSurvivesSnapshotWithoutText(t *testing.T) {
+	now := time.Date(2026, time.October, 18, 12, 0, 0, 0, time.UTC)
+	s := newStats()
+	s.now = func() time.Time { return now }
+	s.record(requestRecord{Time: now, Model: "author/model", Provider: "provider", Status: 200})
+	s.record(requestRecord{
+		Time: now, Model: "author/model", Provider: "provider", Status: 200,
+		Loop: true, LoopAborted: true, LoopRecovered: true, LoopPeriod: 12, LoopRepeat: 40,
+	})
+
+	snap := s.snapshot()
+	normal, looped := snap.Records[0], snap.Records[1]
+	if normal.Loop || normal.LoopAborted || normal.LoopRecovered || normal.LoopPeriod != 0 || normal.LoopRepeat != 0 {
+		t.Fatalf("an ordinary request carries loop state: %#v", normal)
+	}
+	if !looped.Loop || !looped.LoopAborted || !looped.LoopRecovered || looped.LoopPeriod != 12 || looped.LoopRepeat != 40 {
+		t.Fatalf("snapshot lost the loop's shape: %#v", looped)
+	}
+	if !snap.Last.Loop || snap.Last.LoopRepeat != 40 {
+		t.Fatalf("snapshot's last record lost the loop: %#v", snap.Last)
+	}
+
+	// Only the request's own identifiers may be text in the record; every field
+	// the loop path adds is a flag or a count.
+	data, err := json.Marshal(looped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	text := make(map[string]bool)
+	for key, value := range fields {
+		if _, ok := value.(string); ok {
+			text[key] = true
+		}
+	}
+	for _, identifier := range []string{"time", "method", "path", "model", "provider", "reasoning_effort"} {
+		if !text[identifier] {
+			t.Fatalf("record lost its %q identifier: %s", identifier, data)
+		}
+		delete(text, identifier)
+	}
+	if len(text) > 0 {
+		t.Fatalf("loop record carries text beyond the request's identifiers: %v in %s", text, data)
+	}
+	for key, want := range map[string]any{
+		"loop":           true,
+		"loop_aborted":   true,
+		"loop_recovered": true,
+		"loop_period":    float64(12),
+		"loop_repeat":    float64(40),
+	} {
+		if got, ok := fields[key]; !ok || got != want {
+			t.Fatalf("%s = %v (present %v), want %v: %s", key, got, ok, want, data)
+		}
+	}
+}
+
 func TestStatsRingBuffer(t *testing.T) {
 	s := newStats()
 	for i := 0; i < maxRequestRecords+5; i++ {
@@ -366,19 +431,45 @@ func TestStatsRingBuffer(t *testing.T) {
 	}
 }
 
+func TestMetricsRingPrunesAtItsOwnCapSlack(t *testing.T) {
+	now := time.Now()
+	s := newStats()
+	s.now = func() time.Time { return now }
+	// Every record is inside the metrics TTL, so only the cap can trim them.
+	for i := 0; i < maxMetricsRecords+maxMetricsRecords/recordPruneMarginDivisor+1; i++ {
+		s.record(requestRecord{
+			Time: now.Add(time.Duration(i) * time.Millisecond), Model: "author/model", Provider: "provider", Status: 200,
+		})
+	}
+	if got := len(s.snapshot().MetricsRecords); got != maxMetricsRecords {
+		t.Fatalf("metrics records = %d, want %d after crossing the ring's own slack", got, maxMetricsRecords)
+	}
+}
+
 func TestWindowRecordsRetainEightHourSpendWindow(t *testing.T) {
 	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
 	s := newStats()
+	// A full ring of expired records, plus one inside the window, appended past
+	// the prune margin so the prune that drops the expired ones keeps it.
 	s.windowRecords = make([]requestRecord, maxWindowRecords)
 	s.windowRecords[0] = requestRecord{Time: now.Add(-2 * time.Hour)}
-	s.record(requestRecord{Time: now})
+	appended := 0
+	margin := maxWindowRecords / recordPruneMarginDivisor
+	for ; appended <= margin; appended++ {
+		s.record(requestRecord{Time: now})
+	}
 
 	windowRecords := s.snapshot().WindowRecords
-	if len(windowRecords) != 2 {
-		t.Fatalf("window records = %d, want the 2h-old and current records", len(windowRecords))
+	if len(windowRecords) != appended+1 {
+		t.Fatalf("window records = %d, want the 2h-old and %d current records", len(windowRecords), appended)
 	}
 	if !windowRecords[0].Time.Equal(now.Add(-2 * time.Hour)) {
 		t.Fatalf("2h-old spend record was pruned: %#v", windowRecords)
+	}
+	for i, record := range windowRecords[1:] {
+		if !record.Time.Equal(now) {
+			t.Fatalf("expired record at %d survived the prune: %#v", i+1, record)
+		}
 	}
 }
 

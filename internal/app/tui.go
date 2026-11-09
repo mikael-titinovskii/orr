@@ -69,6 +69,22 @@ type providerTestBatchMsg struct {
 	revision uint64
 }
 
+// defaultProviderMsg carries the provider OpenRouter's default routing chose for
+// a model, from the `O` probe. err is set when the probe could not complete.
+type defaultProviderMsg struct {
+	model    string
+	provider string
+	err      error
+	testedAt time.Time
+}
+
+// providerDefaultPick is one model's remembered `O` probe result: the endpoint
+// tag OpenRouter's default routing chose, and when it was probed.
+type providerDefaultPick struct {
+	provider string
+	testedAt time.Time
+}
+
 // modelCatalogMsg carries the upstream model catalog the `k` picker searches.
 type modelCatalogMsg struct {
 	models []catalogModel
@@ -94,30 +110,77 @@ type dashboardModel struct {
 	checkDegradation func(model string)
 	testProvider     func(model, provider string) (providerTestSample, error)
 	testAllProviders func(model string, providers []string) []providerTestResult
-	testResults      map[string]providerTestMsg
-	testing          map[string]bool
-	allTesting       map[string]map[string]bool
-	allTestRevisions map[string]uint64
-	snap             statsSnapshot
-	snapVersion      uint64
-	haveSnap         bool
-	stopwatch        *stopwatchState
-	releaseUpdate    string
-	checkRelease     func() (string, error)
-	fetchQuality     func(model string) (providerQualityCache, error)
-	quality          map[string]map[string]providerQuality
-	qualityFetchedAt map[string]time.Time
-	qualityRetryAt   map[string]time.Time
-	qualityLoading   map[string]bool
+	// defaultProviderProbe runs the `O` probe: it asks OpenRouter which provider
+	// its default routing picks when no sort or order is requested.
+	defaultProviderProbe func(model string) (string, error)
+	testResults          map[string]providerTestMsg
+	testing              map[string]bool
+	allTesting           map[string]map[string]bool
+	allTestRevisions     map[string]uint64
+	defaultPicks         map[string]providerDefaultPick
+	defaultTesting       map[string]bool
+	snap                 statsSnapshot
+	snapVersion          uint64
+	haveSnap             bool
+	stopwatch            *stopwatchState
+	releaseUpdate        string
+	checkRelease         func() (string, error)
+	fetchQuality         func(model string) (providerQualityCache, error)
+	quality              map[string]map[string]providerQuality
+	qualityFetchedAt     map[string]time.Time
+	qualityRetryAt       map[string]time.Time
+	qualityLoading       map[string]bool
 	// watchedModels are the models added with `k`. They stay on the tab list
 	// without traffic, so a model nothing has requested yet can be inspected.
 	watchedModels []string
 	// closedModels holds the tabs closed with `x`, with the time of the close.
 	// A closed model returns to the list only on a request that completes
 	// afterwards, which is what brings back a model with traffic in flight.
-	closedModels map[string]time.Time
-	picker       modelPicker
-	fetchCatalog func() ([]catalogModel, error)
+	closedModels      map[string]time.Time
+	picker            modelPicker
+	fetchCatalog      func() ([]catalogModel, error)
+	logLines          string
+	logVersion        uint64
+	logWidth          int
+	logValid          bool
+	testExpiryVersion uint64
+	// testExpiryStale forces the expiry scan after a probe result is inserted:
+	// the probe can finish behind a record the last scan already saw.
+	testExpiryStale bool
+	// frames is a pointer because View runs on a copy of the dashboard.
+	frames *frameCache
+}
+
+// frameCache memoizes the panels that aggregate the whole window ring, which
+// holds thousands of records once orr has been up for a while.
+type frameCache struct {
+	spend   panelCache
+	history panelCache
+}
+
+// panelCache is keyed by the second too, because the spend windows are read
+// against the clock.
+type panelCache struct {
+	valid   bool
+	version uint64
+	width   int
+	height  int
+	second  int64
+	text    string
+}
+
+func (c *panelCache) hit(version uint64, width, height int, second int64) (string, bool) {
+	if c == nil || !c.valid || c.version != version || c.width != width || c.height != height || c.second != second {
+		return "", false
+	}
+	return c.text, true
+}
+
+func (c *panelCache) store(version uint64, width, height int, second int64, text string) {
+	if c == nil {
+		return
+	}
+	c.valid, c.version, c.width, c.height, c.second, c.text = true, version, width, height, second, text
 }
 
 var (
@@ -219,6 +282,8 @@ func newDashboard(cfg config, stats *stats, routing *routingState) dashboardMode
 		testing:          make(map[string]bool),
 		allTesting:       make(map[string]map[string]bool),
 		allTestRevisions: make(map[string]uint64),
+		defaultPicks:     make(map[string]providerDefaultPick),
+		defaultTesting:   make(map[string]bool),
 		stopwatch:        newStopwatch(),
 		checkRelease:     checkForReleaseUpdate,
 		quality:          make(map[string]map[string]providerQuality),
@@ -226,6 +291,7 @@ func newDashboard(cfg config, stats *stats, routing *routingState) dashboardMode
 		qualityRetryAt:   make(map[string]time.Time),
 		qualityLoading:   make(map[string]bool),
 		closedModels:     make(map[string]time.Time),
+		frames:           &frameCache{},
 	}
 	if upstream, err := url.Parse(cfg.Upstream); err == nil && upstream.Scheme == "https" && upstream.Host == "openrouter.ai" {
 		client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
@@ -344,6 +410,7 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		key := testResultKey(msg.model, msg.provider)
 		delete(m.testing, key)
 		m.testResults[key] = msg
+		m.testExpiryStale = true
 		if pending := m.allTesting[msg.model]; pending != nil {
 			delete(pending, msg.provider)
 			if len(pending) == 0 {
@@ -397,6 +464,7 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				testedAt: msg.testedAt,
 			}
 		}
+		m.testExpiryStale = true
 		msg.results = m.selectionResults(msg.model, msg.results, msg.testedAt)
 		profile, apiErrs := m.selectionProfile(msg.model, msg.testedAt)
 		best, autoUpdated, err := m.routing.applyProviderTestResultsAtRevision(msg.model, msg.results, profile, msg.revision, apiErrs)
@@ -419,6 +487,15 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.model == m.model {
 			m.selectActiveProvider(m.currentSnap())
 		}
+	case defaultProviderMsg:
+		delete(m.defaultTesting, msg.model)
+		if msg.err != nil {
+			// The probe is an aside; a failure leaves the table without the `o`
+			// mark rather than interrupting the dashboard.
+			log.Printf("probe default provider for %s: %v", msg.model, msg.err)
+			break
+		}
+		m.defaultPicks[msg.model] = providerDefaultPick{provider: msg.provider, testedAt: msg.testedAt}
 	case modelCatalogMsg:
 		m.picker.loading = false
 		m.picker.err = msg.err
@@ -566,6 +643,14 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(cmds) > 0 {
 				return m, tea.Batch(cmds...)
 			}
+		case "O":
+			// Probe OpenRouter's default routing: send one ping with no sort or
+			// order and mark the provider its router would have used.
+			if m.model == "" || m.defaultProviderProbe == nil || m.defaultTesting[m.model] {
+				break
+			}
+			m.defaultTesting[m.model] = true
+			return m, m.defaultProviderCmd()
 		case "o":
 			// Cycle the table's display order. Only the rows move: the routing
 			// order requests follow, the pin, and the stored order stay as they
@@ -744,10 +829,17 @@ func (m *dashboardModel) expireClosedTabs(snap statsSnapshot, now time.Time) {
 // request for the same (model, provider) has since superseded. Without this,
 // pressing `t` or `a` would pin the measured column to its value for the
 // full 30-minute TTL and ignore live P50 from incoming requests.
+//
+// Only new records can supersede a result, so the scan runs once per snapshot,
+// plus once after a result is inserted.
 func (m *dashboardModel) expireTestResults(snap statsSnapshot) {
 	if len(m.testResults) == 0 {
 		return
 	}
+	if !m.testExpiryStale && m.testExpiryVersion == m.snapVersion {
+		return
+	}
+	m.testExpiryStale, m.testExpiryVersion = false, m.snapVersion
 	latest := make(map[string]time.Time, len(m.testResults))
 	for _, record := range snap.MetricsRecords {
 		key := testResultKey(record.Model, record.Provider)
@@ -850,7 +942,11 @@ func (m dashboardModel) providers() []string {
 func (m *dashboardModel) refreshLog() {
 	m.resize()
 	snap := m.currentSnap()
-	m.viewport.SetContent(renderLogRows(snap.Records, m.viewport.Width))
+	if !m.logValid || m.logVersion != m.snapVersion || m.logWidth != m.viewport.Width {
+		m.logLines = renderLogRows(snap.Records, m.viewport.Width)
+		m.logVersion, m.logWidth, m.logValid = m.snapVersion, m.viewport.Width, true
+	}
+	m.viewport.SetContent(m.logLines)
 	if m.autoScroll {
 		m.viewport.GotoBottom()
 	}
@@ -875,7 +971,7 @@ func renderLogRows(records []requestRecord, width int) string {
 	for _, record := range records {
 		cells := []string{
 			record.Time.Local().Format("15:04:05"),
-			shorten(record.Model, modelWidth),
+			logModelText(record, modelWidth),
 			shorten(record.Provider, providerWidth),
 			logReasoningText(record),
 			fmt.Sprintf("%d", record.Status),
@@ -997,7 +1093,7 @@ func logRowForeground(record requestRecord) lipgloss.TerminalColor {
 func renderCompactLogRows(records []requestRecord, width int) string {
 	lines := make([]string, 0, len(records)*2)
 	for _, record := range records {
-		first := shorten(fmt.Sprintf("%s  %d  %s  $%.4f", record.Time.Local().Format("15:04:05"), record.Status, logDurationText(record.Duration), record.Cost), width)
+		first := shorten(fmt.Sprintf("%s%s  %d  %s  $%.4f", record.Time.Local().Format("15:04:05"), logLoopSuffix(record), record.Status, logDurationText(record.Duration), record.Cost), width)
 		second := shorten(fmt.Sprintf("%s / %s  %s  %s  %s  %s  %s  %s  %s  %s  %s  %s", record.Model, record.Provider, logReasoningText(record), logTokenValue(record.PromptTokens), logUncachedText(record), logTokenValue(record.CompletionTokens), logThroughputText(record), logThinkPercentText(record), logLatencyText(record), logCacheReadText(record), logCacheWriteText(record), logCachePercentText(record)), width)
 		if record.apiError() {
 			first = errorStyle.Render(first)
@@ -1006,6 +1102,58 @@ func renderCompactLogRows(records []requestRecord, width int) string {
 		lines = append(lines, first, second)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// logLoopMarks are what a request's loop state earns. The mark itself says the
+// response repeated; the suffix says what orr did about it, because a loop it
+// only noticed and a loop it cut are different news to the person reading the
+// log.
+const (
+	loopMarkDetected  = "↺"
+	loopMarkAborted   = "↺!"
+	loopMarkRecovered = "↺+"
+)
+
+// logLoopMarker returns the mark for record's loop state, or blank for the
+// overwhelming majority of requests that answered normally. A recovered loop
+// reports as recovered even when it was also cut short: the spliced continuation
+// is what the client ended up with.
+func logLoopMarker(record requestRecord) string {
+	switch {
+	case record.LoopRecovered:
+		return loopMarkRecovered
+	case record.LoopAborted:
+		return loopMarkAborted
+	case record.Loop:
+		return loopMarkDetected
+	}
+	return ""
+}
+
+// logLoopSuffix puts the mark on a line, with the separating space it needs.
+func logLoopSuffix(record requestRecord) string {
+	if marker := logLoopMarker(record); marker != "" {
+		return " " + marker
+	}
+	return ""
+}
+
+// logModelText renders the Model cell, giving up the cell's own padding to a
+// loop mark when the request has one. The mark rides here rather than in a
+// column of its own because the log table is a fixed grid that fills the pane
+// exactly at its narrowest width: a new column would move every metric after it
+// on rows that never looped. A normal request therefore renders exactly as it
+// did before the mark existed.
+func logModelText(record requestRecord, width int) string {
+	marker := logLoopMarker(record)
+	if marker == "" {
+		return shorten(record.Model, width)
+	}
+	room := width - lipgloss.Width(marker) - 1
+	if room < 1 {
+		return shorten(marker, width)
+	}
+	return shorten(record.Model, room) + " " + marker
 }
 
 func logTokenValue(tokens int) string {
@@ -1135,7 +1283,7 @@ func (m dashboardModel) View() string {
 	// borders) so all three top panels end at the same row.
 	expensesColumnHeight := expensesTopHeight + expensesBottomHeight + 6
 
-	expensesContent := renderExpenses(snap, now, max(1, expensesWidth-2), expensesTopHeight)
+	expensesContent := m.cachedExpenses(snap, now, max(1, expensesWidth-2), expensesTopHeight)
 
 	expensesTop := panelStyle.Width(expensesWidth).Height(expensesTopHeight + 2).Render(expensesContent)
 
@@ -1145,7 +1293,7 @@ func (m dashboardModel) View() string {
 	// extra cell from an odd column width goes to the Stopwatch side.
 	historyHalfWidth := max(1, (expensesWidth-2)/2)
 	stopwatchHalfWidth := max(1, expensesWidth-2-historyHalfWidth)
-	historyPane := panelStyle.Width(historyHalfWidth).Height(expensesBottomHeight + 2).Render(renderHistoryPerDay(snap, now, historyContentWidth(m.width)))
+	historyPane := panelStyle.Width(historyHalfWidth).Height(expensesBottomHeight + 2).Render(m.cachedHistory(snap, now, historyContentWidth(m.width), expensesBottomHeight))
 	stopwatchPane := panelStyle.Width(stopwatchHalfWidth).Height(expensesBottomHeight + 2).Render(m.stopwatch.render(stopwatchContentWidth(m.width), expensesBottomHeight, now))
 	expensesBottom := lipgloss.JoinHorizontal(lipgloss.Top, historyPane, stopwatchPane)
 	expenses := lipgloss.JoinVertical(lipgloss.Left, expensesTop, expensesBottom)
@@ -1161,7 +1309,7 @@ func (m dashboardModel) View() string {
 	}
 	logTitle += "  " + renderKeyHints([]keyHint{{"PgUp/PgDn", "scroll"}, {"q", "quit"}}, max(1, m.width-8))
 	if m.releaseUpdate != "" {
-		logTitle += releaseUpdateStyle.Render(" • " + m.releaseUpdate + " available run ./orr upgrade")
+		logTitle += releaseUpdateStyle.Render(" • " + m.releaseUpdate + " available run orr upgrade")
 	}
 	logWidth := max(1, m.width-4)
 	logView := overlayWatermark(m.viewport.View(), logWidth)
@@ -1172,6 +1320,36 @@ func (m dashboardModel) View() string {
 		return overlayCenter(view, m.renderPicker(m.width, m.height), m.width, m.height)
 	}
 	return view
+}
+
+// cachedExpenses renders the Recent spend table at most once per second, since
+// it aggregates every record in the window ring.
+func (m dashboardModel) cachedExpenses(snap statsSnapshot, now time.Time, width, maxHeight int) string {
+	second := now.Unix()
+	if m.frames != nil {
+		if text, ok := m.frames.spend.hit(m.snapVersion, width, maxHeight, second); ok {
+			return text
+		}
+	}
+	text := renderExpenses(snap, now, width, maxHeight)
+	if m.frames != nil {
+		m.frames.spend.store(m.snapVersion, width, maxHeight, second, text)
+	}
+	return text
+}
+
+func (m dashboardModel) cachedHistory(snap statsSnapshot, now time.Time, width, height int) string {
+	second := now.Unix()
+	if m.frames != nil {
+		if text, ok := m.frames.history.hit(m.snapVersion, width, height, second); ok {
+			return text
+		}
+	}
+	text := renderHistoryPerDay(snap, now, width)
+	if m.frames != nil {
+		m.frames.history.store(m.snapVersion, width, height, second, text)
+	}
+	return text
 }
 
 // renderExpenses renders the Expenses panel capped at maxHeight lines: the
@@ -1557,6 +1735,7 @@ func (m dashboardModel) renderRouting(snap statsSnapshot, width, height int) str
 		{"r", "reload provider list"},
 		{"t", "test provider"},
 		{"a", "test all"},
+		{"O", "openrouter default"},
 	}
 	// Each name on the line follows the same split: a dim label, then the value
 	// it names at the terminal's full brightness, the way the prediction line
@@ -1780,6 +1959,28 @@ func (m dashboardModel) testResultFor(model, provider string) (providerTestMsg, 
 		return providerTestMsg{}, false
 	}
 	return r, true
+}
+
+// defaultProviderCmd launches the `O` probe and returns the command that
+// delivers the provider OpenRouter's default routing chose.
+func (m dashboardModel) defaultProviderCmd() tea.Cmd {
+	model := m.model
+	probe := m.defaultProviderProbe
+	return func() tea.Msg {
+		provider, err := probe(model)
+		return defaultProviderMsg{model: model, provider: provider, err: err, testedAt: m.routing.now()}
+	}
+}
+
+// defaultPickFor returns the provider the `O` probe recorded for model, if the
+// result is still fresh. It expires with the measured metrics so the mark does
+// not outlive the evidence behind it.
+func (m dashboardModel) defaultPickFor(model string) (string, bool) {
+	pick, ok := m.defaultPicks[model]
+	if !ok || m.routing.now().Sub(pick.testedAt) > measuredMetricsTTL {
+		return "", false
+	}
+	return pick.provider, true
 }
 
 // noScore marks a metric with no data for a provider; such cells render unstyled.
@@ -2365,6 +2566,11 @@ func (m dashboardModel) renderProviderTableData(data providerTableData, width, h
 			}
 		}
 		label := marker + " " + provider
+		if pick, ok := m.defaultPickFor(m.model); ok && pick == provider {
+			// The `O` probe found this is the provider OpenRouter's default
+			// routing would have used, if orr had not constrained the request.
+			label += " o"
+		}
 		block, isBlocked := blocked[provider]
 		if isBlocked {
 			// A blocked provider is broken for this account no matter how
@@ -2485,6 +2691,11 @@ func (m dashboardModel) renderCompactProviderTable(providers []string, endpoints
 			}
 		}
 		label := marker + " " + provider
+		if pick, ok := m.defaultPickFor(m.model); ok && pick == provider {
+			// The `O` probe found this is the provider OpenRouter's default
+			// routing would have used, if orr had not constrained the request.
+			label += " o"
+		}
 		block, isBlocked := blocked[provider]
 		if isBlocked {
 			label = errorStyle.Render(label + " ⊘ " + shortBlockReason(block.Reason))
@@ -3012,13 +3223,15 @@ func formatCost(cost float64) string {
 }
 
 func renderRecentExpenses(snap statsSnapshot, width int, now time.Time, maxHeight int) string {
-	const minimumRecentSpend = 1.0
+	const minimumRecentSpend = 0.01
 	spendWindows := []time.Duration{time.Minute, 10 * time.Minute, time.Hour, spendWindowRetention}
 	sortWindows := []time.Duration{spendWindowRetention, time.Hour, 10 * time.Minute, time.Minute}
 	records := snapshotWindowRecords(snap)
 
+	// Eligibility reads the widest column's window: a group is shown when its
+	// 8h spend clears the floor, not when the last hour alone does.
 	totals := make(map[providerGroupKey]float64)
-	cutoff := now.Add(-diagnosticWindows[len(diagnosticWindows)-1])
+	cutoff := now.Add(-spendWindowRetention)
 	for _, record := range records {
 		if !record.Time.Before(cutoff) {
 			totals[providerGroupKey{model: record.Model, provider: record.Provider}] += record.Cost

@@ -74,10 +74,36 @@ func localOrrRepository(ctx context.Context) string {
 	return ""
 }
 
+// gitEnv keeps the background check from prompting. GIT_TERMINAL_PROMPT covers
+// git; BatchMode covers ssh, which otherwise reads a key passphrase from the
+// terminal over the dashboard. An operator's own ssh selection is left alone:
+// GIT_SSH_COMMAND overrides both GIT_SSH and core.sshCommand, and either may be
+// what makes ssh work for the repository being fetched.
+func gitEnv(directory string) []string {
+	env := append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if !sshSelected(directory) {
+		env = append(env, "GIT_SSH_COMMAND=ssh -o BatchMode=yes")
+	}
+	return env
+}
+
+// sshSelected reports whether the operator chose the ssh transport themselves.
+func sshSelected(directory string) bool {
+	if os.Getenv("GIT_SSH_COMMAND") != "" || os.Getenv("GIT_SSH") != "" {
+		return true
+	}
+	args := []string{"config", "--get", "core.sshCommand"}
+	if directory != "" {
+		args = append([]string{"-C", directory}, args...)
+	}
+	output, err := exec.Command("git", args...).Output()
+	return err == nil && strings.TrimSpace(string(output)) != ""
+}
+
 func gitOutput(ctx context.Context, directory string, args ...string) (string, error) {
 	command := exec.CommandContext(ctx, "git", args...)
 	command.Dir = directory
-	command.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	command.Env = gitEnv(directory)
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
 	output, err := command.Output()

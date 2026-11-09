@@ -13,6 +13,12 @@ import (
 const maxRequestRecords = 200
 const maxMetricsRecords = 5000
 const maxWindowRecords = 10000
+
+// recordPruneMarginDivisor sizes each ring's slack above its own cap: a prune
+// scans the whole ring, so the slack amortizes that scan over the appends that
+// refill it.
+const recordPruneMarginDivisor = 8
+
 const measuredMetricsTTL = 30 * time.Minute
 const spendWindowRetention = 8 * time.Hour
 
@@ -60,6 +66,24 @@ type requestRecord struct {
 	// status normally, while internally recovered attempts stay out of the
 	// client-facing request record.
 	RateLimited bool `json:"-"`
+	// Loop marks a response that degenerated into a repetition loop: from some
+	// point on the completion kept repeating the same unit of text instead of
+	// answering. Only the shape of the repetition is recorded, never the
+	// repeated text itself, so nothing a model generated can reach a log, the
+	// dashboard, or a saved stat through these fields.
+	Loop bool `json:"loop,omitempty"`
+	// LoopAborted marks a loop orr cut: the stream was stopped there rather
+	// than passing the rest of the repetition to the client.
+	LoopAborted bool `json:"loop_aborted,omitempty"`
+	// LoopRecovered marks a loop orr cut and then spliced a continuation over,
+	// so the client still received a complete answer.
+	LoopRecovered bool `json:"loop_recovered,omitempty"`
+	// LoopPeriod is the length in bytes of the repeating unit and LoopRepeat
+	// is how many times it repeated. They stand apart from the booleans so the
+	// log can tell a two-word tic from a runaway essay without holding either
+	// the text or a copy of it.
+	LoopPeriod int `json:"loop_period,omitempty"`
+	LoopRepeat int `json:"loop_repeat,omitempty"`
 	// ProviderUnavailable marks OpenRouter reporting that the single selected
 	// endpoint no longer serves the model. Like RateLimited, it is routing-only
 	// evidence and is never persisted.
@@ -375,12 +399,10 @@ func (s *stats) record(record requestRecord) {
 		}
 	}
 	s.windowRecords = append(s.windowRecords, record)
-	// Prune lazily, only when a slice crosses its cap, so the hot path stays
-	// O(1) until the caps are reached.
-	if len(s.metricsRecords) > maxMetricsRecords {
+	if len(s.metricsRecords) > maxMetricsRecords+maxMetricsRecords/recordPruneMarginDivisor {
 		s.metricsRecords = pruneRecords(s.metricsRecords, record.Time.Add(-measuredMetricsTTL), maxMetricsRecords)
 	}
-	if len(s.windowRecords) > maxWindowRecords {
+	if len(s.windowRecords) > maxWindowRecords+maxWindowRecords/recordPruneMarginDivisor {
 		s.windowRecords = pruneRecords(s.windowRecords, record.Time.Add(-spendWindowRetention), maxWindowRecords)
 	}
 	day := record.Time.Local().Format(time.DateOnly)
@@ -417,7 +439,9 @@ func pruneRecords(records []requestRecord, cutoff time.Time, cap int) []requestR
 		}
 	}
 	if len(kept) > cap {
-		kept = append([]requestRecord(nil), kept[len(kept)-cap:]...)
+		// Drop the oldest in place; a fresh slice would allocate the ring on every prune.
+		copy(records[:cap], kept[len(kept)-cap:])
+		kept = records[:cap]
 	}
 	return kept
 }

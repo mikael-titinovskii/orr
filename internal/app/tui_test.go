@@ -257,6 +257,7 @@ func TestRenderExpensesIncludesRecentSpendTable(t *testing.T) {
 			{Time: now.Add(-2 * time.Minute), Model: "aggregate/model", Provider: "many-small", Cost: 0.6000},
 			{Time: now.Add(-3 * time.Minute), Model: "aggregate/model", Provider: "many-small", Cost: 0.6000},
 			{Time: now.Add(-3 * time.Minute), Model: "cheap/model", Provider: "low-spend", Cost: 0.9999},
+			{Time: now.Add(-4 * time.Minute), Model: "dust/model", Provider: "dust-provider", Cost: 0.0040},
 			{Time: now.Add(-61 * time.Minute), Model: "moonshotai/kimi-k3", Provider: "fireworks", Cost: 0.9000},
 		},
 	}
@@ -294,11 +295,14 @@ func TestRenderExpensesIncludesRecentSpendTable(t *testing.T) {
 	if strings.Contains(got, "$0.9000") {
 		t.Fatalf("older-than-60m cost leaked into table:\n%s", got)
 	}
-	if strings.Contains(got, "cheap/model") || strings.Contains(got, "low-spend") {
-		t.Fatalf("sub-$1 spend row was not filtered:\n%s", got)
+	if !strings.Contains(got, "cheap/model") || !strings.Contains(got, "$0.9999") {
+		t.Fatalf("spend above the one-cent floor was filtered out:\n%s", got)
+	}
+	if strings.Contains(got, "dust/model") || strings.Contains(got, "dust-provider") {
+		t.Fatalf("sub-one-cent spend row was not filtered:\n%s", got)
 	}
 	if !strings.Contains(got, "aggregate/model") || !strings.Contains(got, "many-small") || !strings.Contains(got, "$1.2000") {
-		t.Fatalf("aggregated spend above $1 was filtered out:\n%s", got)
+		t.Fatalf("aggregated spend above the floor was filtered out:\n%s", got)
 	}
 	moonshot := strings.Index(got, "moonshotai/kimi-k3")
 	aggregate := strings.Index(got, "aggregate/model")
@@ -345,6 +349,108 @@ func TestRenderRecentExpensesUsesWindowBufferForEightHours(t *testing.T) {
 	got := renderRecentExpenses(snap, 80, now, 100)
 	if !strings.Contains(got, "$3.0000") {
 		t.Fatalf("8h spend did not use the rolling-window buffer:\n%s", got)
+	}
+}
+
+func TestRenderRecentExpensesKeepsSpendIdleForAnHour(t *testing.T) {
+	now := time.Date(2026, time.August, 29, 12, 0, 0, 0, time.UTC)
+	var records []requestRecord
+	for i := 0; i < 4; i++ {
+		records = append(records, requestRecord{
+			Time:     now.Add(-time.Duration(2+i) * time.Hour),
+			Model:    "idle/model",
+			Provider: "provider",
+			Cost:     1,
+			Status:   200,
+		})
+	}
+	got := renderRecentExpenses(statsSnapshot{WindowRecords: records}, 80, now, 100)
+	if !strings.Contains(got, "idle/model") || !strings.Contains(got, "$4.0000") {
+		t.Fatalf("spend older than 60m but inside 8h was filtered out:\n%s", got)
+	}
+}
+
+func TestCachedExpensesRerendersWhenTheSnapshotChanges(t *testing.T) {
+	now := time.Date(2026, time.August, 29, 12, 0, 0, 0, time.UTC)
+	stats := newStats()
+	stats.now = func() time.Time { return now }
+	routing := newRoutingState(nil, time.Hour)
+	routing.now = func() time.Time { return now }
+	dashboard := newDashboard(config{}, stats, routing)
+
+	stats.record(requestRecord{Time: now, Model: "author/model", Provider: "provider", Status: 200, Cost: 1})
+	dashboard.syncModel()
+	before := dashboard.cachedExpenses(dashboard.currentSnap(), now, 60, 20)
+	if !strings.Contains(before, "$1.0000") {
+		t.Fatalf("first snapshot spend missing:\n%s", before)
+	}
+	stats.record(requestRecord{Time: now, Model: "author/model", Provider: "provider", Status: 200, Cost: 2})
+	dashboard.syncModel()
+	after := dashboard.cachedExpenses(dashboard.currentSnap(), now, 60, 20)
+	if !strings.Contains(after, "$3.0000") {
+		t.Fatalf("cached spend survived a new snapshot:\n%s", after)
+	}
+}
+
+func TestCachedExpensesRerendersOnResize(t *testing.T) {
+	now := time.Date(2026, time.August, 29, 12, 0, 0, 0, time.UTC)
+	stats := newStats()
+	stats.now = func() time.Time { return now }
+	routing := newRoutingState(nil, time.Hour)
+	routing.now = func() time.Time { return now }
+	dashboard := newDashboard(config{}, stats, routing)
+	stats.record(requestRecord{Time: now, Model: "author/model", Provider: "provider", Status: 200, Cost: 1})
+	dashboard.syncModel()
+
+	narrow := dashboard.cachedExpenses(dashboard.currentSnap(), now, 40, 20)
+	wide := dashboard.cachedExpenses(dashboard.currentSnap(), now, 90, 20)
+	if narrow == wide {
+		t.Fatalf("panel rendered for one width was reused for another:\n%s", wide)
+	}
+}
+
+func TestExpireTestResultsChecksResultsInsertedAfterTheScan(t *testing.T) {
+	now := time.Now()
+	stats := newStats()
+	stats.now = func() time.Time { return now }
+	routing := newRoutingState(nil, time.Hour)
+	routing.now = func() time.Time { return now }
+	dashboard := newDashboard(config{}, stats, routing)
+	stats.record(requestRecord{Time: now.Add(-2 * time.Minute), Model: "author/model", Provider: "recorded", Status: 200})
+	insertResult := func(provider string, testedAt time.Time) {
+		next, _ := dashboard.Update(providerTestMsg{
+			model: "author/model", provider: provider, tps: 10, testedAt: testedAt,
+		})
+		dashboard = next.(dashboardModel)
+	}
+	// One scan runs with a result already cached, which is what arms the gate.
+	insertResult("probe", now)
+	dashboard.syncModel()
+
+	// This probe finished before the recorded request but reports afterwards,
+	// so no new snapshot arrives to trigger another scan.
+	insertResult("recorded", now.Add(-3*time.Minute))
+	dashboard.syncModel()
+	if _, ok := dashboard.testResultFor("author/model", "recorded"); ok {
+		t.Fatalf("probe result superseded by an earlier record survived the scan")
+	}
+}
+
+func TestLogRefreshShowsRecordsArrivedSinceTheLastRender(t *testing.T) {
+	stats := newStats()
+	routing := newRoutingState(nil, time.Hour)
+	dashboard := newDashboard(config{}, stats, routing)
+	dashboard.width, dashboard.height = 120, 40
+	dashboard.syncModel()
+	dashboard.refreshLog()
+	if strings.Contains(dashboard.viewport.View(), "author/model") {
+		t.Fatalf("empty log already shows a model:\n%s", dashboard.viewport.View())
+	}
+	stats.record(requestRecord{Time: time.Now(), Model: "author/model", Provider: "provider", Status: 200, PromptTokens: 12})
+	dashboard.syncModel()
+	dashboard.refreshLog()
+	if !strings.Contains(dashboard.viewport.View(), "author/model") {
+		t.Fatalf("record arrived after the previous render never reached the log:\n%s", dashboard.viewport.View())
 	}
 }
 
@@ -603,6 +709,148 @@ func TestRenderLogTableFitsRequestedWidth(t *testing.T) {
 	}
 }
 
+// A request that answered normally must render as it did before the loop mark
+// existed: no mark anywhere, and every column exactly where it was.
+func TestRenderLogRowsMarkLoopsWithoutMovingColumns(t *testing.T) {
+	const width = 200
+	base := requestRecord{
+		Time:     time.Date(2026, time.October, 18, 12, 0, 0, 0, time.UTC),
+		Model:    "moonshotai/kimi-k3",
+		Provider: "fireworks",
+		Status:   200,
+		Duration: 1250 * time.Millisecond,
+		Cost:     0.0123,
+	}
+	row := func(record requestRecord) string {
+		t.Helper()
+		return ansi.Strip(renderLogRows([]requestRecord{record}, width))
+	}
+	normal := row(base)
+	if strings.Contains(normal, loopMarkDetected) {
+		t.Fatalf("a normal request rendered a loop mark:\n%s", normal)
+	}
+	if !strings.Contains(normal, "moonshotai/kimi-k3") || !strings.Contains(normal, "fireworks") {
+		t.Fatalf("a normal request lost its identifiers:\n%s", normal)
+	}
+
+	for _, variant := range []struct {
+		name string
+		// mark is the whole loop cell, so a marker that merely shares a glyph
+		// with another state cannot pass for it.
+		mark   string
+		record requestRecord
+	}{
+		{"detected", loopMarkDetected, func() requestRecord {
+			looped := base
+			looped.Loop, looped.LoopPeriod, looped.LoopRepeat = true, 12, 40
+			return looped
+		}()},
+		{"aborted", loopMarkAborted, func() requestRecord {
+			looped := base
+			looped.Loop, looped.LoopAborted, looped.LoopPeriod, looped.LoopRepeat = true, true, 12, 40
+			return looped
+		}()},
+		{"recovered", loopMarkRecovered, func() requestRecord {
+			looped := base
+			looped.Loop, looped.LoopRecovered, looped.LoopPeriod, looped.LoopRepeat = true, true, 12, 40
+			return looped
+		}()},
+	} {
+		t.Run(variant.name, func(t *testing.T) {
+			marked := row(variant.record)
+			if got := logLoopMarker(variant.record); got != variant.mark {
+				t.Fatalf("logLoopMarker = %q, want %q", got, variant.mark)
+			}
+			if !strings.Contains(marked, variant.mark) {
+				t.Fatalf("looped row is missing the %q mark:\n%s", variant.mark, marked)
+			}
+			// The mark lives inside the Model cell, so the row keeps its width and
+			// every column after it keeps its place.
+			if got, want := lipgloss.Width(marked), lipgloss.Width(normal); got != want {
+				t.Fatalf("looped row width = %d, want the unmarked row's %d:\n%s", got, want, marked)
+			}
+			// Columns are compared in cells, not bytes: the mark itself is one cell
+			// but three bytes, which no cell offset should notice.
+			column := func(row, cell string) int {
+				index := strings.Index(row, cell)
+				if index < 0 {
+					t.Fatalf("row is missing %q:\n%s", cell, row)
+				}
+				return ansi.StringWidth(row[:index])
+			}
+			for _, cell := range []string{"fireworks", "$0.0123"} {
+				if got, want := column(marked, cell), column(normal, cell); got != want {
+					t.Fatalf("column %q starts at %d in the looped row, want %d:\n%s\n%s", cell, got, want, marked, normal)
+				}
+			}
+		})
+	}
+
+	// Nothing is held back on a row that did not loop: a model name that fills
+	// its whole column still renders in full, and only a looped row gives cells
+	// up to the mark.
+	modelWidth, _, _, _, _, _, _, _, _, _, _, _, _, _, _ := logTableWidths(width)
+	full := strings.Repeat("m", modelWidth)
+	filled := base
+	filled.Model = full
+	if got := row(filled); !strings.Contains(got, full) {
+		t.Fatalf("a normal row truncated the model that fills its column:\n%s", got)
+	}
+	filled.Loop = true
+	if got := row(filled); strings.Contains(got, full) || !strings.Contains(got, loopMarkDetected) {
+		t.Fatalf("a looped row kept a full-width model or lost its mark:\n%s", got)
+	}
+}
+
+// The mark has to survive the layouts that have less room for it: the narrow
+// fallback and every width the wide table can be drawn at.
+func TestRenderLogRowsKeepLoopedRowsInsideThePane(t *testing.T) {
+	record := requestRecord{
+		Time:        time.Date(2026, time.October, 18, 12, 0, 0, 0, time.UTC),
+		Model:       "a/very/long/model/name/that/fills/its/column",
+		Provider:    "provider-name-that-is-long",
+		Status:      200,
+		Loop:        true,
+		LoopAborted: true,
+		LoopPeriod:  4,
+		LoopRepeat:  99,
+	}
+	for width := logTableMinWidth; width <= 260; width++ {
+		row := ansi.Strip(renderLogRows([]requestRecord{record}, width))
+		if got := lipgloss.Width(row); got > width {
+			t.Fatalf("looped row at %d = %d, overflows the pane:\n%s", width, got, row)
+		}
+		if !strings.Contains(row, loopMarkAborted) {
+			t.Fatalf("looped row at %d lost its mark:\n%s", width, row)
+		}
+	}
+	compact := ansi.Strip(renderLogRows([]requestRecord{record}, 40))
+	if !strings.Contains(compact, loopMarkAborted) {
+		t.Fatalf("compact layout lost the loop mark:\n%s", compact)
+	}
+}
+
+// The mark says a response repeated; its suffix says what orr did about it. A
+// recovered loop reports as recovered even when it was also cut, because the
+// spliced continuation is what the client ended up with.
+func TestLogLoopMarker(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		record requestRecord
+		want   string
+	}{
+		{"normal", requestRecord{Status: 200}, ""},
+		{"detected", requestRecord{Loop: true, LoopPeriod: 6, LoopRepeat: 3}, loopMarkDetected},
+		{"aborted", requestRecord{Loop: true, LoopAborted: true}, loopMarkAborted},
+		{"recovered", requestRecord{Loop: true, LoopRecovered: true}, loopMarkRecovered},
+		{"recovered and cut", requestRecord{Loop: true, LoopAborted: true, LoopRecovered: true}, loopMarkRecovered},
+	} {
+		if got := logLoopMarker(test.record); got != test.want {
+			t.Fatalf("%s marker = %q, want %q", test.name, got, test.want)
+		}
+	}
+}
+
 func TestRenderLogTableNarrowFallbackAndErrorStyling(t *testing.T) {
 	record := requestRecord{Time: time.Now(), Model: "model", Provider: "provider", Status: 500, Err: true}
 	got := renderLogTableHeader(40) + "\n" + renderLogRows([]requestRecord{record}, 40)
@@ -841,7 +1089,7 @@ func TestDashboardShowsReleaseUpdateInLogTitle(t *testing.T) {
 	updated, _ = updated.(dashboardModel).Update(tea.WindowSizeMsg{Width: 190, Height: 60})
 	result := updated.(dashboardModel)
 
-	if got := ansi.Strip(result.View()); !strings.Contains(got, "• v0.3.0 available run ./orr upgrade") {
+	if got := ansi.Strip(result.View()); !strings.Contains(got, "• v0.3.0 available run orr upgrade") {
 		t.Fatalf("dashboard log title missing release notice:\n%s", result.View())
 	}
 }
@@ -3498,7 +3746,7 @@ func TestRoutingHintsNamePickerAndCloseKeys(t *testing.T) {
 	dashboard := newDashboard(config{}, stats, routing)
 	dashboard.syncModel()
 	raw := ansi.Strip(dashboard.renderRouting(stats.snapshot(), 200, 24))
-	for _, want := range []string{"(↑/↓) select", "(Enter) toggle", "(k) models", "(x) close tab", "(r) reload provider list", "(t) test provider", "(a) test all"} {
+	for _, want := range []string{"(↑/↓) select", "(Enter) toggle", "(k) models", "(x) close tab", "(r) reload provider list", "(t) test provider", "(a) test all", "(O) openrouter default"} {
 		if !strings.Contains(raw, want) {
 			t.Fatalf("routing hints are missing %q:\n%s", want, raw)
 		}
@@ -3516,5 +3764,24 @@ func TestRoutingHintsNamePickerAndCloseKeys(t *testing.T) {
 	}
 	if modelLine < 0 || providerLine != modelLine+1 {
 		t.Fatalf("provider keys are not on the line below the model keys:\n%s", raw)
+	}
+}
+
+// The `O` probe marks the provider OpenRouter's default routing picked with an
+// `o` on its row.
+func TestRoutingMarksDefaultProviderPick(t *testing.T) {
+	const model = "a/b"
+	stats := newStats()
+	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"p1", "p2"}}}, time.Hour)
+	routing.setCurrentModel(model)
+	dashboard := newDashboard(config{}, stats, routing)
+	dashboard.syncModel()
+	dashboard.defaultPicks[model] = providerDefaultPick{provider: "p2", testedAt: time.Now()}
+	raw := ansi.Strip(dashboard.renderRouting(stats.snapshot(), 200, 24))
+	if !strings.Contains(raw, "p2 o") {
+		t.Fatalf("default pick marker missing:\n%s", raw)
+	}
+	if strings.Contains(raw, "p1 o") {
+		t.Fatalf("default pick marker landed on the wrong row:\n%s", raw)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"net/url"
@@ -1528,6 +1529,80 @@ func TestEncryptedContentRetryPreservesJSONNumbers(t *testing.T) {
 	}
 }
 
+// A continuation is orr's own second request towards the same answer, so it has
+// to reach the endpoint that answered the first leg. The body orr prepared names
+// the model's whole order — or, for an unpinned model, whatever the client sent —
+// and a continuation re-routed along it would show the entire conversation to a
+// second endpoint just to finish the first one's answer.
+func TestLoopContinuationIsPinnedToTheAnsweringProvider(t *testing.T) {
+	p, err := newProxy(testConfig("https://upstream.test/api/v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.stopDailyBenchmarks()
+	var sent map[string]any
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if err := json.NewDecoder(r.Body).Decode(&sent); err != nil {
+			t.Errorf("decode continuation: %v", err)
+		}
+		return response(http.StatusInternalServerError, `{}`), nil
+	})
+	target := *p.upstream
+	target.Path = "/api/v1/chat/completions"
+	send := p.loopContinuation(context.Background(), "/v1/chat/completions", target, make(http.Header),
+		[]byte(`{"model":"moonshotai/kimi-k2.5","messages":[{"role":"user","content":"hi"}],"stream":true,"provider":{"order":["fireworks","other"],"allow_fallbacks":true}}`),
+		"fireworks")
+	if _, err := send(&loopVerdict{Channel: loopChannelContent, Prefix: "half an answer"}); err == nil {
+		t.Fatal("an unsuccessful continuation was reported as a spliceable stream")
+	}
+	if sent == nil {
+		t.Fatal("continuation never reached the upstream")
+	}
+	if only := routingOnly(sent); !equalSlices(only, []string{"fireworks"}) {
+		t.Fatalf("continuation provider.only = %v, want only fireworks", only)
+	}
+	provider, _ := sent["provider"].(map[string]any)
+	if provider["allow_fallbacks"] != false {
+		t.Fatalf("continuation allow_fallbacks = %v, want false", provider["allow_fallbacks"])
+	}
+	if _, ok := provider["order"]; ok {
+		t.Fatalf("continuation kept the fallback order: %#v", provider)
+	}
+	// The conversation must still be continued, not restarted: pinning only
+	// narrows where the request goes.
+	messages, _ := sent["messages"].([]any)
+	if len(messages) != 3 {
+		t.Fatalf("continuation messages = %d, want the client's turn plus the two continuation turns", len(messages))
+	}
+}
+
+// An unknown model's first request chooses no endpoint: there is nothing to pin,
+// so the continuation keeps the body it was prepared with.
+func TestLoopContinuationWithoutProviderIsSentUnpinned(t *testing.T) {
+	p, err := newProxy(testConfig("https://upstream.test/api/v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.stopDailyBenchmarks()
+	sent := map[string]any{}
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if err := json.NewDecoder(r.Body).Decode(&sent); err != nil {
+			t.Errorf("decode continuation: %v", err)
+		}
+		return response(http.StatusInternalServerError, `{}`), nil
+	})
+	target := *p.upstream
+	target.Path = "/api/v1/chat/completions"
+	body := []byte(`{"model":"author/unknown","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	send := p.loopContinuation(context.Background(), "/v1/chat/completions", target, make(http.Header), body, "")
+	if _, err := send(&loopVerdict{Channel: loopChannelContent, Prefix: "half an answer"}); err == nil {
+		t.Fatal("an unsuccessful continuation was reported as a spliceable stream")
+	}
+	if _, ok := sent["provider"]; ok {
+		t.Fatalf("unpinned continuation invented a provider block: %#v", sent["provider"])
+	}
+}
+
 func TestGeneric404DoesNotFailOverAutomaticProvider(t *testing.T) {
 	const model = "author/model"
 	cfg := testConfig("https://upstream.test/api/v1")
@@ -1778,7 +1853,7 @@ func TestSuccessfulManualBenchmarkRehabilitatesRateLimitedProvider(t *testing.T)
 	}
 	p.setClock(func() time.Time { return now })
 	p.routing.autoPin(model, "limited")
-	if _, accepted := p.routing.markProviderUnavailableAndFailover(model, "limited"); !accepted {
+	if _, accepted := p.routing.markProviderUnavailableAndFailover(model, "limited", true); !accepted {
 		t.Fatal("rate-limit failure was not accepted")
 	}
 	now = now.Add(time.Second)
@@ -1824,7 +1899,7 @@ func TestBenchmarkStartedBeforeFailoverCannotRehabilitateProvider(t *testing.T) 
 		t.Fatal("benchmark did not start")
 	}
 	now = now.Add(time.Second)
-	if _, accepted := p.routing.markProviderUnavailableAndFailover(model, "limited"); !accepted {
+	if _, accepted := p.routing.markProviderUnavailableAndFailover(model, "limited", true); !accepted {
 		t.Fatal("rate-limit failure was not accepted")
 	}
 	close(release)
@@ -2606,6 +2681,47 @@ func TestProxyTestProviderMeasuresARoundTooFastToTime(t *testing.T) {
 	}
 }
 
+// The `O` probe leaves provider preferences off the request so OpenRouter's
+// default routing chooses, then reports the endpoint it picked.
+func TestProbeDefaultProviderReportsServingProvider(t *testing.T) {
+	const model = "moonshotai/kimi-k2.5"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.OpenRouterAPIKey = "sk-test"
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.routing.endpointCache[model] = []endpointMeta{{Tag: "fireworks", ProviderName: "Fireworks"}}
+	stream := "data: {\"provider\":\"fireworks\",\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3}}\n\n" +
+		"data: [DONE]\n"
+	var body []byte
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body, _ = io.ReadAll(r.Body)
+		return response(http.StatusOK, stream), nil
+	})
+	provider, err := p.probeDefaultProvider(model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider != "fireworks" {
+		t.Fatalf("probe provider = %q, want fireworks", provider)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := payload["provider"]; ok {
+		t.Fatalf("probe sent a provider block, so OpenRouter was not choosing: %s", body)
+	}
+	// The probe is orr's own request, so it stays out of the client counters but
+	// is still recorded as a benchmark round.
+	snap := p.stats.snapshot()
+	if len(snap.Records) != 1 || snap.RequestCount != 0 || !snap.Records[0].Benchmark {
+		t.Fatalf("records = %d request count = %d, want one benchmark record", len(snap.Records), snap.RequestCount)
+	}
+}
+
 func TestDailyRefreshWithoutKeyUpdatesProvisionalAutomaticChoice(t *testing.T) {
 	const model = "author/model"
 	t.Setenv("OPENROUTER_API_KEY", "")
@@ -2948,7 +3064,7 @@ func TestNoEligibleProvidersConsumesTheFreshnessWindow(t *testing.T) {
 	// The only provider exhausted its capacity, which is what keeps an automatic
 	// run from pinging anything.
 	p.routing.mu.Lock()
-	p.routing.temporarilyUnavailable[model] = map[string]time.Time{"provider": p.now()}
+	p.routing.temporarilyUnavailable[model] = map[string]unavailableMark{"provider": {detectedAt: p.now(), rateLimit: true}}
 	p.routing.mu.Unlock()
 
 	ready := p.prepareDailyModel(model)
@@ -2973,5 +3089,957 @@ func TestNoEligibleProvidersConsumesTheFreshnessWindow(t *testing.T) {
 	if again := p.prepareDailyModel(model); again != nil {
 		p.waitForDailyBenchmarks()
 		t.Fatal("the next request fetched the same catalog again")
+	}
+}
+
+// loopProxy answers every generation request with body as an event stream, so
+// the loop stage runs through forward the way it does in production.
+func loopProxy(t *testing.T, mode loopMode, body string) (*proxy, *memoryResponseWriter) {
+	t.Helper()
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.Loop = streamConfig(mode)
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.client.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set("Content-Type", "text/event-stream")
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	return p, newMemoryResponseWriter()
+}
+
+// loopForward runs one chat completion through forward.
+func loopForward(t *testing.T, p *proxy, w http.ResponseWriter) requestRecord {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, "http://proxy.test/v1/chat/completions",
+		strings.NewReader(`{"model":"moonshotai/kimi-k2.5","messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := p.forward(w, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return record
+}
+
+func TestProxyCutsAndRecordsALoop(t *testing.T) {
+	chunks, line := streamLoopBody("/v1/chat/completions")
+	full := strings.Join(chunks, "")
+	p, w := loopProxy(t, loopModeAbort, full)
+	record := loopForward(t, p, w)
+
+	if record.Status != http.StatusOK {
+		t.Fatalf("status = %d, want the response to stay 200", record.Status)
+	}
+	if record.Err {
+		t.Fatal("a repetition is not a request error")
+	}
+	if !record.Loop || !record.LoopAborted {
+		t.Fatalf("record loop/aborted = %v/%v, want both set", record.Loop, record.LoopAborted)
+	}
+	if record.LoopRecovered {
+		t.Fatal("abort mode recorded a recovery")
+	}
+	if record.LoopPeriod != len(line) || record.LoopRepeat < loopMinRepeatCount {
+		t.Fatalf("recorded period/repeat = %d/%d, want %d and at least %d", record.LoopPeriod, record.LoopRepeat, len(line), loopMinRepeatCount)
+	}
+	// A repetition is not a provider fault, so nothing may be attributed to it.
+	if record.Blocked || record.RateLimited || record.ProviderUnavailable || record.ProviderFailureHandled {
+		t.Fatalf("the cut touched provider health: %+v", record)
+	}
+	out := w.Body.String()
+	if !strings.HasSuffix(out, string(loopTerminal("/v1/chat/completions", 0))) {
+		t.Fatal("the cut response does not end with the chat terminal sequence")
+	}
+	if strings.Count(out, "data: [DONE]") != 1 {
+		t.Fatalf("%d done sentinels, want one", strings.Count(out, "data: [DONE]"))
+	}
+	if len(out) >= len(full)/2 {
+		t.Fatalf("client received %d of %d bytes, want the loop cut short", len(out), len(full))
+	}
+}
+
+func TestProxyObserveKeepsTheWholeLoopingStream(t *testing.T) {
+	chunks, line := streamLoopBody("/v1/chat/completions")
+	full := strings.Join(chunks, "")
+	p, w := loopProxy(t, loopModeObserve, full)
+	record := loopForward(t, p, w)
+
+	if !record.Loop || record.LoopAborted {
+		t.Fatalf("record loop/aborted = %v/%v, want the loop marked and nothing aborted", record.Loop, record.LoopAborted)
+	}
+	if record.LoopPeriod != len(line) {
+		t.Fatalf("recorded period = %d, want %d", record.LoopPeriod, len(line))
+	}
+	if w.Body.String() != full {
+		t.Fatalf("observe released %d bytes, want all %d", w.Body.Len(), len(full))
+	}
+}
+
+func TestProxyOffModeLeavesALoopingStreamAlone(t *testing.T) {
+	chunks, _ := streamLoopBody("/v1/chat/completions")
+	body := strings.Join(chunks, "") +
+		`data: {"usage":{"prompt_tokens":7,"completion_tokens":11,"cost":0.5}}` + "\n\n" + "data: [DONE]\n\n"
+	p, w := loopProxy(t, loopModeOff, body)
+	record := loopForward(t, p, w)
+
+	if record.Loop || record.LoopAborted || record.LoopPeriod != 0 || record.LoopRepeat != 0 {
+		t.Fatalf("off mode recorded a loop: %+v", record)
+	}
+	if w.Body.String() != body {
+		t.Fatalf("off mode released %d bytes, want all %d", w.Body.Len(), len(body))
+	}
+	// The usage parsers still read the response's end through the stage.
+	if record.PromptTokens != 7 || record.CompletionTokens != 11 || record.Cost != 0.5 {
+		t.Fatalf("usage = %d/%d/$%v, want 7/11/$0.5", record.PromptTokens, record.CompletionTokens, record.Cost)
+	}
+}
+
+// loopStreamAnswer is an event-stream response carrying body.
+func loopStreamAnswer(body string) *http.Response {
+	header := make(http.Header)
+	header.Set("Content-Type", "text/event-stream")
+	return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(body))}
+}
+
+// loopSpliceProxy answers the first generation request with looping and every
+// continuation request with answer. The continuation is recognised by the
+// intervention turn orr appends to it, which is the one thing the two legs do not
+// share. continuations counts only those requests, so catalog and endpoint refreshes
+// in the background cannot confuse the count, and sent holds the last continuation
+// body for the routing assertions.
+func loopSpliceProxy(t *testing.T, cfg loopConfig, looping string, answer func() (*http.Response, error)) (*proxy, *memoryResponseWriter, *int, *string) {
+	t.Helper()
+	configuration := testConfig("https://upstream.test/api/v1")
+	configuration.Loop = cfg
+	p, err := newProxy(configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	continuations := 0
+	var sent string
+	p.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost {
+			return loopStreamAnswer(""), nil
+		}
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("reading the upstream request: %v", err)
+		}
+		if !strings.Contains(string(body), loopIntervention) && !strings.Contains(string(body), loopRestart) {
+			return loopStreamAnswer(looping), nil
+		}
+		continuations++
+		sent = string(body)
+		return answer()
+	})
+	return p, newMemoryResponseWriter(), &continuations, &sent
+}
+
+// loopRecoveryPost runs one streaming chat completion through the whole handler, so
+// the record it produces is the one the dashboard and the stats see. It also asserts
+// the client request was counted once, which is where a continuation must not appear.
+func loopRecoveryPost(t *testing.T, p *proxy, w http.ResponseWriter) requestRecord {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, "http://proxy.test/v1/chat/completions",
+		strings.NewReader(`{"model":"moonshotai/kimi-k2.5","messages":[{"role":"user","content":"write a story"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.ServeHTTP(w, req)
+	snapshot := p.stats.snapshot()
+	if !snapshot.HasLast {
+		t.Fatal("the request produced no record")
+	}
+	if snapshot.RequestCount != 1 {
+		t.Fatalf("stats counted %d client requests, want the one the client sent", snapshot.RequestCount)
+	}
+	return snapshot.Last
+}
+
+func TestProxyRecoversALoopAndAddsTheContinuationToTheRecord(t *testing.T) {
+	chunks, line := streamLoopBody("/v1/chat/completions")
+	looping := streamStrings(chunks)
+	continuation := streamContinuation("/v1/chat/completions")
+	p, w, continuations, sent := loopSpliceProxy(t, streamConfig(loopModeRecover), looping, func() (*http.Response, error) {
+		return loopStreamAnswer(continuation), nil
+	})
+	record := loopRecoveryPost(t, p, w)
+
+	if record.Status != http.StatusOK || record.Err {
+		t.Fatalf("status/err = %d/%v, want a 200 answer", record.Status, record.Err)
+	}
+	// Cut and recovered are both true: the repetition was stopped, and the answer the
+	// client received continues from it.
+	if !record.Loop || !record.LoopAborted || !record.LoopRecovered {
+		t.Fatalf("record loop/aborted/recovered = %v/%v/%v, want all set", record.Loop, record.LoopAborted, record.LoopRecovered)
+	}
+	if record.LoopPeriod != len(line) || record.LoopRepeat < loopMinRepeatCount {
+		t.Fatalf("recorded period/repeat = %d/%d, want %d and at least %d", record.LoopPeriod, record.LoopRepeat, len(line), loopMinRepeatCount)
+	}
+	// A repetition is not a provider fault, and the continuation is not a second
+	// client request.
+	if record.Blocked || record.RateLimited || record.ProviderUnavailable || record.ProviderFailureHandled {
+		t.Fatalf("the recovery touched provider health: %+v", record)
+	}
+	if *continuations != 1 {
+		t.Fatalf("upstream saw %d continuations, want exactly one", *continuations)
+	}
+	// The continuation's own usage is added to the record: the cut leg never reached
+	// a usage frame of its own.
+	if record.PromptTokens != 5 || record.CompletionTokens != 17 || record.Cost != 0.002 {
+		t.Fatalf("usage = %d/%d/$%v, want 5/17/$0.002 from the continuation",
+			record.PromptTokens, record.CompletionTokens, record.Cost)
+	}
+	// The continuation is built from the prepared request, so it keeps the provider
+	// block orr injected and resumes the text the client already has.
+	if !strings.Contains(*sent, `"only":["fireworks"]`) {
+		t.Fatalf("continuation body lost the injected provider block:\n%s", *sent)
+	}
+	if !strings.Contains(*sent, `"role":"assistant"`) || !strings.Contains(*sent, "Here is the summary you asked for. ") {
+		t.Fatalf("continuation body does not resume the clean prefix:\n%s", *sent)
+	}
+	out := w.Body.String()
+	if count := strings.Count(out, "data: [DONE]"); count != 1 {
+		t.Fatalf("%d done sentinels, want exactly one", count)
+	}
+	if count := strings.Count(out, `"finish_reason":"stop"`); count != 1 {
+		t.Fatalf("%d finish_reason frames, want exactly one", count)
+	}
+	if !strings.Contains(out, streamContinuationText) {
+		t.Fatal("the continuation's text never reached the client")
+	}
+	if count := strings.Count(out, line); count >= 20 {
+		t.Fatalf("the client received %d repetitions, want the loop cut short", count)
+	}
+}
+
+func TestProxyRecoveryEndsTheAnswerWhenTheContinuationIsRefused(t *testing.T) {
+	chunks, _ := streamLoopBody("/v1/chat/completions")
+	looping := streamStrings(chunks)
+	p, w, continuations, _ := loopSpliceProxy(t, streamConfig(loopModeRecover), looping, func() (*http.Response, error) {
+		// A rate limit on the continuation. The client's own request was answered, so
+		// this must not be attributed to the provider or turn the request into an error.
+		header := make(http.Header)
+		header.Set("Content-Type", "application/json")
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     header,
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"code":429,"message":"rate limited"}}`)),
+		}, nil
+	})
+	record := loopRecoveryPost(t, p, w)
+
+	if *continuations != 1 {
+		t.Fatalf("upstream saw %d continuations, want one attempt", *continuations)
+	}
+	if record.Err {
+		t.Fatal("a refused continuation turned an answered request into an error")
+	}
+	if !record.Loop || !record.LoopAborted {
+		t.Fatalf("record loop/aborted = %v/%v, want the cut recorded", record.Loop, record.LoopAborted)
+	}
+	if record.LoopRecovered {
+		t.Fatal("a refused continuation was recorded as recovered")
+	}
+	if record.RateLimited || record.Blocked || record.ProviderUnavailable || record.ProviderFailureHandled {
+		t.Fatalf("the refused continuation touched provider health: %+v", record)
+	}
+	out := w.Body.String()
+	if count := strings.Count(out, "data: [DONE]"); count != 1 {
+		t.Fatalf("%d done sentinels, want the cut closed exactly once", count)
+	}
+	if strings.Contains(out, streamContinuationText) {
+		t.Fatal("the client saw text from a continuation that never answered")
+	}
+	if record.CompletionTokens != 0 || record.Cost != 0 {
+		t.Fatalf("usage = %d/$%v, want nothing from a continuation that never answered",
+			record.CompletionTokens, record.Cost)
+	}
+}
+
+func TestProxyRecoveryEstimatesTheContinuationWithoutUsage(t *testing.T) {
+	chunks, _ := streamLoopBody("/v1/chat/completions")
+	looping := streamStrings(chunks)
+	// A leg that streams text and ends without a usage frame: what it generated is
+	// still part of the answer, so it is accounted with the estimate.
+	continuation := loopChatFrame(streamContinuationText) +
+		loopChatFrame("A second sentence carries the answer on. ") + "data: [DONE]\n\n"
+	p, w, continuations, _ := loopSpliceProxy(t, streamConfig(loopModeRecover), looping, func() (*http.Response, error) {
+		return loopStreamAnswer(continuation), nil
+	})
+	record := loopRecoveryPost(t, p, w)
+
+	if *continuations != 1 {
+		t.Fatalf("upstream saw %d continuations, want exactly one", *continuations)
+	}
+	if !record.LoopRecovered {
+		t.Fatalf("record = %+v, want the answer recorded as recovered", record)
+	}
+	if record.CompletionTokens == 0 {
+		t.Fatal("the continuation's output was not accounted at all")
+	}
+	if record.Cost != 0 {
+		t.Fatalf("cost = %v, want nothing for a leg that reported no cost", record.Cost)
+	}
+	if !strings.Contains(w.Body.String(), streamContinuationText) {
+		t.Fatal("the continuation's text never reached the client")
+	}
+}
+
+// logCapture collects the standard logger's output for the rest of the test, so a
+// test can assert what an operator would read in the plain log.
+func logCapture(t *testing.T) *strings.Builder {
+	t.Helper()
+	var output strings.Builder
+	previous := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	return &output
+}
+
+func TestProxyRecoveryLogsWhyASplicedAnswerEndedEarly(t *testing.T) {
+	chunks, _ := streamLoopBody("/v1/chat/completions")
+	looping := streamStrings(chunks)
+	// The continuation repeats itself too. Its text is spliced in, so the request is
+	// a recovery and the row reads ↺+; the answer then ends where that repetition was
+	// confirmed, and the log has to say so — the marks cannot.
+	legChunks, _ := streamLoopBody("/v1/chat/completions")
+	logs := logCapture(t)
+	p, w, continuations, _ := loopSpliceProxy(t, streamConfig(loopModeRecover), looping, func() (*http.Response, error) {
+		return loopStreamAnswer(streamStrings(legChunks)), nil
+	})
+	record := loopRecoveryPost(t, p, w)
+
+	if *continuations != 1 {
+		t.Fatalf("upstream saw %d continuations, want the repeating one to end the answer", *continuations)
+	}
+	if !record.Loop || !record.LoopAborted || !record.LoopRecovered {
+		t.Fatalf("record loop/aborted/recovered = %v/%v/%v, want the recovered mark", record.Loop, record.LoopAborted, record.LoopRecovered)
+	}
+	if !strings.Contains(logs.String(), "stream recovered, then ended: continuation repeated itself") {
+		t.Fatalf("log = %q, want the reason the splice ended early", logs.String())
+	}
+	if count := strings.Count(w.Body.String(), "data: [DONE]"); count != 1 {
+		t.Fatalf("%d done sentinels, want exactly one", count)
+	}
+}
+
+// accountWide429Body is a 429 OpenRouter raises for the whole account: it names
+// no endpoint, so no provider can be blamed for it and none can be routed around.
+const accountWide429Body = `{"error":{"message":"Too many requests","code":429}}`
+
+// thinkingLoopBody is a response whose thinking repeats itself and whose answer has
+// generated nothing yet, which is where a model that keeps re-planning degenerates.
+func thinkingLoopBody(prefix string) (string, string) {
+	line := prefix + "I'll write the response. I'll check the comments and report.\n"
+	var body strings.Builder
+	body.WriteString(loopChatReasoningFrame("Checking the comments first.\n"))
+	for range 40 {
+		body.WriteString(loopChatReasoningFrame(line))
+	}
+	return body.String(), line
+}
+
+func TestProxyRestartsAThinkingLoopThatProducedNoAnswer(t *testing.T) {
+	looping, line := thinkingLoopBody("")
+	p, w, continuations, sent := loopSpliceProxy(t, streamConfig(loopModeRecover), looping,
+		func() (*http.Response, error) {
+			return loopStreamAnswer(streamContinuation("/v1/chat/completions")), nil
+		})
+	record := loopRecoveryPost(t, p, w)
+
+	if *continuations != 1 {
+		t.Fatalf("upstream saw %d continuations, want exactly one restart", *continuations)
+	}
+	if !record.Loop || !record.LoopAborted || !record.LoopRecovered {
+		t.Fatalf("record loop/aborted/recovered = %v/%v/%v, want all set", record.Loop, record.LoopAborted, record.LoopRecovered)
+	}
+	// The restart asks for the answer; the thought that looped is never handed back.
+	if !strings.Contains(*sent, loopRestart) {
+		t.Fatalf("the restart request carries no restart instruction:\n%s", *sent)
+	}
+	if strings.Contains(*sent, line) {
+		t.Fatalf("the looping thought was re-sent to the model:\n%s", *sent)
+	}
+	out := w.Body.String()
+	if !strings.Contains(out, streamContinuationText) {
+		t.Fatal("the restarted answer never reached the client")
+	}
+	if count := strings.Count(out, "data: [DONE]"); count != 1 {
+		t.Fatalf("%d done sentinels, want the response closed exactly once", count)
+	}
+	if strings.Contains(out, `"type":"message_start"`) {
+		t.Fatal("the restart's own message identity reached the client")
+	}
+}
+
+func TestProxyCutsAThinkingLoopOnceTheAnswerStarted(t *testing.T) {
+	looping, _ := thinkingLoopBody("")
+	// The same loop, but the answer has already begun. Restarting would append a
+	// second answer to prose the client is reading, so the answer ends at the cut.
+	p, w, continuations, _ := loopSpliceProxy(t, streamConfig(loopModeRecover),
+		loopChatFrame("Here is the first part of the answer.\n")+looping,
+		func() (*http.Response, error) {
+			return loopStreamAnswer(streamContinuation("/v1/chat/completions")), nil
+		})
+	record := loopRecoveryPost(t, p, w)
+
+	if *continuations != 0 {
+		t.Fatalf("upstream saw %d continuations, want none once an answer exists", *continuations)
+	}
+	if !record.Loop || !record.LoopAborted {
+		t.Fatalf("record loop/aborted = %v/%v, want the cut recorded", record.Loop, record.LoopAborted)
+	}
+	if record.LoopRecovered {
+		t.Fatal("a thinking loop after the answer started was recorded as recovered")
+	}
+	out := w.Body.String()
+	if strings.Contains(out, streamContinuationText) {
+		t.Fatal("the client saw text from a restart that must not have been requested")
+	}
+	if !strings.Contains(out, "Here is the first part of the answer.") {
+		t.Fatal("the answer text generated before the loop was dropped with it")
+	}
+	if count := strings.Count(out, "data: [DONE]"); count != 1 {
+		t.Fatalf("%d done sentinels, want the cut closed exactly once", count)
+	}
+}
+
+// rateLimitProxy builds a proxy whose transport answers chat completions through
+// answer, recording the provider each attempt named. Background work is closed so
+// a recovery run cannot race the assertions.
+func rateLimitProxy(t *testing.T, cfg config, answer func(attempt int, provider string) *http.Response) (*proxy, *[]string) {
+	t.Helper()
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.stopDailyBenchmarks()
+	attempts := make([]string, 0, 4)
+	var mu sync.Mutex
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+			return response(http.StatusInternalServerError, `{}`), nil
+		}
+		named := routingOnly(body)
+		provider := ""
+		if len(named) > 0 {
+			provider = named[0]
+		}
+		mu.Lock()
+		attempts = append(attempts, provider)
+		attempt := len(attempts)
+		mu.Unlock()
+		return answer(attempt, provider), nil
+	})
+	return p, &attempts
+}
+
+func rateLimitedRequest(t *testing.T, ctx context.Context) *http.Request {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://proxy.test/v1/chat/completions",
+		strings.NewReader(`{"model":"author/model","messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return req
+}
+
+// The default threshold makes the first provider-attributed 429 fail over, so a
+// client that never retries — an agent subagent — receives an answer instead of a
+// rate limit it would have to retry itself.
+func TestDefaultRateLimitThresholdFailsOverOnTheFirst429(t *testing.T) {
+	const model = "author/model"
+	if defaultRateLimitFailoverThreshold != 1 {
+		t.Fatalf("default 429 failover threshold = %d, want 1", defaultRateLimitFailoverThreshold)
+	}
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.Models = map[string]providerConfig{model: {
+		Order:     []string{"limited", "healthy"},
+		UpdatedAt: time.Now(),
+	}}
+	p, attempts := rateLimitProxy(t, cfg, func(_ int, provider string) *http.Response {
+		if provider == "limited" {
+			return response(http.StatusTooManyRequests, rateLimitBody)
+		}
+		return response(http.StatusOK, `{"id":"ok"}`)
+	})
+
+	res := newMemoryResponseWriter()
+	p.ServeHTTP(res, rateLimitedRequest(t, context.Background()))
+	if res.Code != http.StatusOK {
+		t.Fatalf("response = %d, want the failover answer, body %s", res.Code, res.Body.String())
+	}
+	if want := []string{"limited", "healthy"}; !equalSlices(*attempts, want) {
+		t.Fatalf("provider attempts = %v, want %v", *attempts, want)
+	}
+}
+
+// A raised threshold is still the client's own choice: it asks to see the first
+// 429, so that response is forwarded without a replay.
+func TestRaisedRateLimitThresholdForwardsTheFirst429(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.RateLimitFailoverThreshold = 2
+	cfg.Models = map[string]providerConfig{model: {Order: []string{"only"}, UpdatedAt: time.Now()}}
+	p, attempts := rateLimitProxy(t, cfg, func(_ int, _ string) *http.Response {
+		return response(http.StatusTooManyRequests, rateLimitBody)
+	})
+
+	res := newMemoryResponseWriter()
+	p.ServeHTTP(res, rateLimitedRequest(t, context.Background()))
+	if res.Code != http.StatusTooManyRequests {
+		t.Fatalf("response = %d, want the 429 the client asked to see", res.Code)
+	}
+	if len(*attempts) != 1 {
+		t.Fatalf("provider attempts = %v, want no replay below the raised threshold", *attempts)
+	}
+}
+
+// A rate-limited provider with nothing to fail over to is asked once more instead
+// of handing the client a 429, and the successful replay is recorded as the plain
+// success it was.
+func TestRateLimitedProviderWithoutAlternativeIsRetriedForTheClient(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.Models = map[string]providerConfig{model: {Order: []string{"only"}, UpdatedAt: time.Now()}}
+	p, attempts := rateLimitProxy(t, cfg, func(attempt int, _ string) *http.Response {
+		if attempt == 1 {
+			return response(http.StatusTooManyRequests, rateLimitBody)
+		}
+		return response(http.StatusOK, `{"id":"ok"}`)
+	})
+
+	res := newMemoryResponseWriter()
+	p.ServeHTTP(res, rateLimitedRequest(t, context.Background()))
+	if res.Code != http.StatusOK {
+		t.Fatalf("response = %d, want the retried answer, body %s", res.Code, res.Body.String())
+	}
+	if len(*attempts) != 2 {
+		t.Fatalf("provider attempts = %v, want one replay", *attempts)
+	}
+	snap := p.stats.snapshot()
+	if !snap.HasLast {
+		t.Fatal("the request was not recorded")
+	}
+	if snap.Last.Status != http.StatusOK || snap.Last.Err || snap.Last.RateLimited || snap.Last.ProviderFailureHandled {
+		t.Fatalf("record = %+v, want a normal success", snap.Last)
+	}
+}
+
+// One replay per request, not one per 429: a provider that answers 429 again is
+// the answer the client receives, with the upstream body intact.
+func TestRepeatedRateLimitIsForwardedToTheClient(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.Models = map[string]providerConfig{model: {Order: []string{"only"}, UpdatedAt: time.Now()}}
+	p, attempts := rateLimitProxy(t, cfg, func(_ int, _ string) *http.Response {
+		return response(http.StatusTooManyRequests, rateLimitBody)
+	})
+
+	res := newMemoryResponseWriter()
+	p.ServeHTTP(res, rateLimitedRequest(t, context.Background()))
+	if res.Code != http.StatusTooManyRequests {
+		t.Fatalf("response = %d, want 429", res.Code)
+	}
+	if got := res.Body.String(); got != rateLimitBody {
+		t.Fatalf("forwarded body = %q, want the upstream body", got)
+	}
+	if len(*attempts) != 2 {
+		t.Fatalf("provider attempts = %v, want exactly one replay", *attempts)
+	}
+}
+
+// An account-wide 429 names no endpoint, so no provider can be blamed or routed
+// around; the burst is absorbed by one replay of the same request instead.
+func TestAccountWideRateLimitIsRetriedOnce(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.Models = map[string]providerConfig{model: {
+		Order:     []string{"first", "second"},
+		UpdatedAt: time.Now(),
+	}}
+	p, attempts := rateLimitProxy(t, cfg, func(attempt int, _ string) *http.Response {
+		if attempt == 1 {
+			return response(http.StatusTooManyRequests, accountWide429Body)
+		}
+		return response(http.StatusOK, `{"id":"ok"}`)
+	})
+	p.routing.autoPin(model, "first")
+
+	res := newMemoryResponseWriter()
+	p.ServeHTTP(res, rateLimitedRequest(t, context.Background()))
+	if res.Code != http.StatusOK {
+		t.Fatalf("response = %d, want the retried answer, body %s", res.Code, res.Body.String())
+	}
+	if len(*attempts) != 2 {
+		t.Fatalf("attempts = %v, want one replay on the same route", *attempts)
+	}
+	if provider := p.routing.pinnedProvider(model); provider != "first" {
+		t.Fatalf("routed provider = %q, want the unattributed 429 not to fail over", provider)
+	}
+}
+
+// A repeated account-wide 429 still reaches the client unchanged, and it is still
+// not attributed to any provider.
+func TestRepeatedAccountWideRateLimitReachesTheClient(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.Models = map[string]providerConfig{model: {
+		Order:     []string{"first", "second"},
+		UpdatedAt: time.Now(),
+	}}
+	p, attempts := rateLimitProxy(t, cfg, func(_ int, _ string) *http.Response {
+		return response(http.StatusTooManyRequests, accountWide429Body)
+	})
+	p.routing.autoPin(model, "first")
+
+	res := newMemoryResponseWriter()
+	p.ServeHTTP(res, rateLimitedRequest(t, context.Background()))
+	if res.Code != http.StatusTooManyRequests {
+		t.Fatalf("response = %d, want 429", res.Code)
+	}
+	if got := res.Body.String(); got != accountWide429Body {
+		t.Fatalf("forwarded body = %q, want the upstream body", got)
+	}
+	if len(*attempts) != 2 {
+		t.Fatalf("attempts = %v, want exactly one replay", *attempts)
+	}
+	if provider := p.routing.pinnedProvider(model); provider != "first" {
+		t.Fatalf("routed provider = %q, want the unattributed 429 not to fail over", provider)
+	}
+	snap := p.stats.snapshot()
+	if !snap.HasLast || snap.Last.RateLimited || snap.Last.ProviderFailureHandled {
+		t.Fatalf("record = %+v, want an unattributed 429 recorded against no provider", snap.Last)
+	}
+}
+
+// A manual pin is the user's choice of provider, so a 429 on it is answered by the
+// same provider: retried there, never rerouted.
+func TestManualPinIsRetriedOnTheSameProvider(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.Models = map[string]providerConfig{model: {
+		Order:     []string{"pinned", "other"},
+		ManualPin: "pinned",
+		UpdatedAt: time.Now(),
+	}}
+	p, attempts := rateLimitProxy(t, cfg, func(attempt int, _ string) *http.Response {
+		if attempt == 1 {
+			return response(http.StatusTooManyRequests, rateLimitBody)
+		}
+		return response(http.StatusOK, `{"id":"ok"}`)
+	})
+
+	res := newMemoryResponseWriter()
+	p.ServeHTTP(res, rateLimitedRequest(t, context.Background()))
+	if res.Code != http.StatusOK {
+		t.Fatalf("response = %d, want the retried answer, body %s", res.Code, res.Body.String())
+	}
+	if want := []string{"pinned", "pinned"}; !equalSlices(*attempts, want) {
+		t.Fatalf("provider attempts = %v, want %v", *attempts, want)
+	}
+	if provider, manual := p.routing.pinInfo(model); provider != "pinned" || !manual {
+		t.Fatalf("pin = %q manual=%v, want the manual pin untouched", provider, manual)
+	}
+}
+
+// Retry-After inside the ceiling is the wait that is taken.
+func TestRateLimitRetryHonoursRetryAfterWithinCeiling(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.Models = map[string]providerConfig{model: {Order: []string{"only"}, UpdatedAt: time.Now()}}
+	p, attempts := rateLimitProxy(t, cfg, func(attempt int, _ string) *http.Response {
+		if attempt == 1 {
+			resp := response(http.StatusTooManyRequests, rateLimitBody)
+			resp.Header.Set("Retry-After", "1")
+			return resp
+		}
+		return response(http.StatusOK, `{"id":"ok"}`)
+	})
+
+	started := time.Now()
+	res := newMemoryResponseWriter()
+	p.ServeHTTP(res, rateLimitedRequest(t, context.Background()))
+	elapsed := time.Since(started)
+	if res.Code != http.StatusOK || len(*attempts) != 2 {
+		t.Fatalf("response = %d after %v attempts, want the honoured replay", res.Code, len(*attempts))
+	}
+	if elapsed < 900*time.Millisecond {
+		t.Fatalf("replay after %v, want the advertised one second", elapsed)
+	}
+}
+
+// A Retry-After beyond the ceiling closes the quota window: replaying inside it
+// would spend the client's one allowed retry on a request the provider has
+// already said it will refuse, so the 429 is forwarded immediately — no wait,
+// and no second upstream request.
+func TestRateLimitRetryForwardsALongRetryAfterWithoutReplay(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.Models = map[string]providerConfig{model: {Order: []string{"only"}, UpdatedAt: time.Now()}}
+	p, attempts := rateLimitProxy(t, cfg, func(_ int, _ string) *http.Response {
+		resp := response(http.StatusTooManyRequests, rateLimitBody)
+		resp.Header.Set("Retry-After", "120")
+		return resp
+	})
+
+	started := time.Now()
+	res := newMemoryResponseWriter()
+	p.ServeHTTP(res, rateLimitedRequest(t, context.Background()))
+	elapsed := time.Since(started)
+	if res.Code != http.StatusTooManyRequests {
+		t.Fatalf("response = %d, want 429", res.Code)
+	}
+	if got := res.Body.String(); got != rateLimitBody {
+		t.Fatalf("forwarded body = %q, want the upstream 429 body", got)
+	}
+	if len(*attempts) != 1 {
+		t.Fatalf("attempts = %v, want the 429 forwarded with no replay", *attempts)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("request took %v, want the long Retry-After not waited out", elapsed)
+	}
+}
+
+// An automatic benchmark run skips providers that just exhausted their capacity,
+// because every round would spend a request to be told the same thing. That skip
+// lasts for the rate-limit cooldown only: once it lapses the provider is measured
+// again, while a provider the model no longer serves stays skipped.
+func TestAutomaticBenchmarkReprobesRateLimitedProviderAfterCooldown(t *testing.T) {
+	const model = "author/model"
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.Models = map[string]providerConfig{model: {Order: []string{"limited", "gone", "healthy"}}}
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.setClock(func() time.Time { return now })
+	p.stopDailyBenchmarks()
+	var mu sync.Mutex
+	probed := make(map[string]bool, 3)
+	p.dailyTestProvider = func(_ context.Context, _ string, provider string, _ int) (providerTestSample, error) {
+		mu.Lock()
+		probed[provider] = true
+		mu.Unlock()
+		return pingSample(100, 10*time.Millisecond), nil
+	}
+	run := func() map[string]bool {
+		t.Helper()
+		if _, complete := p.benchmarkProviders(model, []string{"limited", "gone", "healthy"}, now.Add(time.Second), true, 3); !complete {
+			t.Fatal("automatic benchmark did not complete inside its deadline")
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		measured := probed
+		probed = make(map[string]bool, 3)
+		return measured
+	}
+	if _, accepted := p.routing.markProviderUnavailableAndFailover(model, "limited", true); !accepted {
+		t.Fatal("rate-limit failure was not accepted")
+	}
+	if _, accepted := p.routing.markProviderUnavailableAndFailover(model, "gone", false); !accepted {
+		t.Fatal("unavailability failure was not accepted")
+	}
+
+	if measured := run(); len(measured) != 1 || !measured["healthy"] {
+		t.Fatalf("providers measured inside the cooldowns = %v, want the healthy provider alone", measured)
+	}
+
+	now = now.Add(rateLimitUnavailableCooldown + time.Second)
+	if measured := run(); len(measured) != 2 || !measured["limited"] || !measured["healthy"] {
+		t.Fatalf("providers measured after the rate-limit cooldown = %v, want limited and healthy", measured)
+	}
+}
+
+func TestRateLimitRetryDelayHonoursRetryAfterWithinCeiling(t *testing.T) {
+	if rateLimitRetryBackoff != 250*time.Millisecond {
+		t.Fatalf("default 429 replay backoff = %v, want 250ms", rateLimitRetryBackoff)
+	}
+	if rateLimitRetryAfterCeiling != 3*time.Second {
+		t.Fatalf("Retry-After ceiling = %v, want 3s", rateLimitRetryAfterCeiling)
+	}
+	now := time.Date(2026, time.November, 4, 12, 0, 0, 0, time.UTC)
+	p, err := newProxy(testConfig("https://upstream.test/api/v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.setClock(func() time.Time { return now })
+
+	cases := []struct {
+		name   string
+		header string
+		want   time.Duration
+		// replay is whether the 429 is absorbed at all. Only a hint longer than
+		// the ceiling closes the window; everything else is a burst.
+		replay bool
+	}{
+		{name: "absent", header: "", want: rateLimitRetryBackoff, replay: true},
+		{name: "zero", header: "0", want: 0, replay: true},
+		{name: "one second", header: "1", want: time.Second, replay: true},
+		{name: "at the ceiling", header: "3", want: rateLimitRetryAfterCeiling, replay: true},
+		{name: "above the ceiling", header: "4", replay: false},
+		{name: "quota window", header: "120", replay: false},
+		{name: "negative", header: "-1", want: rateLimitRetryBackoff, replay: true},
+		{name: "unparseable", header: "soon", want: rateLimitRetryBackoff, replay: true},
+		{name: "http date inside the ceiling", header: now.Add(2 * time.Second).Format(http.TimeFormat), want: 2 * time.Second, replay: true},
+		{name: "http date in the past", header: now.Add(-time.Minute).Format(http.TimeFormat), want: rateLimitRetryBackoff, replay: true},
+		{name: "http date beyond the ceiling", header: now.Add(time.Minute).Format(http.TimeFormat), replay: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			header := make(http.Header)
+			if tc.header != "" {
+				header.Set("Retry-After", tc.header)
+			}
+			got, replay := p.rateLimitRetryDelay(header)
+			if replay != tc.replay {
+				t.Fatalf("replay for %q = %v, want %v", tc.header, replay, tc.replay)
+			}
+			if got != tc.want {
+				t.Fatalf("delay for %q = %v, want %v", tc.header, got, tc.want)
+			}
+		})
+	}
+}
+
+// Waiting is orr's convenience, so a client that has already given up is not held
+// for a replay nobody will read.
+func TestRateLimitRetryYieldsToTheClientContext(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.Models = map[string]providerConfig{model: {Order: []string{"only"}, UpdatedAt: time.Now()}}
+	p, attempts := rateLimitProxy(t, cfg, func(_ int, _ string) *http.Response {
+		resp := response(http.StatusTooManyRequests, rateLimitBody)
+		resp.Header.Set("Retry-After", "3")
+		return resp
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	res := newMemoryResponseWriter()
+	p.ServeHTTP(res, rateLimitedRequest(t, ctx))
+	elapsed := time.Since(started)
+	if elapsed > time.Second {
+		t.Fatalf("request took %v, want the wait abandoned with the client", elapsed)
+	}
+	if len(*attempts) != 1 {
+		t.Fatalf("attempts = %v, want no replay for an abandoned request", *attempts)
+	}
+	if res.Code != http.StatusTooManyRequests {
+		t.Fatalf("response = %d, want 429", res.Code)
+	}
+}
+
+// An absorbed 429 must not outlive its own replay: the failover accounting marks
+// the provider unavailable and drops its automatic pin before the bounded replay
+// runs, and a replay that answers disproves exactly that conclusion.
+//
+// The clock is separated on purpose. The success-clear in observeProviderFailure
+// compares the request start with the moment the mark was recorded and skips a
+// request that started first, so on a coarse platform clock the mark would be
+// cleared by accident; here the mark is recorded 20ms after the request started,
+// which is what a real round trip looks like.
+// A concurrent request can record a newer mark for the same provider while the
+// replay is in flight. That verdict is evidence the replay does not contradict, so
+// it must survive both the clear and the pin restore.
+func TestAbsorbedReplayKeepsANewerConcurrentMark(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.Models = map[string]providerConfig{model: {Order: []string{"only"}, UpdatedAt: time.Now()}}
+
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	var mu sync.Mutex
+	move := func(d time.Duration) {
+		mu.Lock()
+		now = now.Add(d)
+		mu.Unlock()
+	}
+	var holder *proxy
+	p, attempts := rateLimitProxy(t, cfg, func(attempt int, _ string) *http.Response {
+		if attempt == 1 {
+			// The mark this request causes lands after the request began.
+			move(20 * time.Millisecond)
+			return response(http.StatusTooManyRequests, rateLimitBody)
+		}
+		// While the replay is in flight, another request records a newer mark.
+		move(time.Second)
+		if _, accepted := holder.routing.markProviderUnavailableAndFailover(model, "only", true); !accepted {
+			t.Error("the concurrent mark was not accepted")
+		}
+		return response(http.StatusOK, `{"id":"ok"}`)
+	})
+	holder = p
+	p.setClock(func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	})
+	p.routing.autoPin(model, "only")
+	p.stats.setAutoPin(model, "only")
+
+	res := newMemoryResponseWriter()
+	p.ServeHTTP(res, rateLimitedRequest(t, context.Background()))
+	if res.Code != http.StatusOK || len(*attempts) != 2 {
+		t.Fatalf("response = %d after %v attempts, want the retried answer", res.Code, len(*attempts))
+	}
+	if !p.routing.isTemporarilyUnavailable(model, "only") {
+		t.Fatal("the replay's success cleared a mark recorded after it began")
+	}
+	if provider, manual := p.routing.pinInfo(model); provider == "only" && !manual {
+		t.Fatal("the automatic pin was restored to a provider a newer mark excludes")
+	}
+}
+
+func TestAbsorbedRateLimitClearsTheCondemnationItCaused(t *testing.T) {
+	const model = "author/model"
+	cfg := testConfig("https://upstream.test/api/v1")
+	cfg.Models = map[string]providerConfig{model: {Order: []string{"only"}, UpdatedAt: time.Now()}}
+
+	now := time.Now()
+	var clockMu sync.Mutex
+	advance := func(d time.Duration) {
+		clockMu.Lock()
+		now = now.Add(d)
+		clockMu.Unlock()
+	}
+	p, attempts := rateLimitProxy(t, cfg, func(attempt int, _ string) *http.Response {
+		if attempt == 1 {
+			// The 429 arrives 20ms into the request, so the provider-failure
+			// mark it records is later than the request start.
+			advance(20 * time.Millisecond)
+			return response(http.StatusTooManyRequests, rateLimitBody)
+		}
+		return response(http.StatusOK, `{"id":"ok"}`)
+	})
+	p.setClock(func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return now
+	})
+	p.routing.autoPin(model, "only")
+	p.stats.setAutoPin(model, "only")
+
+	res := newMemoryResponseWriter()
+	p.ServeHTTP(res, rateLimitedRequest(t, context.Background()))
+	if res.Code != http.StatusOK || len(*attempts) != 2 {
+		t.Fatalf("response = %d after %v attempts, want the retried answer", res.Code, len(*attempts))
+	}
+	if p.routing.isTemporarilyUnavailable(model, "only") {
+		t.Fatal("an absorbed 429 still excludes the provider that answered the replay")
+	}
+	if provider, manual := p.routing.pinInfo(model); provider != "only" || manual {
+		t.Fatalf("pin = %q manual=%v, want the automatic pin the accounting dropped restored", provider, manual)
+	}
+	if pin := p.stats.providerPinsSnapshot()[model]; pin.Provider != "only" {
+		t.Fatalf("persisted pin = %q, want the restored automatic route", pin.Provider)
 	}
 }

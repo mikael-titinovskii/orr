@@ -10,6 +10,7 @@
 *.test
 /orr.log
 /__pycache__/
+.tmp
 
 # Local agent skills. The .agents directory itself stays in the repo.
 /.agents/skills/sync-public/

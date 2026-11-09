@@ -257,6 +257,23 @@ func (p *proxy) forward(w http.ResponseWriter, incoming *http.Request) (requestR
 
 	var resp *http.Response
 	providerFailoverActive := false
+	// retriedRateLimit records that the one bounded 429 replay is spent. The
+	// budget is one retry per client request, not one per attempt: however many
+	// 429s arrive, the second one is the answer the client receives.
+	retriedRateLimit := false
+	// condemnedProvider names the provider the failover accounting marked
+	// unavailable, and whose automatic pin it dropped, before the bounded replay
+	// ran. That condemnation was a prediction about the replay, so the replay's
+	// own answer decides whether it stands; the name keeps the decision tied to
+	// the provider it was about, even if a later attempt lands elsewhere.
+	condemnedProvider := ""
+	// condemnedAt is the moment the replay began. The clear passes this rather
+	// than the current clock so it undoes only the mark this request's own 429
+	// caused: a concurrent request that recorded a newer mark for the same
+	// provider while the replay was in flight is describing evidence this replay
+	// does not contradict, and clearing it would return a failing provider to
+	// selection on somebody else's success.
+	condemnedAt := time.Time{}
 	// errorBody holds the drained prefix of an unsuccessful response, read to
 	// classify it. It is forwarded to the client first, and whatever the
 	// prefix cap cut off is streamed after it, so no error body is truncated.
@@ -290,6 +307,27 @@ func (p *proxy) forward(w http.ResponseWriter, incoming *http.Request) (requestR
 			return record, nil
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if condemnedProvider != "" && condemnedProvider == record.Provider {
+				// The replay answered on the provider the failover accounting had
+				// already condemned, so the 429 it was blamed for is not the answer
+				// the client got. That mark must not outlive the request which
+				// disproves it: it excludes the provider from automatic benchmarks and
+				// demotes it for its entire cooldown, long after the provider proved it
+				// could serve the model. The request's own success cannot do this later
+				// — the success-clear compares the request start against the moment of
+				// the mark and skips a request that began first — so it is done here,
+				// dated to when the replay began so a mark recorded after that survives.
+				p.routing.clearProviderUnavailable(record.Model, record.Provider, condemnedAt)
+				// The same accounting deleted the model's automatic pin. Restoring
+				// it keeps the next request on the route that just worked — unless a
+				// concurrent request recorded a newer mark for this provider, in which
+				// case that verdict, not this success, decides its standing.
+				if !p.routing.isTemporarilyUnavailable(record.Model, record.Provider) &&
+					p.routing.ensureAutoPin(record.Model, record.Provider) {
+					p.stats.setAutoPin(record.Model, record.Provider)
+				}
+				syncPersistedAutomaticPin(p.routing, p.stats, record.Model)
+			}
 			break
 		}
 		// An unsuccessful response is a small JSON document, so reading it
@@ -321,6 +359,20 @@ func (p *proxy) forward(w http.ResponseWriter, incoming *http.Request) (requestR
 			providerRateLimited := attributable && resp.StatusCode == http.StatusTooManyRequests && parseProviderRateLimit(errorBody)
 			providerUnavailable := attributable && resp.StatusCode == http.StatusNotFound && parseProviderUnavailable(errorBody)
 			if !providerRateLimited && !providerUnavailable {
+				// An unattributed 429 is an account-wide limit: it names no
+				// provider, so neither the pin nor the provider order has
+				// anything to move, and it is not counted against a provider.
+				// Letting the burst pass and asking the same route once more is
+				// the only way such a limit can be absorbed at all.
+				if resp.StatusCode == http.StatusTooManyRequests && !retriedRateLimit && modified != nil {
+					if p.absorbRateLimit(incoming.Context(), resp.Header) {
+						retriedRateLimit = true
+						resp.Body.Close()
+						body = bytes.NewReader(modified)
+						errorBody = nil
+						continue
+					}
+				}
 				break
 			}
 			record.RateLimited = providerRateLimited
@@ -332,6 +384,33 @@ func (p *proxy) forward(w http.ResponseWriter, incoming *http.Request) (requestR
 				replacement, failover = p.rateLimitReplacement(record.Model, record.Provider, providerFailoverActive)
 			} else {
 				replacement, failover = p.providerUnavailableReplacement(record.Model, record.Provider)
+			}
+			// A 429 that moving provider cannot answer earns one bounded replay on
+			// the provider already selected. That is every 429 on a manual pin —
+			// the pin never moves, so ORR_429_FAILOVER_THRESHOLD does not apply to
+			// it: rateLimitReplacement returns before counting, and the first 429
+			// is absorbed whatever the threshold says — and an automatic pin whose
+			// threshold was reached with nothing eligible left to move to. An
+			// automatic pin below a raised threshold still forwards the first 429,
+			// because that tolerance is what the client asked for.
+			if providerRateLimited && !retriedRateLimit && replacement == "" && modified != nil && (failover || p.routing.manualPin(record.Model)) {
+				if p.absorbRateLimit(incoming.Context(), resp.Header) {
+					retriedRateLimit = true
+					// Only an accepted failover has condemned anything: a manual
+					// pin never reached the accounting at all.
+					if failover {
+						condemnedProvider = record.Provider
+						condemnedAt = p.now()
+					}
+					// The record describes the answer the client receives, and a
+					// replay that succeeds is a normal success: the failure
+					// marks belong to a 429 that is actually delivered.
+					record.RateLimited, record.ProviderUnavailable, record.ProviderFailureHandled = false, false, false
+					resp.Body.Close()
+					body = bytes.NewReader(modified)
+					errorBody = nil
+					continue
+				}
 			}
 			if !failover {
 				break
@@ -403,47 +482,72 @@ func (p *proxy) forward(w http.ResponseWriter, incoming *http.Request) (requestR
 	w.Header().Del("Content-Length")
 	w.WriteHeader(resp.StatusCode)
 
-	tail := make([]byte, 0, 64*1024)
+	tail := make([]byte, 0, streamTailBytes)
 	defer resp.Body.Close()
-	flusher, canFlush := w.(http.Flusher)
+	sink := newStreamSink(w)
 	if len(errorBody) > 0 {
 		// An unsuccessful response was drained to classify it: forward what
 		// was read, then fall through to stream whatever the cap cut off.
 		if record.TTFT == 0 {
 			record.TTFT = p.now().Sub(started)
 		}
-		tail = appendTail(tail, errorBody, 64*1024)
-		if _, err := w.Write(errorBody); err != nil {
+		tail = appendTail(tail, errorBody, streamTailBytes)
+		if _, err := sink.Write(errorBody); err != nil {
 			record.Duration, record.Err = p.now().Sub(started), true
 			return record, err
 		}
-		if canFlush {
-			flusher.Flush()
-		}
+		sink.Flush()
 	}
-	buf := make([]byte, 32*1024)
-	for {
-		n, readErr := resp.Body.Read(buf)
-		if n > 0 {
-			if record.TTFT == 0 {
-				record.TTFT = p.now().Sub(started)
+	stage := newStreamStage(incoming.URL.Path, p.cfg.Loop, resp, sink, func() {
+		if record.TTFT == 0 {
+			record.TTFT = p.now().Sub(started)
+		}
+	})
+	// The stage keeps accumulating every byte it reads into this same tail, so
+	// usage, cost, and the refusal and rate-limit parsers still read the
+	// response's end exactly as they did when this loop lived here.
+	stage.tail = tail
+	if p.cfg.Loop.Mode == loopModeRecover && modified != nil {
+		// Recover mode continues a cut answer with a request of orr's own. It goes to
+		// the provider that answered this leg and is pinned to it, and it is never
+		// recorded, counted, or held against a provider's health: the client asked
+		// for one request and receives one answer.
+		stage.continuation = p.loopContinuation(incoming.Context(), incoming.URL.Path, target, incoming.Header, modified, record.Provider)
+	}
+	verdict, streamErr := stage.Run()
+	tail = stage.tail
+	if verdict != nil {
+		record.Loop = true
+		record.LoopPeriod, record.LoopRepeat = verdict.Period, verdict.Repeat
+		action := "stream cut"
+		switch {
+		case p.cfg.Loop.Mode == loopModeObserve:
+			action = "stream unchanged"
+		case stage.recovery != nil && stage.recovery.Splices > 0:
+			// The cut is what the client never saw the end of, and the splice is what
+			// it received instead: both marks are true of this request.
+			record.LoopAborted, record.LoopRecovered = true, true
+			action = "stream recovered"
+			if stage.recovery.Reason != "" {
+				// The splice itself ended early — the continuation repeated itself, or
+				// its stream broke off — and that is the one thing an operator cannot
+				// infer from the marks: the row says recovered either way.
+				action += ", then ended: " + stage.recovery.Reason
 			}
-			tail = appendTail(tail, buf[:n], 64*1024)
-			if _, err := w.Write(buf[:n]); err != nil {
-				record.Duration, record.Err = p.now().Sub(started), true
-				return record, err
-			}
-			if canFlush {
-				flusher.Flush()
+		default:
+			record.LoopAborted = true
+			if stage.recovery != nil && stage.recovery.Reason != "" {
+				action = "stream cut, no continuation: " + stage.recovery.Reason
 			}
 		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			record.Duration, record.Err = p.now().Sub(started), true
-			return record, readErr
-		}
+		// The shape of the repetition, never the text: what a model generated
+		// does not belong in a log.
+		log.Printf("loop detected in %s for %s: %d bytes repeated %d times; %s",
+			incoming.URL.Path, record.Model, verdict.Period, verdict.Repeat, action)
+	}
+	if streamErr != nil {
+		record.Duration, record.Err = p.now().Sub(started), true
+		return record, streamErr
 	}
 	record.Duration = p.now().Sub(started)
 	routedModel, routedProvider := record.Model, record.Provider
@@ -461,6 +565,26 @@ func (p *proxy) forward(w http.ResponseWriter, incoming *http.Request) (requestR
 	record.CacheWriteTokens = summary.cacheWriteTokens
 	if summary.hasCost {
 		record.Cost = summary.cost
+	}
+	if recovery := stage.recovery; recovery != nil && recovery.Splices > 0 {
+		// The continuation is part of this client request's answer and part of its
+		// bill, so its own usage is added to the record rather than replacing the
+		// first leg's. Its prompt was sent again and charged again, which is why the
+		// totals cover both legs. A leg that reported no usage is accounted with the
+		// estimate of what it generated: the client was given that text either way.
+		continuation := extractResponseSummary(stage.recoveryTail)
+		tokens := continuation.completionTokens
+		if tokens == 0 {
+			tokens = recovery.EstimatedTokens
+		}
+		record.PromptTokens += continuation.promptTokens
+		record.CompletionTokens += tokens
+		record.ReasoningTokens += continuation.reasoningTokens
+		record.CachedTokens += continuation.cachedTokens
+		record.CacheWriteTokens += continuation.cacheWriteTokens
+		if continuation.hasCost {
+			record.Cost += continuation.cost
+		}
 	}
 	// OpenRouter can accept a streaming request and then report a routing
 	// refusal in an SSE frame. The status is already on the wire, so this
@@ -766,27 +890,107 @@ func (p *proxy) encryptedContentRetry(body []byte, model, selected, creator stri
 	if pinned, manual := p.routing.pinInfo(model); manual || pinned == "" || pinned != selected {
 		return nil
 	}
+	pinned, err := pinProviderBody(body, creator)
+	if err != nil {
+		return nil
+	}
+	return pinned
+}
+
+// pinProviderBody rewrites body's provider block to provider alone with
+// fallbacks disabled, so the request cannot be answered by any other endpoint.
+// The block orr injected names the model's whole order or carries client-sent
+// routing, and an empty provider means no endpoint was chosen: the body is
+// returned untouched, since there is nothing to pin to.
+func pinProviderBody(body []byte, provider string) ([]byte, error) {
+	if provider == "" {
+		return body, nil
+	}
 	var payload map[string]any
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
-	if decoder.Decode(&payload) != nil {
-		return nil
+	if err := decoder.Decode(&payload); err != nil {
+		return nil, err
 	}
-	provider, _ := payload["provider"].(map[string]any)
-	if provider == nil {
-		provider = map[string]any{}
+	block, _ := payload["provider"].(map[string]any)
+	if block == nil {
+		block = map[string]any{}
 	}
-	delete(provider, "order")
-	provider["only"] = []string{creator}
-	provider["allow_fallbacks"] = false
-	payload["provider"] = provider
+	// An explicit order is the fallback list this pin exists to replace.
+	delete(block, "order")
+	block["only"] = []string{provider}
+	block["allow_fallbacks"] = false
+	payload["provider"] = block
 	var buf bytes.Buffer
 	encoder := json.NewEncoder(&buf)
 	encoder.SetEscapeHTML(false)
-	if encoder.Encode(payload) != nil {
-		return nil
+	if err := encoder.Encode(payload); err != nil {
+		return nil, err
 	}
-	return buf.Bytes()
+	return buf.Bytes(), nil
+}
+
+// loopContinuation returns the request sender a recover-mode stage splices with.
+// The continuation is a request of orr's own: it is sent on the route the client's
+// request took, carrying that request's headers and a provider block pinned to the
+// endpoint that answered the first leg, so the same provider answers the second one.
+// The pin matters even when the client's own request carried no provider block: the
+// block orr injected names the model's whole order, and a continuation that OpenRouter
+// re-routed would show the entire conversation to a second endpoint to continue an
+// answer the first one produced. A manual pin already behaves this way.
+//
+// It is deliberately not a client request. Nothing here records it, counts it, or
+// holds it against a provider's health — the client asked for one request and
+// receives one answer, and a continuation that a policy refused or a rate limit
+// stopped is a reason to end that answer at the cut, not a fault of the provider
+// the client chose.
+func (p *proxy) loopContinuation(ctx context.Context, path string, target url.URL, header http.Header, body []byte, provider string) func(*loopVerdict) (io.ReadCloser, error) {
+	return func(verdict *loopVerdict) (io.ReadCloser, error) {
+		pinned, err := pinProviderBody(body, provider)
+		if err != nil {
+			return nil, errors.New("could not prepare the continuation request")
+		}
+		continuation, err := loopContinuationBody(path, pinned, *verdict, p.cfg.Loop.Penalty)
+		if err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.String(), bytes.NewReader(continuation))
+		if err != nil {
+			return nil, errors.New("could not create the continuation request")
+		}
+		copyHeaders(req.Header, header)
+		// The transport adds its own Accept-Encoding and transparently decompresses,
+		// which is what keeps the spliced frames readable.
+		req.Header.Del("Accept-Encoding")
+		req.Header.Del("Content-Length")
+		req.Host = p.upstream.Host
+		resp, err := p.client.Do(req)
+		if err != nil {
+			// Logged with the path only, like every other upstream failure: the error
+			// value embeds the full URL, and what a model generated never reaches a log.
+			cause := err
+			if unwrapped := errors.Unwrap(err); unwrapped != nil {
+				cause = unwrapped
+			}
+			log.Printf("loop continuation %s %s: %v", req.Method, req.URL.Path, cause)
+			return nil, errors.New("continuation request failed")
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			// A refusal, a rate limit and a timeout all arrive here, and the status is
+			// all the record needs to say: the body is drained only far enough to let
+			// the connection be reused.
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+			resp.Body.Close()
+			return nil, fmt.Errorf("continuation answered %d", resp.StatusCode)
+		}
+		if !isEventStream(resp.Header.Get("Content-Type")) {
+			// A JSON answer cannot be spliced into a stream, and forwarding it as one
+			// would put a document where the client expects frames.
+			resp.Body.Close()
+			return nil, errors.New("continuation is not an event stream")
+		}
+		return resp.Body, nil
+	}
 }
 
 // observeProviderFailure maintains one bounded consecutive-429 counter per
@@ -847,7 +1051,7 @@ func (p *proxy) rateLimitReplacement(model, provider string, force bool) (string
 	delete(p.rateLimitRuns, key)
 	p.rateLimitMu.Unlock()
 
-	replacement, accepted := p.automaticProviderFailover(model, provider)
+	replacement, accepted := p.automaticProviderFailover(model, provider, true)
 	if !accepted {
 		return "", false
 	}
@@ -863,6 +1067,75 @@ func (p *proxy) rateLimitReplacement(model, provider string, force bool) (string
 	return replacement, true
 }
 
+const (
+	// rateLimitRetryBackoff is how long a 429 that no provider change can
+	// answer is waited out before the provider already selected is asked once
+	// more. The point is to absorb a burst, not to sit out a hard quota window:
+	// a client with sub-second expectations — an agent loop that does not retry
+	// on its own — is better served by a fast 429 than by a multi-second stall.
+	rateLimitRetryBackoff = 250 * time.Millisecond
+	// rateLimitRetryAfterCeiling is the longest Retry-After hint orr honours.
+	// A longer hint is not waited out: the 429 is forwarded instead of holding
+	// the request for the rest of a quota window.
+	rateLimitRetryAfterCeiling = 3 * time.Second
+)
+
+// rateLimitRetryDelay is how long to wait before replaying a rate-limited
+// request, and whether the request is worth replaying at all. Retry-After is
+// honoured exactly when it names a wait between zero and
+// rateLimitRetryAfterCeiling. A longer hint is a closed quota window: the
+// provider has already said when it will accept the request again, so a replay
+// inside that window — with the fallback backoff or with the hinted wait —
+// would spend the client's one allowed retry on a request the provider is
+// certain to refuse. Such a 429 is forwarded instead, which the second return
+// value reports. A missing, unparseable, or past hint says nothing about the
+// window, so rateLimitRetryBackoff applies and the replay goes ahead.
+func (p *proxy) rateLimitRetryDelay(header http.Header) (time.Duration, bool) {
+	value := strings.TrimSpace(header.Get("Retry-After"))
+	if value == "" {
+		return rateLimitRetryBackoff, true
+	}
+	wait := time.Duration(-1)
+	if seconds, err := strconv.Atoi(value); err == nil {
+		wait = time.Duration(seconds) * time.Second
+	} else if when, err := http.ParseTime(value); err == nil {
+		wait = when.Sub(p.now())
+	}
+	if wait < 0 {
+		return rateLimitRetryBackoff, true
+	}
+	if wait > rateLimitRetryAfterCeiling {
+		return 0, false
+	}
+	return wait, true
+}
+
+// absorbRateLimit waits out one bounded backoff and reports whether the request
+// should be replayed on the route it already selected. It is the answer for a
+// 429 that no provider change can fix: an account-wide limit that names no
+// endpoint, a manual pin, or an automatic pin with nothing else eligible to
+// move to. Waiting is orr's convenience, not the client's, so the wait yields to
+// the client's context: a request that has already been abandoned is never held
+// for a retry nobody will read. A 429 whose Retry-After names a window longer
+// than the ceiling is not absorbed at all; it reaches the client as it arrived.
+func (p *proxy) absorbRateLimit(ctx context.Context, header http.Header) bool {
+	wait, replay := p.rateLimitRetryDelay(header)
+	if !replay {
+		return false
+	}
+	if wait <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // providerUnavailableReplacement immediately moves away from an endpoint that
 // OpenRouter says no longer serves the selected model. Retrying the same dead
 // endpoint cannot help, so this failure does not consume the configurable 429
@@ -872,7 +1145,7 @@ func (p *proxy) providerUnavailableReplacement(model, provider string) (string, 
 	p.rateLimitMu.Lock()
 	delete(p.rateLimitRuns, key)
 	p.rateLimitMu.Unlock()
-	replacement, accepted := p.automaticProviderFailover(model, provider)
+	replacement, accepted := p.automaticProviderFailover(model, provider, false)
 	if !accepted {
 		return "", false
 	}
@@ -884,8 +1157,12 @@ func (p *proxy) providerUnavailableReplacement(model, provider string) (string, 
 	return replacement, true
 }
 
-func (p *proxy) automaticProviderFailover(model, provider string) (string, bool) {
-	replacement, accepted := p.routing.markProviderUnavailableAndFailover(model, provider)
+// automaticProviderFailover moves the automatic route away from a provider that
+// just failed and mirrors the new pin into the stats. rateLimited records how the
+// failure is remembered: a 429 blocks the provider for the rate limit's short
+// cooldown, while an unreachable provider is remembered for the full TTL.
+func (p *proxy) automaticProviderFailover(model, provider string, rateLimited bool) (string, bool) {
+	replacement, accepted := p.routing.markProviderUnavailableAndFailover(model, provider, rateLimited)
 	if !accepted {
 		return "", false
 	}
@@ -1623,6 +1900,50 @@ func (p *proxy) testProviderContext(ctx context.Context, model, provider string,
 	}, nil
 }
 
+// probeDefaultProvider sends one minimal ping-pong request with no provider
+// preferences, so OpenRouter's default routing picks the endpoint, and returns
+// the endpoint tag it chose. It answers the dashboard's `O` probe: which
+// provider default routing would have used. The request is real and billed, so
+// it is recorded like a benchmark round — kept out of provider health
+// accounting but visible in stats.
+func (p *proxy) probeDefaultProvider(model string) (string, error) {
+	return p.probeDefaultProviderContext(context.Background(), model)
+}
+
+func (p *proxy) probeDefaultProviderContext(ctx context.Context, model string) (string, error) {
+	if !validModelID(model) {
+		return "", fmt.Errorf("model %q is not a valid author/model", model)
+	}
+	if p.cfg.openRouterKey() == "" {
+		return "", fmt.Errorf("no OpenRouter API key configured")
+	}
+	target := *p.upstream
+	target.Path = strings.TrimRight(p.upstream.Path, "/") + "/chat/completions"
+	payload, err := json.Marshal(map[string]any{
+		"model":      model,
+		"messages":   []any{map[string]any{"role": "user", "content": "ping"}},
+		"max_tokens": providerTestMaxTokens,
+		"stream":     true,
+		"usage":      map[string]any{"include": true},
+	})
+	if err != nil {
+		return "", err
+	}
+	roundCtx, cancel := context.WithTimeout(ctx, providerTestTimeout)
+	defer cancel()
+	record, err := p.pingPong(roundCtx, target.String(), payload, model, "")
+	record.Benchmark = true
+	p.stats.record(record)
+	if err != nil {
+		return "", err
+	}
+	if record.Provider == "" {
+		return "", fmt.Errorf("OpenRouter did not report which provider served the default route")
+	}
+	provider, _ := p.routing.resolveProvider(model, record.Provider)
+	return provider, nil
+}
+
 // noteBlocked records a routing refusal against the provider that caused it,
 // so the provider stops being ranked, pinned and benchmarked until the block
 // expires. A failed persist is logged rather than surfaced: the block still
@@ -1695,6 +2016,13 @@ func medianFloat(values []float64) float64 {
 func (p *proxy) pingPong(ctx context.Context, target string, payload []byte, model, provider string) (requestRecord, error) {
 	started := p.now()
 	record := requestRecord{Time: started, Method: http.MethodPost, Path: "/v1/chat/completions", Model: model, Provider: provider}
+	// An empty provider means the caller let OpenRouter's default routing choose;
+	// the stream then reports which provider answered, and naming it keeps the
+	// error messages below honest about what was refused.
+	providerLabel := provider
+	if providerLabel == "" {
+		providerLabel = "the default route"
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(payload))
 	if err != nil {
 		record.Duration = p.now().Sub(started)
@@ -1718,7 +2046,7 @@ func (p *proxy) pingPong(ctx context.Context, target string, payload []byte, mod
 		record.Duration = p.now().Sub(started)
 		if refusal, blocked := parseBlockedReason(body); blocked {
 			record.Blocked, record.BlockedReason = true, refusal.Reason
-			return record, fmt.Errorf("provider %s is blocked for this account: %s", provider, refusal.Reason)
+			return record, fmt.Errorf("provider %s is blocked for this account: %s", providerLabel, refusal.Reason)
 		}
 		return record, fmt.Errorf("provider returned HTTP %d", resp.StatusCode)
 	}
@@ -1744,6 +2072,9 @@ func (p *proxy) pingPong(ctx context.Context, target string, payload []byte, mod
 	record.Duration = p.now().Sub(started)
 	record.TTFT = ttft
 	summary := extractResponseSummary(tail)
+	if provider == "" && summary.provider != "" {
+		record.Provider = summary.provider
+	}
 	record.PromptTokens = summary.promptTokens
 	record.CompletionTokens = summary.completionTokens
 	record.ReasoningTokens = summary.reasoningTokens
@@ -1754,7 +2085,7 @@ func (p *proxy) pingPong(ctx context.Context, target string, payload []byte, mod
 	}
 	if refusal, blocked := parseBlockedReason(tail); blocked {
 		record.Blocked, record.BlockedReason, record.Err = true, refusal.Reason, true
-		return record, fmt.Errorf("provider %s is blocked for this account: %s", provider, refusal.Reason)
+		return record, fmt.Errorf("provider %s is blocked for this account: %s", providerLabel, refusal.Reason)
 	}
 	if record.CompletionTokens <= 0 {
 		return record, fmt.Errorf("no completion tokens in response")

@@ -31,12 +31,71 @@ type config struct {
 	DegradationMinSamples      int
 	DegradationCooldown        time.Duration
 	DegradationTimeout         time.Duration
+	Loop                       loopConfig
 	db                         *store.Store
 	dbPath                     string
 	preferEnvFile              bool
 }
 
-const defaultRateLimitFailoverThreshold = 2
+// defaultRateLimitFailoverThreshold counts the provider-attributed 429s one
+// model tolerates before orr moves to another provider. One means the first 429
+// fails over immediately, which is what a client that never retries — an agent
+// subagent, for instance — needs: a forwarded 429 ends its turn, and an unused
+// tolerance cannot help it. A user who prefers the client to see the first 429
+// can raise it through ORR_429_FAILOVER_THRESHOLD.
+const defaultRateLimitFailoverThreshold = 1
+
+// loopMode is what orr does when the tail of a streamed response starts
+// repeating itself.
+type loopMode string
+
+const (
+	loopModeOff     loopMode = "off"
+	loopModeObserve loopMode = "observe"
+	loopModeAbort   loopMode = "abort"
+	loopModeRecover loopMode = "recover"
+)
+
+// loopConfig holds loop detection's mode and thresholds. MinPeriod and
+// MinRepeat bound how much of the stream the detector holds: nothing larger
+// than those two windows is ever compared.
+type loopConfig struct {
+	Mode             loopMode
+	MinPeriod        int
+	MinRepeat        int
+	MaxContinuations int
+	Penalty          float64
+}
+
+// Loop detection ships on in recover mode: the repeating tail is cut out, the
+// continuation is requested again with anti-repetition sampling, and the two
+// pieces are spliced into one stream. Off, observe, and abort are the quieter
+// alternatives ORR_LOOP_DETECTION accepts.
+const (
+	defaultLoopMode             = loopModeRecover
+	defaultLoopMinPeriod        = 32
+	defaultLoopMinRepeat        = 512
+	defaultLoopMaxContinuations = 1
+	defaultLoopPenalty          = 0.4
+	minLoopMinPeriod            = 8
+	maxLoopPenalty              = 2
+	// maxLoopMinPeriod is the detector's own period ceiling, not a tuned limit, and
+	// it is half of loopMaxPeriod rather than all of it: a repeating unit shorter
+	// than the minimum is rounded up to a multiple of it, and that multiple still has
+	// to fit inside what tier 1 considers. At the full 2048 a 40-byte unit rounds to
+	// 2080 and is discarded, which is the silent no-detection this bound exists to
+	// prevent — with 1024 the worst rounding (minimum + unit - 1) stays under 2048.
+	maxLoopMinPeriod = loopMaxPeriod / 2
+	// minLoopMinRepeat is the detector's own suffix floor: whatever is configured,
+	// tier 2 never accepts a shorter exactly periodic suffix, so a smaller minimum
+	// repetition is raised to this instead of applied.
+	minLoopMinRepeat = loopMinSuffixBytes
+	// maxLoopMinRepeat is the detector's own ring size, not a tuned limit: it keeps
+	// only that much text per channel, so a minimum repetition longer than the ring
+	// can never be confirmed. Above it detection does not get stricter, it silently
+	// never fires.
+	maxLoopMinRepeat = loopRingBytes
+)
 
 // Degradation recovery ships on: it only ever acts on an automatic pin, and
 // its cooldown bounds how often it may spend a benchmark. The threshold is the
@@ -76,7 +135,14 @@ func loadConfigWithOptions(envPath string, preferEnvFile bool) (config, error) {
 		DegradationMinSamples:      defaultDegradationMinSamples,
 		DegradationCooldown:        defaultDegradationCooldown,
 		DegradationTimeout:         defaultDegradationTimeout,
-		preferEnvFile:              preferEnvFile,
+		Loop: loopConfig{
+			Mode:             defaultLoopMode,
+			MinPeriod:        defaultLoopMinPeriod,
+			MinRepeat:        defaultLoopMinRepeat,
+			MaxContinuations: defaultLoopMaxContinuations,
+			Penalty:          defaultLoopPenalty,
+		},
+		preferEnvFile: preferEnvFile,
 	}
 
 	fileEnv, err := readDotEnv(envPath)
@@ -173,6 +239,41 @@ func loadConfigWithOptions(envPath string, preferEnvFile bool) (config, error) {
 			return config{}, fmt.Errorf("parse ORR_DEGRADATION_TIMEOUT: %w", err)
 		}
 		cfg.DegradationTimeout = parsed
+	}
+	if raw := value("ORR_LOOP_DETECTION"); raw != "" {
+		parsed, err := parseLoopMode(raw)
+		if err != nil {
+			return config{}, err
+		}
+		cfg.Loop.Mode = parsed
+	}
+	if raw := value("ORR_LOOP_MIN_PERIOD"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return config{}, fmt.Errorf("parse ORR_LOOP_MIN_PERIOD: must be an integer")
+		}
+		cfg.Loop.MinPeriod = parsed
+	}
+	if raw := value("ORR_LOOP_MIN_REPEAT"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return config{}, fmt.Errorf("parse ORR_LOOP_MIN_REPEAT: must be an integer")
+		}
+		cfg.Loop.MinRepeat = parsed
+	}
+	if raw := value("ORR_LOOP_MAX_CONTINUATIONS"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return config{}, fmt.Errorf("parse ORR_LOOP_MAX_CONTINUATIONS: must be an integer")
+		}
+		cfg.Loop.MaxContinuations = parsed
+	}
+	if raw := value("ORR_LOOP_PENALTY"); raw != "" {
+		parsed, err := strconv.ParseFloat(raw, 64)
+		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+			return config{}, fmt.Errorf("parse ORR_LOOP_PENALTY: must be a number")
+		}
+		cfg.Loop.Penalty = parsed
 	}
 	cfg.OpenRouterAPIKey = value("OPENROUTER_API_KEY")
 
@@ -275,6 +376,18 @@ func envValue(fileEnv map[string]string, name string, preferEnvFile bool) string
 	return strings.TrimSpace(fileEnv[name])
 }
 
+// parseLoopMode reads ORR_LOOP_DETECTION. An unrecognized value is an error
+// that names every accepted one, so a typo fails at startup instead of
+// silently falling back to a mode the operator did not choose.
+func parseLoopMode(raw string) (loopMode, error) {
+	switch mode := loopMode(strings.ToLower(strings.TrimSpace(raw))); mode {
+	case loopModeOff, loopModeObserve, loopModeAbort, loopModeRecover:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("parse ORR_LOOP_DETECTION: must be one of %s, %s, %s, or %s", loopModeOff, loopModeObserve, loopModeAbort, loopModeRecover)
+	}
+}
+
 func (c config) openRouterKey() string {
 	if key := strings.TrimSpace(c.OpenRouterAPIKey); key != "" {
 		return key
@@ -327,7 +440,46 @@ func (c config) validate() error {
 	if c.DegradationTimeout <= 0 {
 		return fmt.Errorf("ORR_DEGRADATION_TIMEOUT must be positive")
 	}
+	if err := c.validateLoop(); err != nil {
+		return err
+	}
 	return validateModels(c.Models)
+}
+
+// validateLoop runs after parsing because the windows are only meaningful
+// against each other: a repeat shorter than two periods cannot be told apart
+// from ordinary phrasing, and a repeat longer than the detector's ring can never
+// be confirmed at all. The detector's own absolute bounds are checked first,
+// before the relative ones: a period it discards or a repeat it would raise
+// silently weakens detection whatever the other setting is.
+func (c config) validateLoop() error {
+	switch c.Loop.Mode {
+	case loopModeOff, loopModeObserve, loopModeAbort, loopModeRecover:
+	default:
+		return fmt.Errorf("ORR_LOOP_DETECTION must be one of %s, %s, %s, or %s", loopModeOff, loopModeObserve, loopModeAbort, loopModeRecover)
+	}
+	if c.Loop.MinPeriod < minLoopMinPeriod {
+		return fmt.Errorf("ORR_LOOP_MIN_PERIOD must be at least %d", minLoopMinPeriod)
+	}
+	if c.Loop.MinPeriod > maxLoopMinPeriod {
+		return fmt.Errorf("ORR_LOOP_MIN_PERIOD must be at most %d, the longest repeating unit the detector considers: tier 1 discards a longer period, so detection silently never fires instead of getting stricter", maxLoopMinPeriod)
+	}
+	if c.Loop.MinRepeat < minLoopMinRepeat {
+		return fmt.Errorf("ORR_LOOP_MIN_REPEAT must be at least %d: the detector never looks back less than that, so a smaller value would be raised to it rather than applied", minLoopMinRepeat)
+	}
+	if c.Loop.MinRepeat < 2*c.Loop.MinPeriod {
+		return fmt.Errorf("ORR_LOOP_MIN_REPEAT must be at least twice ORR_LOOP_MIN_PERIOD (%d)", 2*c.Loop.MinPeriod)
+	}
+	if c.Loop.MinRepeat > maxLoopMinRepeat {
+		return fmt.Errorf("ORR_LOOP_MIN_REPEAT must be at most %d, the detector's ring size: a longer repeat never fits in the text it keeps, so tier 2 cannot confirm it and detection silently never fires", maxLoopMinRepeat)
+	}
+	if c.Loop.MaxContinuations < 0 {
+		return fmt.Errorf("ORR_LOOP_MAX_CONTINUATIONS cannot be negative")
+	}
+	if c.Loop.Penalty < 0 || c.Loop.Penalty > maxLoopPenalty {
+		return fmt.Errorf("ORR_LOOP_PENALTY must be between 0 and %g", float64(maxLoopPenalty))
+	}
+	return nil
 }
 
 // validateModels rejects stored routing values the upstream API would refuse, so
