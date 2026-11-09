@@ -37,6 +37,23 @@ func TestAPIDocsPublicAndEmbedded(t *testing.T) {
 	}
 }
 
+// The served schema states the version the binary reports. The embedded JSON is
+// the only copy, so it is pinned to Version here: a version bump that forgets the
+// API docs fails this test instead of leaving the served schema lying.
+func TestOpenAPIVersionMatchesBinary(t *testing.T) {
+	var spec struct {
+		Info struct {
+			Version string `json:"version"`
+		} `json:"info"`
+	}
+	if err := json.Unmarshal(openAPISchema, &spec); err != nil {
+		t.Fatal(err)
+	}
+	if spec.Info.Version != Version {
+		t.Fatalf("schema version = %q, want the binary's %q", spec.Info.Version, Version)
+	}
+}
+
 func TestOpenAPIPathsMatchHandlers(t *testing.T) {
 	var spec struct {
 		OpenAPI    string                                `json:"openapi"`

@@ -187,7 +187,7 @@ func TestRateLimitFailoverMovesOnlyAutomaticPin(t *testing.T) {
 		}},
 	}}, time.Hour)
 	routing.autoPin(model, "limited")
-	if replacement, changed := routing.markProviderUnavailableAndFailover(model, "limited"); !changed || replacement != "healthy" {
+	if replacement, changed := routing.markProviderUnavailableAndFailover(model, "limited", true); !changed || replacement != "healthy" {
 		t.Fatalf("automatic failover = %q, %v; want healthy, true", replacement, changed)
 	}
 	if provider, manual := routing.pinInfo(model); provider != "healthy" || manual {
@@ -195,7 +195,7 @@ func TestRateLimitFailoverMovesOnlyAutomaticPin(t *testing.T) {
 	}
 
 	routing.pin(model, "limited")
-	if replacement, changed := routing.markProviderUnavailableAndFailover(model, "limited"); changed || replacement != "" {
+	if replacement, changed := routing.markProviderUnavailableAndFailover(model, "limited", true); changed || replacement != "" {
 		t.Fatalf("manual pin was failed over to %q", replacement)
 	}
 	if provider, manual := routing.pinInfo(model); provider != "limited" || !manual {
@@ -210,7 +210,7 @@ func TestRateLimitFailoverClearsAutomaticPinWithoutCandidate(t *testing.T) {
 	}}, time.Hour)
 	routing.autoPin(model, "only")
 
-	if replacement, accepted := routing.markProviderUnavailableAndFailover(model, "only"); !accepted || replacement != "" {
+	if replacement, accepted := routing.markProviderUnavailableAndFailover(model, "only", true); !accepted || replacement != "" {
 		t.Fatalf("rate-limit failover = %q, %v; want empty, true", replacement, accepted)
 	}
 	if provider, manual := routing.pinInfo(model); provider != "" || manual {
@@ -226,7 +226,7 @@ func TestLateSuccessDoesNotClearRateLimitFailure(t *testing.T) {
 	}}, time.Hour)
 	routing.now = func() time.Time { return detectedAt }
 	routing.autoPin(model, "limited")
-	if _, accepted := routing.markProviderUnavailableAndFailover(model, "limited"); !accepted {
+	if _, accepted := routing.markProviderUnavailableAndFailover(model, "limited", true); !accepted {
 		t.Fatal("rate-limit failure was not accepted")
 	}
 
@@ -251,7 +251,7 @@ func TestBenchmarkStartedBeforeRateLimitCannotRestoreFailedProvider(t *testing.T
 	}
 	routing.autoPin(model, "fast-limited")
 	revision := routing.modelRevision(model)
-	if replacement, accepted := routing.markProviderUnavailableAndFailover(model, "fast-limited"); !accepted || replacement != "healthy" {
+	if replacement, accepted := routing.markProviderUnavailableAndFailover(model, "fast-limited", true); !accepted || replacement != "healthy" {
 		t.Fatalf("rate-limit failover = %q, %v; want healthy, true", replacement, accepted)
 	}
 
@@ -271,12 +271,117 @@ func TestBenchmarkStartedBeforeRateLimitCannotRestoreFailedProvider(t *testing.T
 	// The threshold counter may observe the old pin immediately before a
 	// concurrent benchmark installs the replacement. The health transition
 	// must return that new automatic pin instead of leaking the threshold 429.
-	if replacement, accepted := routing.markProviderUnavailableAndFailover(model, "fast-limited"); !accepted || replacement != "healthy" {
+	if replacement, accepted := routing.markProviderUnavailableAndFailover(model, "fast-limited", true); !accepted || replacement != "healthy" {
 		t.Fatalf("concurrent replacement = %q, %v; want healthy, true", replacement, accepted)
 	}
 	cfg, _ := routing.modelConfig(model)
 	if want := []string{"healthy", "fast-limited"}; !equalSlices(cfg.Order, want) {
 		t.Fatalf("provider order = %v, want %v", cfg.Order, want)
+	}
+}
+
+// A provider-attributed 429 is a statement about capacity in the last few
+// seconds, not a verdict that the endpoint cannot serve the model. With the
+// default threshold of one, aging the mark like a removed provider would drop a
+// working provider from selection, from its pin, and from automatic benchmarks
+// for half an hour after a single transient 429.
+// A 429 says nothing about an endpoint OpenRouter has said no longer serves the
+// model, so it must not replace that mark and cut the exclusion down to the
+// rate-limit cooldown.
+func TestRateLimitMarkDoesNotShortenAnUnavailabilityMark(t *testing.T) {
+	const model = "author/model"
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	routing := newRoutingState(map[string]providerConfig{model: {
+		Order: []string{"gone", "healthy"},
+	}}, time.Hour)
+	routing.now = func() time.Time { return now }
+	if _, accepted := routing.markProviderUnavailableAndFailover(model, "gone", false); !accepted {
+		t.Fatal("unavailability failure was not accepted")
+	}
+	now = now.Add(time.Minute)
+	if _, accepted := routing.markProviderUnavailableAndFailover(model, "gone", true); !accepted {
+		t.Fatal("rate-limit failure was not accepted")
+	}
+	now = now.Add(rateLimitUnavailableCooldown + time.Second)
+	if !routing.isTemporarilyUnavailable(model, "gone") {
+		t.Fatal("a 429 shortened an unavailability exclusion to the rate-limit cooldown")
+	}
+	if !routing.temporarilyUnavailableProviders(model)["gone"] {
+		t.Fatal("automatic benchmarks skip a provider the 429 downgraded")
+	}
+}
+
+// A lapsed exclusion must not suppress a fresh 429 mark: otherwise the provider that
+// just rate-limited is treated as available, and the recovery benchmark spends a
+// request probing it.
+func TestExpiredMarkDoesNotSuppressAFreshRateLimit(t *testing.T) {
+	const model = "author/model"
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	routing := newRoutingState(map[string]providerConfig{model: {
+		Order: []string{"gone", "healthy"},
+	}}, time.Hour)
+	routing.now = func() time.Time { return now }
+	if _, accepted := routing.markProviderUnavailableAndFailover(model, "gone", false); !accepted {
+		t.Fatal("unavailability failure was not accepted")
+	}
+	now = now.Add(measuredMetricsTTL + time.Second)
+	if routing.isTemporarilyUnavailable(model, "gone") {
+		t.Fatal("the unavailability exclusion outlived the measured TTL")
+	}
+	if _, accepted := routing.markProviderUnavailableAndFailover(model, "gone", true); !accepted {
+		t.Fatal("rate-limit failure was not accepted")
+	}
+	if !routing.isTemporarilyUnavailable(model, "gone") {
+		t.Fatal("a lapsed exclusion suppressed the fresh rate-limit mark")
+	}
+	now = now.Add(rateLimitUnavailableCooldown + time.Second)
+	if routing.isTemporarilyUnavailable(model, "gone") {
+		t.Fatal("the fresh rate-limit mark did not expire on its own cooldown")
+	}
+}
+
+func TestRateLimitMarkExpiresOnShorterCooldownThanRemoval(t *testing.T) {
+	const model = "author/model"
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	routing := newRoutingState(map[string]providerConfig{model: {
+		Order: []string{"limited", "gone"},
+	}}, time.Hour)
+	routing.now = func() time.Time { return now }
+	if rateLimitUnavailableCooldown >= measuredMetricsTTL {
+		t.Fatalf("rate-limit cooldown = %v, want shorter than the %v unavailability cooldown", rateLimitUnavailableCooldown, measuredMetricsTTL)
+	}
+	if _, accepted := routing.markProviderUnavailableAndFailover(model, "limited", true); !accepted {
+		t.Fatal("rate-limit failure was not accepted")
+	}
+	if _, accepted := routing.markProviderUnavailableAndFailover(model, "gone", false); !accepted {
+		t.Fatal("unavailability failure was not accepted")
+	}
+
+	now = now.Add(rateLimitUnavailableCooldown - time.Second)
+	if !routing.isTemporarilyUnavailable(model, "limited") {
+		t.Fatal("rate-limited provider returned before its cooldown ended")
+	}
+	if excluded := routing.temporarilyUnavailableProviders(model); !excluded["limited"] || !excluded["gone"] {
+		t.Fatalf("excluded providers = %v, want both marks still in force", excluded)
+	}
+
+	now = now.Add(time.Second)
+	if routing.isTemporarilyUnavailable(model, "limited") {
+		t.Fatal("rate-limited provider is still excluded after its own cooldown")
+	}
+	if routing.temporarilyUnavailableProviders(model)["limited"] {
+		t.Fatal("automatic benchmarks still skip the rate-limited provider after its cooldown")
+	}
+	if !routing.temporarilyUnavailableProviders(model)["gone"] {
+		t.Fatal("provider that cannot serve the model returned before the measured TTL")
+	}
+
+	now = now.Add(measuredMetricsTTL)
+	if routing.isTemporarilyUnavailable(model, "gone") {
+		t.Fatal("unavailable provider is still excluded after the measured TTL")
+	}
+	if excluded := routing.temporarilyUnavailableProviders(model); len(excluded) != 0 {
+		t.Fatalf("excluded providers = %v, want none", excluded)
 	}
 }
 

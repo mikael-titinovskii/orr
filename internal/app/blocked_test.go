@@ -796,7 +796,7 @@ func TestClientRequestDoesNotRetryOrdinaryFailures(t *testing.T) {
 	attempts := 0
 	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		attempts++
-		return response(http.StatusTooManyRequests, rateLimitBody), nil
+		return response(http.StatusInternalServerError, `{"error":{"message":"upstream unavailable","code":500}}`), nil
 	})
 
 	req, _ := http.NewRequest(http.MethodPost, "http://proxy.test/v1/chat/completions",
@@ -807,14 +807,14 @@ func TestClientRequestDoesNotRetryOrdinaryFailures(t *testing.T) {
 	if attempts != 1 {
 		t.Fatalf("attempts = %d, want 1", attempts)
 	}
-	if res.Code != http.StatusTooManyRequests {
+	if res.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want the upstream failure forwarded", res.Code)
 	}
-	if !strings.Contains(res.Body.String(), "rate-limited") {
+	if !strings.Contains(res.Body.String(), "upstream unavailable") {
 		t.Fatalf("error body was not forwarded: %s", res.Body.String())
 	}
 	if p.routing.isBlocked(model, "a") {
-		t.Fatal("a rate limit was recorded as a policy block")
+		t.Fatal("an ordinary failure was recorded as a policy block")
 	}
 }
 

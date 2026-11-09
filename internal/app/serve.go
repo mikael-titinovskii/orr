@@ -100,6 +100,10 @@ func serve(cfg config) error {
 
 	log.Printf("orr listening on http://%s/v1", cfg.Listen)
 	log.Printf("forwarding to %s", strings.TrimRight(cfg.Upstream, "/"))
+	// Loop detection ships on in recover mode, which means orr may cut a repeating
+	// tail and spend a second upstream request to continue the answer. An operator
+	// should read that policy at startup rather than infer it from a cut stream.
+	log.Printf("loop detection: %s", cfg.Loop.Mode)
 	if tuiEnabled {
 		// The TUI owns the terminal now. Send log writes to a file instead of
 		// stderr: a stray stderr write desyncs the alternate-screen cursor, so
@@ -175,6 +179,9 @@ func runDashboard(ctx context.Context, cfg config, p *proxy, serverErrors <-chan
 	dashboard.testAllProviders = func(model string, providers []string) []providerTestResult {
 		results, _ := p.benchmarkProviders(model, providers, time.Now().Add(manualBenchmarkGate), false, len(providers))
 		return results
+	}
+	dashboard.defaultProviderProbe = func(model string) (string, error) {
+		return p.probeDefaultProvider(model)
 	}
 	program := tea.NewProgram(dashboard, tea.WithAltScreen())
 	go func() {

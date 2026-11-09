@@ -110,6 +110,34 @@ orr serve --prefer-env-file
 orr providers moonshotai/kimi-k3 --env ./local.env --prefer-env-file
 ```
 
+## Upgrading
+
+Two behaviours changed for installations that never set the variables behind
+them.
+
+- **Loop recovery is on.** `ORR_LOOP_DETECTION` defaults to `recover`, so a
+  streamed answer that starts repeating itself is cut there and continued with
+  one extra upstream request. That request is billable and counts against your
+  OpenRouter rate limits, and the recovered request's row understates the spend
+  because the cut leg's own usage never arrives (see
+  [Loop detection](#loop-detection)). A repeat in the model's *thinking* is cut
+  and restarted the same way, with the same one extra request, as long as the
+  answer itself had not started.
+- **A single rate limit moves the pin.** `ORR_429_FAILOVER_THRESHOLD` defaults to
+  `1`, so an automatic pin moves to another provider on the first
+  provider-attributed 429 instead of passing that 429 on to the client.
+
+To restore the previous behaviour, set both:
+
+```dotenv
+ORR_LOOP_DETECTION=off
+ORR_429_FAILOVER_THRESHOLD=2
+```
+
+`observe` is the quieter middle ground for loop detection: the output is
+untouched and no extra request is made, and the request log still marks the
+responses that would have been cut.
+
 ## Management API
 
 `orr serve` also exposes a REST API at `http://127.0.0.1:8787/api/v1`, with or
@@ -154,6 +182,7 @@ The useful controls are:
 | `o` | Change the provider table's display order: routing order, then each metric column. |
 | `t` | Benchmark the selected provider. |
 | `a` | Benchmark every listed provider. |
+| `O` | Probe which provider OpenRouter's default routing picks, and mark its row with `o`. |
 | `s` | Start or stop the spend stopwatch. |
 | `q` / `Ctrl+C` | Stop the proxy cleanly. |
 
@@ -165,6 +194,13 @@ before returning to `Default`. Prices sort cheapest first, `Tp`/`mTp`, `GPQA`, a
 `Tau` fastest or highest first, latencies lowest first, and the error columns
 cleanest first; a provider with a blank cell for the active column sorts below
 every provider that reports one.
+
+`O` answers what OpenRouter would have chosen on its own. It sends one minimal
+request with no provider preferences — the same shape as a `t` benchmark but
+without the pinned provider — so OpenRouter's default routing picks the endpoint,
+and then marks the chosen provider's row with a trailing `o`. The mark expires on
+the same window as the measured metrics. The request is real and billable, so it
+is recorded like a benchmark round.
 
 `k` opens a search box over the dashboard. It lists the models the dashboard
 already knows and, once the OpenRouter catalog arrives, every model the catalog
@@ -208,7 +244,11 @@ the listed providers for that model. The provider table shows the cache-read
 price in `Cache`; cache-hit percentages are shown in the request log.
 The request log's own columns are `In`, `Uncached`, and `Out` for input,
 uncached-input, and output tokens, `CR` and `CW` for cache reads and writes,
-and `C%` for the cached share of the input.
+and `C%` for the cached share of the input. A request whose response began
+repeating itself carries a loop mark before its status: `↺` when the repetition
+was only detected, `↺!` when the stream was cut there, and `↺+` when a
+continuation was spliced over the cut. The mark says the response repeated; the
+suffix says what `orr` did about it.
 Every other column of the request log carries a subtle background shade so
 values stay distinguishable across the table's full width; failed requests keep
 the error red across the whole row.
@@ -228,10 +268,49 @@ See [OpenRouter's Auto Exacto documentation](https://openrouter.ai/docs/guides/r
 for how the benchmarks and tool-call errors are measured.
 
 Manual pins stay until removed. Automatic pins select the best measured
-provider, expire after `ORR_PIN_TTL` (one hour by default), and can fail over
-after provider-specific 429s or an unavailable endpoint. The recovery benchmark a
+provider, expire after `ORR_PIN_TTL` (one hour by default), and move on the first
+provider-attributed 429 or an unavailable endpoint. The recovery benchmark a
 failure starts is held to a 30-second cooldown per model, saved in the database,
 so a restart does not hand the same failing provider a fresh run.
+
+A client should not have to spend a retry on a 429, because clients that never
+retry — a subagent worker is the case this is for — die on the first one. A rate
+limit OpenRouter attributes to the selected provider moves the pin to another
+provider of the same model immediately, and the request is answered without the
+client spending a retry. A 429 that no provider change can answer is absorbed
+instead: at most one wait per request — a quarter of a second, or the response's
+`Retry-After` when it asks for three seconds or less, ending at once if the
+client hangs up — and then one retry of the same request. A longer `Retry-After`
+is not waited out at all: that 429 goes to the client as it arrived, with no
+retry, because the provider has already said when it will accept the request
+again and a replay inside that window would spend the request's one retry on a
+refusal. Absorption covers a manual pin, which never moves, and an account-wide
+limit that names no provider — the shape several clients sharing one API key run
+into — whatever the threshold is. An automatic pin earns the same absorption
+only once the threshold has been reached with nothing else eligible to move to.
+
+The invariant is one replay per client request, and the 429 after it: however
+many attempts a request's route chain takes, `orr` replays it at most once, and
+the next 429 is the answer the client receives. In a chain of limited providers
+that is the third 429, not the second. When the selected provider is limited and
+the provider it failed over to is limited too, the first 429 is answered by the
+failover, the second by the one replay, and the client receives the third. Past
+that bound nothing is absorbed again, so a provider that keeps answering 429 and
+a manually pinned model whose provider stays rate-limited both deliver their 429
+unchanged.
+`ORR_429_FAILOVER_THRESHOLD` (default `1`) is the setting behind that: it counts
+automatic pins only, and it is how many attributed 429s one provider gets before
+the pin moves. A manual pin never moves, so it always absorbs the first 429
+whatever the value; raising the threshold is what restores the older tolerance
+for an automatic pin, whose single 429 is then passed through and has to be
+retried by the client.
+
+A rate limit is treated as a burst, not as a verdict: a provider that answered
+429 is out of automatic selection, out of failover candidates, and out of
+automatic benchmark runs for about two minutes, and is eligible again after that
+without any request from you. An endpoint that is unavailable, rather than
+merely rate-limited, keeps that exclusion for the 30 minutes the measured
+metrics live.
 
 A conversation that replays encrypted reasoning can only continue on the
 provider that produced it. When the automatic pin has moved since, orr retries
@@ -443,13 +522,176 @@ Then run `/models` refresh (or `/reload`) in Kimi Code. Every OpenRouter model i
 imported into `~/.kimi-code/config.toml`; the provider's `api_key` comes from
 `source.apiKey`, so it must be non-empty.
 
+## Loop detection
+
+A model can get stuck repeating the same sentence, the same code block, or the
+same list until the output limit cuts it off. `orr` watches the stream for that
+and treats it as a fault of the generation, not of the client's request.
+
+`ORR_LOOP_DETECTION` picks what happens:
+
+| Mode | Behavior |
+| --- | --- |
+| `off` | Pass the response through byte for byte. Nothing is inspected. |
+| `observe` | Pass the response through unchanged and take no action. |
+| `abort` | End the response at the point the repeat starts, so the client's stream finishes instead of running to the output limit. |
+| `recover` | The default. Cut the repeating tail, ask the model to continue from the cut, and splice the continuation into the one stream the client is reading. |
+
+`recover` is the default because a client still streaming a loop is waiting for
+output nobody will read, while a long answer that derails once is usually still
+wanted.
+
+Detection only looks at text `orr` has just forwarded. It keeps a fixed 8 KiB
+ring of that recent history per channel, whatever the settings say, and a
+repeated stretch shorter than `ORR_LOOP_MIN_PERIOD` bytes (32 by default) is
+ordinary phrasing rather than a loop. `ORR_LOOP_MIN_REPEAT` (512 by default) is
+the shortest exactly repeating suffix that confirms one — a threshold, not the
+amount of history held, so raising it makes detection stricter rather than
+larger. A whole response is never buffered, so a request's detection memory does
+not grow with its length.
+
+What counts as text is fixed, and narrower than the whole stream. Chat
+completions contributes `delta.content`, `delta.reasoning`,
+`delta.reasoning_content`, and the `reasoning.text` and `reasoning.summary`
+items of `delta.reasoning_details`; the Responses API contributes
+`response.output_text.delta`, `response.reasoning_text.delta`, and
+`response.reasoning_summary_text.delta`; Messages contributes `text_delta`,
+`thinking_delta`, and `input_json_delta`. Encrypted reasoning — the
+`reasoning.encrypted` items a provider hands back as an opaque blob — is never
+measured, because there is no prose in it to compare. On the response it belongs to
+it reaches the client untouched; a continuation's own encrypted items are dropped
+with the rest of that leg's frames, since they identify a response the client never
+opened.
+
+Both settings are byte counts with ends the detector itself sets, and a value
+outside them is refused at startup rather than accepted and silently overridden:
+
+- `ORR_LOOP_MIN_PERIOD` is between 8 and 1024. A repeating unit shorter than the
+  minimum is rounded up to a multiple of it, and that multiple still has to fit
+  inside the 2048-byte stretch tier 1 considers — which is why the accepted
+  maximum is half of it: at the full 2048 a 40-byte unit rounds to 2080 and is
+  discarded, so detection would silently never fire.
+- `ORR_LOOP_MIN_REPEAT` is between 512 and 8192, and at least twice
+  `ORR_LOOP_MIN_PERIOD` — a rule that only bites for periods above 256. Tier 2
+  never accepts an exactly periodic suffix shorter than 512 bytes, so a smaller
+  minimum repetition would be raised to 512 rather than applied. The upper end is
+  the fixed 8192-byte ring that history lives in: a minimum longer than the text
+  the detector keeps can never be satisfied, so nothing is ever confirmed and
+  detection silently never fires. Past the ring the setting does not make
+  detection stricter, it turns it off. Inside the range a larger value does
+  narrow detection, because fewer repeats are long enough to confirm. A value
+  right at the ceiling only fires when a single repeating unit fills the whole
+  ring evenly, so the practical setting stays well below it. If the repeats you
+  see are longer units rather than longer runs of the same unit, raise
+  `ORR_LOOP_MIN_PERIOD` instead.
+
+Recovery then:
+
+1. stops forwarding where the repeat starts and drops the repeated part;
+2. sends one more upstream request, with the repetition penalty
+   `ORR_LOOP_PENALTY` (default `0.4`) applied to sampling, so it is less likely to
+   fall back into the same groove. A repeat in the answer resumes from the text
+   already sent. A repeat in the model's *thinking* cannot be resumed, because no
+   provider takes a thought back as the assistant's own turn, so it restarts
+   instead: the client's own conversation plus one instruction to answer
+   directly, with the thought that looped left out. Restarting is only worth a
+   request while the client holds nothing yet — no prose and no tool call —
+   because afterwards a second answer or a second call would be appended to it;
+3. relays that continuation inside the same response body, so the client reads
+   one answer rather than two.
+
+`ORR_LOOP_MAX_CONTINUATIONS` (default `1`) is how many such continuations one
+response may use; with `0` the cut is where the answer ends. A value above `1`
+adds nothing: a continuation that repeats itself ends the answer instead of being
+continued again, because resuming the text it just failed to escape would spend
+another request to arrive back at the same verdict.
+
+What the client receives is one response, not two stitched together:
+
+- **One identity.** The continuation opens a message of its own upstream, and
+  those opening frames are dropped: the client already has the `message_start`,
+  `response.created`, or role frame of the response it is reading.
+- **One terminator.** The aborted leg's finish frames never reach the client. The
+  response ends with the same sequence `abort` writes — a `finish_reason` chunk
+  and `[DONE]` for chat completions, `response.completed` for the Responses API,
+  and `content_block_stop`, `message_delta`, and `message_stop` for Messages —
+  written once, after the spliced text.
+- **A usage figure on Messages, and only there.** The continuation's own usage
+  frame is dropped with the rest of its non-text frames. A `/v1/messages` client
+  is told the continuation's output-token estimate in `message_delta`; chat
+  completions and the Responses API carry no usage in their terminal frames,
+  exactly as in `abort`.
+- **Messages recovery is best-effort for anything but single-block text.** The
+  reframer forwards every `text_delta`, `thinking_delta`, and `input_json_delta`
+  frame byte for byte with the index it arrived with, and drops the continuation's
+  own `content_block_start`; it never compares that index with the block the client
+  has open. A continuation whose first block is thinking or tool use, or one that
+  opened a second block, therefore hands the client deltas for a block it never saw
+  start. A single-block text continuation, which is what a repeated answer
+  produces, splices cleanly.
+- **Comments while it waits.** Between the cut and the continuation's first token
+  the client receives SSE comment lines (`: `), which every event-stream parser
+  ignores. They keep a client with an idle-read timeout from treating the wait as
+  a dead stream, and no empty `data:` frame is ever sent.
+
+Recovery falls back to a plain cut — the answer ends where the repetition was
+confirmed, with the same terminator — whenever a continuation cannot be used at
+all: the repeat was in tool-call arguments (a truncated JSON prefix is not a turn
+a model can continue), the repeat was in the reasoning channel after the client
+had already been handed prose or a tool call (a restart there would append a
+second answer or a second call), the answer repeat had no clean text before it to
+resume from, `ORR_LOOP_MAX_CONTINUATIONS` is `0`, or the continuation request was
+refused, rate-limited, timed out, or answered with something that is not an event
+stream. That request is marked `↺!` in the dashboard, and the plain log names the
+reason.
+
+A splice can also end early and still be both. The text the continuation did
+generate is spliced in, so the client still receives a complete-looking answer and
+the request is marked `↺+`, and the answer then ends where the continuation stopped
+— either because it repeated itself, or because its stream broke off mid-splice.
+The log line names which of the two instead of leaving it at "stream recovered":
+
+```
+loop detected in /v1/chat/completions for <model>: 69 bytes repeated 15 times; stream recovered, then ended: continuation repeated itself
+loop detected in /v1/chat/completions for <model>: 69 bytes repeated 15 times; stream recovered, then ended: continuation stream ended early
+```
+
+Either way the client still receives a valid terminator, and the answer it holds is
+only the part of the continuation that arrived.
+
+Recovery is not a passive inspection, and its cost is real:
+
+- **One extra upstream request** per recovery. It is billable, and it counts
+  against your OpenRouter rate limits. It is not a second client request: it never
+  appears in the request log, the request counts, or a provider's health, and its
+  tokens and cost are added to the row of the request it continued.
+- **A slow token at the cut.** The gap between the last token before the cut and
+  the first token of the continuation reads like a slow token; the comment lines
+  above are what keep it from reading like a dead connection.
+- **A row that understates the spend.** A recovered request's row carries what the
+  cut leg reported — normally nothing, because the cut closes the stream before its
+  usage frame arrives — plus the continuation's own usage, or the estimate from the
+  text it generated when it reported none. What it cannot carry is the cut leg's own
+  prompt and the prefix that leg generated: that prompt was the whole conversation,
+  re-sent and re-billed on the second leg, and its usage frame never arrived. Read
+  the row as a lower bound on what the answer cost.
+
+Turn the feature off in `.env` and restart `orr serve`:
+
+```dotenv
+ORR_LOOP_DETECTION=off
+```
+
+`observe` is the middle ground for deciding whether to keep the feature: the
+output is untouched and no extra request is made.
+
 ## Runtime options
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ORR_TUI` | `true` | Enable the interactive dashboard. |
 | `ORR_PIN_TTL` | `1h` | Lifetime of automatic pins. |
-| `ORR_429_FAILOVER_THRESHOLD` | `2` | Consecutive provider 429s before automatic failover. |
+| `ORR_429_FAILOVER_THRESHOLD` | `1` | Provider-attributed 429s an automatic pin tolerates before the model moves to another provider; `1` moves on the first, and a higher value lets a 429 reach the client first. A manual pin never moves and is unaffected. |
 | `ORR_LOG_REQUESTS` | `true` | Emit completed request lines in plain-log mode. |
 | `ORR_UPDATE_MAX_PROVIDERS` | `20` | Maximum providers kept after a refresh. |
 | `ORR_UPDATE_CACHE_ONLY` | `false` | Prefer only prompt-cache-capable providers. |
@@ -459,6 +701,11 @@ imported into `~/.kimi-code/config.toml`; the provider's `api_key` comes from
 | `ORR_DEGRADATION_MIN_SAMPLES` | `3` | Answered requests required in the window before vitals are judged. |
 | `ORR_DEGRADATION_COOLDOWN` | `10m` | Minimum gap between recovery benchmarks for one model; must be positive. |
 | `ORR_DEGRADATION_TIMEOUT` | `10s` | How long one recovery refresh and benchmark may take. |
+| `ORR_LOOP_DETECTION` | `recover` | What to do when a streamed response repeats itself: `off`, `observe`, `abort`, or `recover`. |
+| `ORR_LOOP_MIN_PERIOD` | `32` | Shortest repeating stretch, in bytes, that counts as a loop; between 8 and 1024. A shorter unit is rounded up to a multiple of this, and that multiple must still fit the 2048-byte stretch the detector considers, so values above 1024 are refused rather than left to disable detection. |
+| `ORR_LOOP_MIN_REPEAT` | `512` | Shortest exactly repeating suffix, in bytes, that confirms a loop; between 512 and 8192, and at least twice the period. It sets the confirmation threshold, not the history held: the ring is a fixed 8 KiB. A smaller value would be raised to 512; above 8192 no repeat fits in the ring and detection never fires. |
+| `ORR_LOOP_MAX_CONTINUATIONS` | `1` | Continuations `recover` may request for one response; 0 allows none. |
+| `ORR_LOOP_PENALTY` | `0.4` | Repetition penalty applied to the recovery request; between 0 and 2. |
 
 `OPENROUTER_API_KEY` also enables benchmarks, usage tracking, and account
 metrics. Client requests still use the client’s own authorization header.

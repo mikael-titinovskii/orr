@@ -228,7 +228,7 @@ type routingState struct {
 	modelOrderDone         map[string]chan struct{}
 	modelOrderFailedAt     map[string]time.Time
 	pendingPins            map[string]persistedPin
-	temporarilyUnavailable map[string]map[string]time.Time
+	temporarilyUnavailable map[string]map[string]unavailableMark
 	timeWeight             float64
 	// degradation is the live watchdog switch. It is read on the request path
 	// before any vitals work, so turning it off skips the scan entirely.
@@ -258,7 +258,7 @@ func newRoutingState(models map[string]providerConfig, pinTTL time.Duration) *ro
 		modelOrderDone:         make(map[string]chan struct{}),
 		modelOrderFailedAt:     make(map[string]time.Time),
 		pendingPins:            make(map[string]persistedPin),
-		temporarilyUnavailable: make(map[string]map[string]time.Time),
+		temporarilyUnavailable: make(map[string]map[string]unavailableMark),
 		timeWeight:             defaultBenchmarkTimeWeight,
 		degradation:            true,
 		now:                    time.Now,
@@ -625,9 +625,35 @@ func (r *routingState) markBlocked(model, provider, reason string) (bool, error)
 	return true, err
 }
 
+// unavailableMark records when a provider was excluded from automatic routing
+// and why. The reason decides how long the exclusion lasts, so it has to be
+// stored rather than inferred: the same map holds both kinds.
+type unavailableMark struct {
+	detectedAt time.Time
+	rateLimit  bool
+}
+
+// rateLimitUnavailableCooldown is how long a provider-attributed 429 keeps a
+// provider out of automatic selection, pins, and automatic benchmarks. It is
+// deliberately far shorter than measuredMetricsTTL: a rate limit describes the
+// last few seconds of capacity, not the endpoint's ability to serve the model.
+// With the default threshold of one, a single transient 429 would otherwise
+// remove a working provider from the order for half an hour. A provider that
+// genuinely cannot serve the model keeps the full measuredMetricsTTL.
+const rateLimitUnavailableCooldown = 2 * time.Minute
+
+// unavailableCooldown is how long one mark excludes its provider.
+func unavailableCooldown(mark unavailableMark) time.Duration {
+	if mark.rateLimit {
+		return rateLimitUnavailableCooldown
+	}
+	return measuredMetricsTTL
+}
+
 // markProviderUnavailableAndFailover records a transient provider failure and
 // moves an automatic pin away from it. This covers an exhausted rate limit and
-// an endpoint that disappeared from the model between catalog refreshes.
+// an endpoint that disappeared from the model between catalog refreshes;
+// rateLimited selects which of the two cooldowns the mark carries.
 // persistMu serializes this health transition with
 // benchmark commits: either the benchmark applies first and this method fixes
 // its pin afterward, or this method applies first and the benchmark sees the
@@ -637,7 +663,7 @@ func (r *routingState) markBlocked(model, provider, reason string) (bool, error)
 // The replacement may already be current when a concurrent benchmark changed
 // the pin first. An empty replacement means no eligible fallback was available
 // in the current order.
-func (r *routingState) markProviderUnavailableAndFailover(model, provider string) (string, bool) {
+func (r *routingState) markProviderUnavailableAndFailover(model, provider string, rateLimited bool) (string, bool) {
 	if model == "" || provider == "" {
 		return "", false
 	}
@@ -653,10 +679,18 @@ func (r *routingState) markProviderUnavailableAndFailover(model, provider string
 	now := r.now()
 	limited := r.temporarilyUnavailable[model]
 	if limited == nil {
-		limited = make(map[string]time.Time)
+		limited = make(map[string]unavailableMark)
 		r.temporarilyUnavailable[model] = limited
 	}
-	limited[provider] = now
+	// A 429 says nothing about an endpoint OpenRouter has said no longer serves the
+	// model, so it must not shorten that exclusion: only a claim at least as strong
+	// as the one already in force replaces it. An entry whose cooldown has lapsed is
+	// not in force and must not suppress a fresh mark either, or a provider that just
+	// rate-limited is treated as available.
+	if existing, ok := limited[provider]; !ok || existing.rateLimit || !rateLimited ||
+		!providerUnavailableLocked(limited, provider, now) {
+		limited[provider] = unavailableMark{detectedAt: now, rateLimit: rateLimited}
+	}
 	if pinned && pin.provider != provider && !providerUnavailableLocked(limited, pin.provider, now) && !isBlockedLocked(cfg, pin.provider, now) {
 		return pin.provider, true
 	}
@@ -677,9 +711,9 @@ func (r *routingState) markProviderUnavailableAndFailover(model, provider string
 	return "", true
 }
 
-func providerUnavailableLocked(providers map[string]time.Time, provider string, now time.Time) bool {
-	detectedAt, ok := providers[provider]
-	return ok && now.Sub(detectedAt) < measuredMetricsTTL
+func providerUnavailableLocked(providers map[string]unavailableMark, provider string, now time.Time) bool {
+	mark, ok := providers[provider]
+	return ok && now.Sub(mark.detectedAt) < unavailableCooldown(mark)
 }
 
 func (r *routingState) temporarilyUnavailableProviders(model string) map[string]bool {
@@ -688,8 +722,8 @@ func (r *routingState) temporarilyUnavailableProviders(model string) map[string]
 	defer r.mu.Unlock()
 	providers := r.temporarilyUnavailable[model]
 	recent := make(map[string]bool, len(providers))
-	for provider, detectedAt := range providers {
-		if now.Sub(detectedAt) >= measuredMetricsTTL {
+	for provider, mark := range providers {
+		if now.Sub(mark.detectedAt) >= unavailableCooldown(mark) {
 			delete(providers, provider)
 			continue
 		}
@@ -712,8 +746,8 @@ func (r *routingState) clearProviderUnavailable(model, provider string, requestS
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	providers := r.temporarilyUnavailable[model]
-	detectedAt, ok := providers[provider]
-	if !ok || requestStarted.Before(detectedAt) {
+	mark, ok := providers[provider]
+	if !ok || requestStarted.Before(mark.detectedAt) {
 		return
 	}
 	delete(providers, provider)
@@ -1523,8 +1557,8 @@ func (r *routingState) applyProviderTestResultsAtRevision(model string, results 
 	for provider, rate := range apiErrors {
 		effectiveErrors[provider] = rate
 	}
-	for provider, detectedAt := range r.temporarilyUnavailable[model] {
-		if now.Sub(detectedAt) < measuredMetricsTTL {
+	for provider, mark := range r.temporarilyUnavailable[model] {
+		if now.Sub(mark.detectedAt) < unavailableCooldown(mark) {
 			effectiveErrors[provider] = 1
 		}
 	}
