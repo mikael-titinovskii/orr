@@ -174,7 +174,7 @@ The useful controls are:
 | `Enter` | Toggle a manual pin for the selected provider. |
 | `←` / `→` | Move the speed/price control between its stops. |
 | `d` | Turn degradation recovery on or off. |
-| `p` | Change the day the `Prediction` line prices: 10m to 200m tokens in steps of ten million. |
+| `p` | Change the day the `Prediction` line and the `$Mon` column price: 50m, 100m, 300m, 500m, 700m, or 1000m tokens per day. The chosen day is saved. |
 | `Tab` | Switch between recently used models. |
 | `k` | Search the model catalog and open the highlighted model in a tab. |
 | `x` | Close the current model tab. |
@@ -190,7 +190,8 @@ The useful controls are:
 stored provider order stay as they are, so requests keep following the same route.
 The `Order` field in the routing pane names the active column, the column's own
 name is highlighted in the table, and each press of `o` moves to the next column
-before returning to `Default`. Prices sort cheapest first, `Tp`/`mTp`, `GPQA`, and
+before returning to `Default`. `$Mon` and the price columns sort cheapest
+first, `Tp`/`mTp`, `GPQA`, and
 `Tau` fastest or highest first, latencies lowest first, and the error columns
 cleanest first; a provider with a blank cell for the active column sorts below
 every provider that reports one.
@@ -213,19 +214,24 @@ back, so closing a tab whose traffic is still in flight is temporary.
 
 The `Prediction` line under the header projects what the highlighted provider
 would cost over the next hour, the next eight hours, and the next 20 working
-days. It prices one day of tokens — 20 million unless `p` changes it — split the
+days. It prices one day of tokens — 100 million unless `p` changes it — split the
 way auto selection's reference request splits it (2,000 uncached input, 30,000
 cached input, and 200 output tokens), against that provider's published
 prices; the label names the day it prices and the key that changes it. Pressing
-`p` cycles 10m to 200m tokens per day in steps of ten million, cycling back to
-10m. The label quotes the day and the 20-working-day month it adds up to, so the
-volume is never an abstract number: `20m/d 400m/m`. The workload never
+`p` cycles 50m, 100m, 300m, 500m, 700m, and 1000m tokens per day, cycling back
+to the first. The label quotes the day and the 20-working-day month it adds up
+to, so the volume is never an abstract number: `100m/d 2b/m`. The workload never
 follows live traffic, so the figures change only when you change the day, move
-the selection to another provider, or that provider reprices; the chosen day
-stays in memory and resets with the process. The 20-day value assumes an
+the selection to another provider, or that provider reprices; the chosen day is
+saved and restored on the next start. The 20-day value assumes an
 eight-hour working day at today's prices. The line stays out when the provider
 is blocked for the account, when its catalog entry is missing a price the
 projection needs, or when the pane is too narrow for all three horizons.
+
+The `$Mon` column leads the provider table's metrics: it prices each
+provider at the same day the `Prediction` line uses, for the same 20-working-day
+month, so it is the projection's `20d` figure shown every provider at once. It
+is colored on the same cheapest-green→priciest-red scale as the price columns.
 
 The provider table includes OpenRouter's published `GPQA` Diamond and `Tau`
 Airline benchmark scores, plus `Tool` and `Json` error rates. Benchmark

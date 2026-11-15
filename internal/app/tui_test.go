@@ -85,7 +85,7 @@ func TestComputeScoresSevenProviderPriceDistribution(t *testing.T) {
 		}
 	}
 
-	scores := computeScores(providers, endpoints, nil)
+	scores := computeScores(providers, endpoints, nil, newPredictionRate(float64(predictionWorkloadSteps[defaultPredictionWorkloadStep])))
 	if got := scores["cheapest"].prompt; got != 1 {
 		t.Fatalf("cheapest score = %v, want endpoint 1", got)
 	}
@@ -96,6 +96,29 @@ func TestComputeScoresSevenProviderPriceDistribution(t *testing.T) {
 		if got := scores[provider].prompt; got <= 0 {
 			t.Fatalf("clustered provider %q has worst score %v", provider, got)
 		}
+	}
+}
+
+// The $Mon column is scored like the price columns: the cheapest provider's
+// projected month reads green, the priciest red, and a provider whose catalog
+// entry cannot price the workload stays unscored rather than free.
+func TestComputeScoresMonthGradientFollowsMonthlyBill(t *testing.T) {
+	providers := []string{"cheap", "pricey", "unpriced"}
+	endpoints := map[string]endpointMeta{
+		"cheap":    {Tag: "cheap", Pricing: endpointPricing{Prompt: decimal(1), Completion: decimal(2)}},
+		"pricey":   {Tag: "pricey", Pricing: endpointPricing{Prompt: decimal(4), Completion: decimal(8)}},
+		"unpriced": {Tag: "unpriced", Pricing: endpointPricing{Prompt: decimal(1)}},
+	}
+	rate := newPredictionRate(float64(predictionWorkloadSteps[defaultPredictionWorkloadStep]))
+	scores := computeScores(providers, endpoints, nil, rate)
+	if got := scores["cheap"].month; got != 1 {
+		t.Fatalf("cheapest monthly bill scored %v, want 1", got)
+	}
+	if got := scores["pricey"].month; got != 0 {
+		t.Fatalf("priciest monthly bill scored %v, want 0", got)
+	}
+	if got := scores["unpriced"].month; got != noScore {
+		t.Fatalf("a provider missing an output price scored %v, want noScore", got)
 	}
 }
 
@@ -153,10 +176,10 @@ func TestRenderHistoryPerDayUsesLocalCosts(t *testing.T) {
 		CreditMonth: "2026-03",
 	}
 	got := renderHistoryPerDay(snap, now, 60)
-	if !strings.Contains(got, "This m  $3.0000") {
+	if !strings.Contains(got, "This m $3") {
 		t.Fatalf("history used account-wide credit spend:\n%s", got)
 	}
-	if !strings.Contains(got, "Last m  $7.0000") {
+	if !strings.Contains(got, "Last m $7") {
 		t.Fatalf("last month spend crossed month boundary:\n%s", got)
 	}
 }
@@ -178,10 +201,11 @@ func TestRenderHistoryPerDayShowsRecentPersistedDays(t *testing.T) {
 	got := renderHistoryPerDay(snap, now, 60)
 	for _, want := range []string{
 		"History",
-		"This m  $24.9000  1.50m",
-		"Last m  $5.0000  0.50m",
-		"Aug 30   $23.0000",
-		"Jul 15   $5.0000",
+		"Month  Cost   Tokens Med/day Med tok",
+		"This m $25    2m     $13     1m",
+		"Last m $5     0m     $5      0m",
+		"Aug 30 $23.00 1m",
+		"Jul 15 $5.00  0m",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q:\n%s", want, got)
@@ -193,18 +217,18 @@ func TestRenderHistoryPerDayShowsRecentPersistedDays(t *testing.T) {
 }
 
 // Token counts stay in millions until a thousand of them would be printed, at
-// which point billions read better than "1478.16m".
+// which point billions read better than "1478m", and are always rounded to a
+// whole number of the chosen unit.
 func TestFormatDailyTokensSwitchesToBillions(t *testing.T) {
 	for _, test := range []struct {
 		tokens int64
 		want   string
 	}{
 		{0, ""},
-		{250_000, "0.25m"},
-		{999_000_000, "999.00m"},
-		{999_994_999, "999.99m"},
-		{999_995_000, "1.00b"},
-		{1_478_160_000, "1.48b"},
+		{250_000, "0m"},
+		{999_000_000, "999m"},
+		{999_994_999, "1b"},
+		{1_478_160_000, "1b"},
 	} {
 		if got := formatDailyTokens(test.tokens); got != test.want {
 			t.Fatalf("formatDailyTokens(%d) = %q, want %q", test.tokens, got, test.want)
@@ -221,9 +245,10 @@ func TestRenderHistoryPerDayCapsAtSevenDays(t *testing.T) {
 	}
 	snap := statsSnapshot{DailyCosts: days}
 	got := renderHistoryPerDay(snap, now, 60)
-	// Seven day rows plus the populated current-month summary; the missing
-	// previous month stays blank and the 8th-oldest day must be absent.
-	if strings.Count(got, "$") != 1+7 {
+	// Seven day rows plus the populated current-month summary, which now carries
+	// two figures (the month total and its median day); the missing previous month
+	// stays blank and the 8th-oldest day must be absent.
+	if strings.Count(got, "$") != 2+7 {
 		t.Fatalf("expected 7 day rows, got:\n%s", got)
 	}
 	for _, want := range []string{
@@ -533,6 +558,24 @@ func TestRenderHistoryLeavesMissingMonthsBlank(t *testing.T) {
 	got := renderHistoryPerDay(statsSnapshot{}, now, 60)
 	if strings.Contains(got, "$0.0000") {
 		t.Fatalf("missing month cost rendered as zero:\n%s", got)
+	}
+}
+
+// The $Mon column and the history month totals show whole dollars, rounding the
+// cents up so a spend meant to be planned against is never understated.
+func TestFormatWholeDollarsRoundsCentsUp(t *testing.T) {
+	for cost, want := range map[float64]string{
+		0:     "",
+		-1:    "",
+		0.4:   "$1",
+		76.02: "$77",
+		73.04: "$74",
+		83.85: "$84",
+		190:   "$190",
+	} {
+		if got := formatWholeDollars(cost); got != want {
+			t.Errorf("formatWholeDollars(%v) = %q, want %q", cost, got, want)
+		}
 	}
 }
 
@@ -2037,7 +2080,7 @@ func TestRoutingPaneProjectsSelectedProviderSpend(t *testing.T) {
 		Time: now.Add(-time.Minute), Model: model, Provider: "fast", Status: 200,
 		PromptTokens: 2000, CachedTokens: 1000, CompletionTokens: 1000,
 	})
-	// The whole 20M reference day is this model's: 2.5M tokens per active hour,
+	// The whole 100M reference day is this model's: 12.5M tokens per active hour,
 	// split evenly across uncached input, cache reads, and output.
 	dashboard := newDashboard(config{}, stats, routing)
 	dashboard.syncModel()
@@ -2052,7 +2095,7 @@ func TestRoutingPaneProjectsSelectedProviderSpend(t *testing.T) {
 		return ""
 	}
 	dashboard.selection = 0
-	if got, want := header(190), "Prediction (p) 20m/d 400m/m  1h $0.68  8h $5.47  20d $109"; got != want {
+	if got, want := header(190), "Prediction (p) 100m/d 2b/m  1h $3.42  8h $27.33  20d $547"; got != want {
 		t.Fatalf("routing pane projection = %q, want %q", got, want)
 	}
 	lines := strings.Split(ansi.Strip(dashboard.renderRouting(stats.snapshot(), 190, 24)), "\n")
@@ -2065,7 +2108,7 @@ func TestRoutingPaneProjectsSelectedProviderSpend(t *testing.T) {
 		}
 	}
 	dashboard.selection = 1
-	if got, want := header(190), "Prediction (p) 20m/d 400m/m  1h $0.36  8h $2.86  20d $57.14"; got != want {
+	if got, want := header(190), "Prediction (p) 100m/d 2b/m  1h $1.79  8h $14.29  20d $286"; got != want {
 		t.Fatalf("projection after moving the selection = %q, want %q", got, want)
 	}
 	// A burst of traffic with a different token mix must not move the figure: the
@@ -2076,7 +2119,7 @@ func TestRoutingPaneProjectsSelectedProviderSpend(t *testing.T) {
 			PromptTokens: 60_000, CachedTokens: 120_000, CompletionTokens: 300,
 		})
 	}
-	if got, want := header(190), "Prediction (p) 20m/d 400m/m  1h $0.36  8h $2.86  20d $57.14"; got != want {
+	if got, want := header(190), "Prediction (p) 100m/d 2b/m  1h $1.79  8h $14.29  20d $286"; got != want {
 		t.Fatalf("projection drifted with traffic: %q, want %q", got, want)
 	}
 	if got := header(30); got != "" {
@@ -2113,17 +2156,17 @@ func TestRoutingPanePredictsBeforeAnyTraffic(t *testing.T) {
 	dashboard := newDashboard(config{}, stats, routing)
 	dashboard.syncModel()
 
-	// 2.5M tokens per active hour, split 2/21 uncached, 18/21 cached, and 1/21
+	// 12.5M tokens per active hour, split 2/21 uncached, 18/21 cached, and 1/21
 	// output by the reference request.
 	view := ansi.Strip(dashboard.renderRouting(stats.snapshot(), 190, 24))
-	if want := "Prediction (p) 20m/d 400m/m  1h $0.68  8h $5.47  20d $109"; !strings.Contains(view, want) {
+	if want := "Prediction (p) 100m/d 2b/m  1h $3.42  8h $27.33  20d $547"; !strings.Contains(view, want) {
 		t.Fatalf("routing pane has no cold-start projection %q:\n%s", want, view)
 	}
 }
 
-// 'p' walks the day the projection prices from 10m to 200m tokens in steps of
-// ten million, then wraps. The label and the prices move together, and the
-// choice is view state rather than settings, so nothing is persisted.
+// 'p' walks the day the projection prices from 50m to 1000m tokens, then wraps.
+// The label and the prices move together; the choice is a view setting, but it
+// is mirrored into stats so a restart keeps it.
 func TestPredictionKeyCyclesWorkload(t *testing.T) {
 	const model = "moonshotai/kimi-k3"
 	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"fast"}}}, time.Hour)
@@ -2144,25 +2187,25 @@ func TestPredictionKeyCyclesWorkload(t *testing.T) {
 		}
 		return ""
 	}
-	if got, want := line(), "Prediction (p) 20m/d 400m/m  1h $0.68  8h $5.47  20d $109"; got != want {
+	if got, want := line(), "Prediction (p) 100m/d 2b/m  1h $3.42  8h $27.33  20d $547"; got != want {
 		t.Fatalf("initial projection = %q, want %q", got, want)
 	}
 	updated, _ := dashboard.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
 	dashboard = updated.(dashboardModel)
-	if got, want := line(), "Prediction (p) 30m/d 600m/m  1h $1.02  8h $8.20  20d $164"; got != want {
+	if got, want := line(), "Prediction (p) 300m/d 6b/m  1h $10.25  8h $81.99  20d $1640"; got != want {
 		t.Fatalf("projection after one press = %q, want %q", got, want)
 	}
-	// The last stop is 200m, and one more press wraps back to the default.
+	// The last stop is 1000m, and one more press wraps back to the default.
 	for range predictionWorkloadSteps[2 : len(predictionWorkloadSteps)-1] {
 		updated, _ := dashboard.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
 		dashboard = updated.(dashboardModel)
 	}
-	if got, want := line(), "Prediction (p) 200m/d 4b/m  1h $6.83  8h $54.66  20d $1093"; got != want {
+	if got, want := line(), "Prediction (p) 1b/d 20b/m  1h $34.16  8h $273  20d $5466"; got != want {
 		t.Fatalf("projection at the last stop = %q, want %q", got, want)
 	}
 	updated, _ = dashboard.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
 	dashboard = updated.(dashboardModel)
-	if got, want := line(), "Prediction (p) 10m/d 200m/m  1h $0.34  8h $2.73  20d $54.66"; got != want {
+	if got, want := line(), "Prediction (p) 50m/d 1b/m  1h $1.71  8h $13.66  20d $273"; got != want {
 		t.Fatalf("projection after wrapping = %q, want %q", got, want)
 	}
 }
@@ -2270,6 +2313,7 @@ func TestProviderTableOrderKeyCyclesColumns(t *testing.T) {
 		t.Fatalf("routing header does not name the routing order:\n%s", got)
 	}
 	want := []providerSortColumn{
+		providerSortMonth,
 		providerSortInput, providerSortOutput, providerSortCache, providerSortThroughput,
 		providerSortMeasuredThroughput, providerSortLatency, providerSortMeasuredLatency,
 		providerSortGPQA, providerSortTau, providerSortToolError, providerSortJSONError,
@@ -2347,6 +2391,8 @@ func TestProviderTableOrderSortsRowsWithoutTouchingRouting(t *testing.T) {
 	}
 
 	check(providerSortRoute, "fast")
+	press("o") // $Mon: the cheaper monthly bill leads.
+	check(providerSortMonth, "cheap")
 	press("o") // In: the cheaper prompt price leads.
 	check(providerSortInput, "cheap")
 	press("o") // Out
@@ -2373,8 +2419,8 @@ func TestProviderTableOrderKeepsSelectionOnProvider(t *testing.T) {
 	routing := newRoutingState(map[string]providerConfig{model: {Order: []string{"fast", "cheap"}}}, time.Hour)
 	routing.setCurrentModel(model)
 	routing.endpointCache[model] = []endpointMeta{
-		{Tag: "fast", Pricing: endpointPricing{Prompt: 0.000002}, Throughput: 120, Latency: 300},
-		{Tag: "cheap", Pricing: endpointPricing{Prompt: 0.0000005}, Throughput: 60, Latency: 500},
+		{Tag: "fast", Pricing: endpointPricing{Prompt: 0.000002, Completion: 0.000008}, Throughput: 120, Latency: 300},
+		{Tag: "cheap", Pricing: endpointPricing{Prompt: 0.0000005, Completion: 0.000002}, Throughput: 60, Latency: 500},
 	}
 	dashboard := newDashboard(config{}, newStats(), routing)
 	dashboard.syncModel()
@@ -2444,8 +2490,8 @@ func TestProviderTableHighlightsSortedColumnName(t *testing.T) {
 	updated, _ := dashboard.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
 	dashboard = updated.(dashboardModel)
 	line := tableHeader()
-	if got := styledCell(line, keyHintStyle); got != "In" {
-		t.Fatalf("sorted column name is %q, want In:\n%q", got, ansi.Strip(line))
+	if got := styledCell(line, keyHintStyle); got != "$Mon" {
+		t.Fatalf("sorted column name is %q, want $Mon:\n%q", got, ansi.Strip(line))
 	}
 
 	// The compact layout has no single header row, so each metric line heads
@@ -2453,9 +2499,9 @@ func TestProviderTableHighlightsSortedColumnName(t *testing.T) {
 	marked, dimmed := false, false
 	for _, line := range strings.Split(dashboard.renderRouting(dashboard.stats.snapshot(), 68, 40), "\n") {
 		switch {
-		case strings.Contains(ansi.Strip(line), "Cache ") && styledCell(line, keyHintStyle) == "In":
+		case strings.Contains(ansi.Strip(line), "Cache ") && styledCell(line, keyHintStyle) == "$Mon":
 			marked = true
-		case strings.Contains(ansi.Strip(line), "Cache ") && styledCell(line, dimStyle) == "In":
+		case strings.Contains(ansi.Strip(line), "Cache ") && styledCell(line, dimStyle) == "$Mon":
 			dimmed = true
 		}
 	}
@@ -2549,7 +2595,7 @@ func TestRoutingHeaderKeepsOrderIndicatorInsidePane(t *testing.T) {
 	// The counter, the order indicator, the model, and the pin appear in that
 	// order, so the two states read before the name they qualify.
 	wide := header(120)
-	positions := []string{"[1/2 Tab]", "Order In (o)", "Model  " + model, "Pin    cheap (manual)"}
+	positions := []string{"[1/2 Tab]", "Order $Mon (o)", "Model  " + model, "Pin    cheap (manual)"}
 	previous := -1
 	for _, segment := range positions {
 		at := strings.Index(wide, segment)
