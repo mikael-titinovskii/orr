@@ -233,6 +233,11 @@ type stats struct {
 	// state the user has never toggled.
 	degradation      bool
 	degradationSaved bool
+	// predictionTokens is the daily token volume the 'p' key last priced. Zero
+	// means the choice has never been made, so the dashboard keeps its default
+	// stop; the value is a view setting, but it outlives the process so a
+	// restart keeps pricing the same day.
+	predictionTokens int64
 	inFlight         int
 	mutations        uint64
 	now              func() time.Time
@@ -302,6 +307,20 @@ func (s *stats) setDegradation(enabled bool) {
 	s.mu.Lock()
 	s.degradation = enabled
 	s.degradationSaved = true
+	s.mu.Unlock()
+}
+
+// currentPredictionTokens is the persisted daily token volume the 'p' key last
+// priced, or zero when it has never been set.
+func (s *stats) currentPredictionTokens() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.predictionTokens
+}
+
+func (s *stats) setPredictionTokens(tokens int64) {
+	s.mu.Lock()
+	s.predictionTokens = tokens
 	s.mu.Unlock()
 }
 
@@ -626,6 +645,8 @@ func (s *stats) save(db *store.Store) error {
 	}
 	timeWeight := s.timeWeight
 	snapshot.TimeWeight = &timeWeight
+	predictionTokens := s.predictionTokens
+	snapshot.PredictionTokens = &predictionTokens
 	// Only a switch the user actually toggled is saved. Writing the seeded value
 	// on every save would freeze it in the database on the first run and make
 	// ORR_DEGRADATION unchangeable from then on.
@@ -747,6 +768,9 @@ func (s *stats) load(db *store.Store) error {
 	if saved.Degradation != nil {
 		s.degradation = *saved.Degradation
 		s.degradationSaved = true
+	}
+	if saved.PredictionTokens != nil {
+		s.predictionTokens = *saved.PredictionTokens
 	}
 	return nil
 }

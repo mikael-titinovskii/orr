@@ -38,6 +38,7 @@ type Stats struct {
 	RecoveryRuns     map[string]time.Time
 	TimeWeight       *float64
 	Degradation      *bool
+	PredictionTokens *int64
 	BenchmarkSamples map[string]map[string][]Sample
 }
 
@@ -75,12 +76,13 @@ func (s *Store) LoadStats() (Stats, error) {
 }
 
 func (s *Store) loadState(stats *Stats) error {
-	row := s.db.QueryRow(`SELECT request_count, credit_spend, credit_month, budget, budget_reset, time_weight, degradation FROM state WHERE id = 1`)
+	row := s.db.QueryRow(`SELECT request_count, credit_spend, credit_month, budget, budget_reset, time_weight, degradation, prediction_tokens FROM state WHERE id = 1`)
 	var (
 		timeWeight  sql.NullFloat64
 		degradation sql.NullInt64
+		prediction  sql.NullInt64
 	)
-	err := row.Scan(&stats.RequestCount, &stats.CreditSpend, &stats.CreditMonth, &stats.Budget, &stats.BudgetReset, &timeWeight, &degradation)
+	err := row.Scan(&stats.RequestCount, &stats.CreditSpend, &stats.CreditMonth, &stats.Budget, &stats.BudgetReset, &timeWeight, &degradation, &prediction)
 	if err == sql.ErrNoRows {
 		return nil
 	}
@@ -94,6 +96,10 @@ func (s *Store) loadState(stats *Stats) error {
 	if degradation.Valid {
 		value := degradation.Int64 != 0
 		stats.Degradation = &value
+	}
+	if prediction.Valid {
+		value := prediction.Int64
+		stats.PredictionTokens = &value
 	}
 	return nil
 }
@@ -254,26 +260,30 @@ func (s *Store) SaveStats(stats Stats) error {
 }
 
 func saveState(tx *sql.Tx, stats Stats) error {
-	var timeWeight, degradation any
+	var timeWeight, degradation, predictionTokens any
 	if stats.TimeWeight != nil {
 		timeWeight = *stats.TimeWeight
 	}
 	if stats.Degradation != nil {
 		degradation = boolAsInt(*stats.Degradation)
 	}
+	if stats.PredictionTokens != nil {
+		predictionTokens = *stats.PredictionTokens
+	}
 	_, err := tx.Exec(
-		`INSERT INTO state (id, request_count, credit_spend, credit_month, budget, budget_reset, time_weight, degradation)
-		 VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO state (id, request_count, credit_spend, credit_month, budget, budget_reset, time_weight, degradation, prediction_tokens)
+		 VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (id) DO UPDATE SET
-		     request_count = excluded.request_count,
-		     credit_spend  = excluded.credit_spend,
-		     credit_month  = excluded.credit_month,
-		     budget        = excluded.budget,
-		     budget_reset  = excluded.budget_reset,
-		     time_weight   = excluded.time_weight,
-		     degradation   = excluded.degradation`,
+		     request_count     = excluded.request_count,
+		     credit_spend      = excluded.credit_spend,
+		     credit_month      = excluded.credit_month,
+		     budget            = excluded.budget,
+		     budget_reset      = excluded.budget_reset,
+		     time_weight       = excluded.time_weight,
+		     degradation       = excluded.degradation,
+		     prediction_tokens = excluded.prediction_tokens`,
 		stats.RequestCount, stats.CreditSpend, stats.CreditMonth,
-		stats.Budget, stats.BudgetReset, timeWeight, degradation,
+		stats.Budget, stats.BudgetReset, timeWeight, degradation, predictionTokens,
 	)
 	if err != nil {
 		return fmt.Errorf("write state: %w", err)

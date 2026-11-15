@@ -293,6 +293,11 @@ func newDashboard(cfg config, stats *stats, routing *routingState) dashboardMode
 		closedModels:     make(map[string]time.Time),
 		frames:           &frameCache{},
 	}
+	// A day chosen with 'p' in an earlier run is restored so a restart keeps
+	// pricing the same volume; without one the default stop stands.
+	if tokens := stats.currentPredictionTokens(); tokens > 0 {
+		m.predictionStep = predictionStepForTokens(tokens)
+	}
 	if upstream, err := url.Parse(cfg.Upstream); err == nil && upstream.Scheme == "https" && upstream.Host == "openrouter.ai" {
 		client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 		m.fetchQuality = func(model string) (providerQualityCache, error) {
@@ -532,9 +537,11 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "d":
 			m.toggleDegradation()
 		case "p":
-			// Cycle the day the projection prices. It is a view setting, so it
-			// stays in memory and resets with the process.
+			// Cycle the day the projection prices. It is a view setting, but the
+			// choice is mirrored into stats so it is saved and restored with the
+			// rest of the state.
 			m.predictionStep = (m.predictionStep + 1) % len(predictionWorkloadSteps)
+			m.stats.setPredictionTokens(m.predictionStepValue())
 		case "k":
 			m.openPicker()
 			return m, m.pickerCmd()
@@ -1403,31 +1410,66 @@ func renderUsageBar(used float64, width int) string {
 	return rendered.String()
 }
 
-// renderHistoryPerDay renders the per-day cost history, clipped to width so
-// the panel never wraps (a wrapped line would render taller than the height
-// computed by expensesHeights and push the log pane off screen).
+// renderHistoryPerDay renders the per-day cost history as a table: the current
+// and previous month as rows of total and median-day figures, then the most
+// recent days below them. Cost and tokens keep their own columns so the figures
+// line up instead of running together. It is clipped to width so the panel never
+// wraps (a wrapped line would render taller than the height computed by
+// expensesHeights and push the log pane off screen).
 func renderHistoryPerDay(snap statsSnapshot, now time.Time, width int) string {
 	currentMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-	month := monthCostText(snap.DailyCosts, currentMonth)
-	monthTokens := monthTokenTotal(snap.DailyTokens, currentMonth)
-	previousMonth := currentMonth.AddDate(0, -1, 0)
-	lastMonth := monthCostText(snap.DailyCosts, previousMonth)
-	lastMonthTokens := monthTokenTotal(snap.DailyTokens, previousMonth)
 	days := make([]string, 0, len(snap.DailyCosts))
 	for day := range snap.DailyCosts {
 		days = append(days, day)
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(days)))
-	lines := []string{
-		titleStyle.Render("History"),
-		"",
-		historyMonthLine("This m", month, monthTokens, width),
-		historyMonthLine("Last m", lastMonth, lastMonthTokens, width),
-		"",
+
+	header := []string{"Month", "Cost", "Tokens", "Med/day", "Med tok"}
+	monthRows := [][]string{
+		monthTableRow("This m", snap, currentMonth),
+		monthTableRow("Last m", snap, currentMonth.AddDate(0, -1, 0)),
 	}
+	dayRows := make([][]string, 0, min(7, len(days)))
 	for _, day := range days[:min(7, len(days))] {
 		parsed, _ := time.ParseInLocation(time.DateOnly, day, now.Location())
-		lines = append(lines, shorten(fmt.Sprintf("%-8s $%.4f  %s", parsed.Format("Jan 02"), snap.DailyCosts[day], formatDailyTokens(snap.DailyTokens[day])), width))
+		dayRows = append(dayRows, []string{
+			parsed.Format("Jan 02"),
+			fmt.Sprintf("$%.2f", snap.DailyCosts[day]),
+			formatDailyTokens(snap.DailyTokens[day]),
+			"", "",
+		})
+	}
+
+	// One width per column, taken from the header and every row, so the figures
+	// line up instead of packing against each other.
+	widths := make([]int, len(header))
+	for _, section := range [][][]string{{header}, monthRows, dayRows} {
+		for _, row := range section {
+			for i, cell := range row {
+				widths[i] = max(widths[i], lipgloss.Width(cell))
+			}
+		}
+	}
+	line := func(row []string) string {
+		parts := make([]string, len(row))
+		for i, cell := range row {
+			parts[i] = cell
+			if i < len(row)-1 {
+				parts[i] = padRight(cell, widths[i])
+			}
+		}
+		return strings.TrimRight(shorten(strings.Join(parts, " "), width), " ")
+	}
+
+	lines := []string{titleStyle.Render("History"), "", dimStyle.Render(line(header))}
+	for _, row := range monthRows {
+		lines = append(lines, line(row))
+	}
+	if len(dayRows) > 0 {
+		lines = append(lines, "")
+		for _, row := range dayRows {
+			lines = append(lines, line(row))
+		}
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1443,37 +1485,70 @@ func dimLabelLine(label, rest string, width int) string {
 	return dimStyle.Render(label) + strings.TrimPrefix(plain, label)
 }
 
-// historyMonthLine renders one month's cost and tokens. The month label recedes
-// so the figures beside it read as the values.
-func historyMonthLine(label, cost string, tokens int64, width int) string {
-	return dimLabelLine(label, fmt.Sprintf("  %s  %s", cost, formatDailyTokens(tokens)), width)
+// monthTableRow summarizes one month for the history table: the label, the
+// month's total spend and tokens, and the median day's spend and tokens. A month
+// with nothing recorded leaves its figures blank rather than a row of zeroes.
+func monthTableRow(label string, snap statsSnapshot, month time.Time) []string {
+	totalCost, medianCost, totalTokens, medianTokens := monthSummary(snap, month)
+	if totalCost <= 0 && totalTokens <= 0 {
+		return []string{label, "", "", "", ""}
+	}
+	return []string{
+		label,
+		formatWholeDollars(totalCost),
+		formatDailyTokens(totalTokens),
+		formatWholeDollars(medianCost),
+		formatDailyTokens(medianTokens),
+	}
 }
 
-func monthCostText(daily map[string]float64, month time.Time) string {
+// monthSummary totals a month's recorded days and finds the median day, for cost
+// and tokens independently: a day's dollar figure and its token count arrive by
+// different paths, so neither median should stand in for the other. The medians
+// are taken over the days the month actually recorded, not over its calendar
+// length, so a quiet day does not drag a typical one down.
+func monthSummary(snap statsSnapshot, month time.Time) (totalCost, medianCost float64, totalTokens, medianTokens int64) {
 	prefix := month.Local().Format("2006-01-")
-	var total float64
-	found := false
-	for day, cost := range daily {
+	costs := make([]float64, 0, 31)
+	tokens := make([]int64, 0, 31)
+	for day, cost := range snap.DailyCosts {
 		if strings.HasPrefix(day, prefix) {
-			total += cost
-			found = true
+			costs = append(costs, cost)
+			totalCost += cost
 		}
 	}
-	if !found {
+	for day, count := range snap.DailyTokens {
+		if strings.HasPrefix(day, prefix) {
+			tokens = append(tokens, count)
+			totalTokens += count
+		}
+	}
+	return totalCost, medianFloat(costs), totalTokens, medianInt(tokens)
+}
+
+// formatWholeDollars renders a cost as whole dollars, rounding the cents up: a
+// spend shown to plan against should never understate the bill. A cost of zero
+// has nothing to show and stays blank.
+func formatWholeDollars(cost float64) string {
+	if cost <= 0 {
 		return ""
 	}
-	return fmt.Sprintf("$%.4f", total)
+	return fmt.Sprintf("$%.0f", math.Ceil(cost))
 }
 
-func monthTokenTotal(daily map[string]int64, month time.Time) int64 {
-	prefix := month.Local().Format("2006-01-")
-	var total int64
-	for day, tokens := range daily {
-		if strings.HasPrefix(day, prefix) {
-			total += tokens
-		}
+// medianInt is the P50 of a day-token series, kept in the integer tokens the
+// daily totals are counted in.
+func medianInt(values []int64) int64 {
+	if len(values) == 0 {
+		return 0
 	}
-	return total
+	sorted := append([]int64(nil), values...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	mid := len(sorted) / 2
+	if len(sorted)%2 == 1 {
+		return sorted[mid]
+	}
+	return (sorted[mid-1] + sorted[mid]) / 2
 }
 
 func formatDailyTokens(tokens int64) string {
@@ -1481,12 +1556,14 @@ func formatDailyTokens(tokens int64) string {
 		return ""
 	}
 	// A count that runs past a thousand million tokens is written in billions:
-	// "1478.16m" is a number nobody reads as a size.
+	// "1478m" is a number nobody reads as a size. The count is rounded to a whole
+	// number of the chosen unit, so a day of traffic reads as "43m", never with a
+	// decimal tail.
 	millions := float64(tokens) / 1_000_000
-	if millions >= 999.995 {
-		return fmt.Sprintf("%.2fb", millions/1_000)
+	if millions >= 999.5 {
+		return fmt.Sprintf("%.0fb", millions/1_000)
 	}
-	return fmt.Sprintf("%.2fm", millions)
+	return fmt.Sprintf("%.0fm", millions)
 }
 
 // timeWeightStopNames name the control's positions from the price end to the
@@ -1855,7 +1932,7 @@ func (m dashboardModel) predictionText(data providerTableData) (plain, styled st
 		return "", ""
 	}
 	daily := m.predictionStepValue()
-	hourly, ok := newPredictionRate(float64(daily)).hourlyCost(endpoint.Pricing)
+	hourly, ok := m.predictionRate().hourlyCost(endpoint.Pricing)
 	if !ok {
 		return "", ""
 	}
@@ -1995,6 +2072,7 @@ type measuredMetrics struct {
 }
 
 type providerScores struct {
+	month          float64
 	prompt         float64
 	completion     float64
 	cacheRead      float64
@@ -2010,11 +2088,12 @@ type providerScores struct {
 	toolError      float64
 }
 
-func computeScores(providers []string, endpoints map[string]endpointMeta, measured map[string]measuredMetrics) map[string]providerScores {
+func computeScores(providers []string, endpoints map[string]endpointMeta, measured map[string]measuredMetrics, rate predictionRate) map[string]providerScores {
 	result := make(map[string]providerScores, len(providers))
 	prompts := make(map[string]float64, len(providers))
 	completions := make(map[string]float64, len(providers))
 	cacheReads := make(map[string]float64, len(providers))
+	months := make(map[string]float64, len(providers))
 	throughputs := make(map[string]float64, len(providers)*2)
 	latencies := make(map[string]float64, len(providers)*2)
 	for _, provider := range providers {
@@ -2027,6 +2106,9 @@ func computeScores(providers []string, endpoints map[string]endpointMeta, measur
 			}
 			if ep.Pricing.InputCacheRead > 0 {
 				cacheReads[provider] = ep.Pricing.InputCacheRead.float()
+			}
+			if cost, ok := rate.monthlyCost(ep.Pricing); ok {
+				months[provider] = cost
 			}
 			if ep.Throughput > 0 {
 				throughputs[provider+"_catalog"] = ep.Throughput
@@ -2049,10 +2131,12 @@ func computeScores(providers []string, endpoints map[string]endpointMeta, measur
 	promptLow, promptHigh := robustBounds(prompts)
 	completionLow, completionHigh := robustBounds(completions)
 	cacheLow, cacheHigh := robustBounds(cacheReads)
+	monthLow, monthHigh := robustBounds(months)
 	throughputLow, throughputHigh := robustBounds(throughputs)
 	latencyLow, latencyHigh := robustBounds(latencies)
 	for _, provider := range providers {
 		scores := providerScores{
+			month:          noScore,
 			prompt:         noScore,
 			completion:     noScore,
 			cacheRead:      noScore,
@@ -2076,6 +2160,9 @@ func computeScores(providers []string, endpoints map[string]endpointMeta, measur
 			}
 			if v, ok := cacheReads[provider]; ok {
 				scores.cacheRead = scoreFor(v, cacheLow, cacheHigh)
+			}
+			if v, ok := months[provider]; ok {
+				scores.month = scoreFor(v, monthLow, monthHigh)
 			}
 			if v, ok := throughputs[provider+"_catalog"]; ok {
 				scores.throughput = scoreFor(v, throughputHigh, throughputLow)
@@ -2224,6 +2311,7 @@ type providerSortColumn int
 
 const (
 	providerSortRoute providerSortColumn = iota
+	providerSortMonth
 	providerSortInput
 	providerSortOutput
 	providerSortCache
@@ -2244,6 +2332,7 @@ const (
 // standing for the routing order requests follow.
 var providerSortLabels = [...]string{
 	providerSortRoute:              "Default",
+	providerSortMonth:              "$Mon",
 	providerSortInput:              "In",
 	providerSortOutput:             "Out",
 	providerSortCache:              "Cache",
@@ -2262,7 +2351,7 @@ var providerSortLabels = [...]string{
 // providerTableHeader heads the table: the provider label, then one column per
 // sortable metric, in providerSortColumn order so headerIndex indexes it.
 func providerTableHeader() []string {
-	return append([]string{"Provider"}, providerSortLabels[providerSortInput:]...)
+	return append([]string{"Provider"}, providerSortLabels[providerSortMonth:]...)
 }
 
 func (c providerSortColumn) label() string {
@@ -2275,7 +2364,7 @@ func (c providerSortColumn) label() string {
 // headerIndex is the column's cell in the provider table header, or -1 when the
 // routing order is showing and no column is sorted.
 func (c providerSortColumn) headerIndex() int {
-	if c < providerSortInput || c >= providerSortColumns {
+	if c < providerSortMonth || c >= providerSortColumns {
 		return -1
 	}
 	return int(c)
@@ -2297,6 +2386,7 @@ var sortValueMissing = math.Inf(1)
 // sortValueMissing except for the error columns, where a reported zero is a
 // clean record and sorts first.
 type providerSortValues struct {
+	month                       float64
 	in, out, cache              float64
 	throughput, latency         float64
 	measThroughput, measLatency float64
@@ -2310,6 +2400,8 @@ type providerSortValues struct {
 // blanks last.
 func (v providerSortValues) sortKey(column providerSortColumn) float64 {
 	switch column {
+	case providerSortMonth:
+		return v.month
 	case providerSortInput:
 		return v.in
 	case providerSortOutput:
@@ -2369,6 +2461,9 @@ type providerTableData struct {
 	pinned       string
 	pinnedManual bool
 	sortValues   map[string]providerSortValues
+	// rate is the 'p' workload priced once for this table, shared by the sort
+	// values, the $Mon cells, and their score gradient so all three agree.
+	rate predictionRate
 }
 
 // providerTableData gathers the table's inputs once, so the rows drawn and the
@@ -2395,7 +2490,10 @@ func (m dashboardModel) providerTableData(snap statsSnapshot) providerTableData 
 	}
 
 	blocked := m.routing.blockedProviders(m.model)
-	scores := computeScores(providers, endpointByTag, measured)
+	// The 'p' workload is priced once per table build and shared by the sort
+	// values and the score gradient.
+	rate := m.predictionRate()
+	scores := computeScores(providers, endpointByTag, measured, rate)
 	applyProviderQualityScores(providers, m.quality[m.model], scores)
 	applyMeasuredErrorScores(providers, records, scores)
 	pinned, pinnedManual := m.routing.pinInfo(m.model)
@@ -2403,7 +2501,7 @@ func (m dashboardModel) providerTableData(snap statsSnapshot) providerTableData 
 	values := make(map[string]providerSortValues, len(providers))
 	for _, provider := range providers {
 		_, isBlocked := blocked[provider]
-		values[provider] = m.providerSortRow(provider, endpointByTag, measured, records, isBlocked)
+		values[provider] = m.providerSortRow(provider, endpointByTag, measured, records, isBlocked, rate)
 	}
 	return providerTableData{
 		providers:    providers,
@@ -2415,6 +2513,7 @@ func (m dashboardModel) providerTableData(snap statsSnapshot) providerTableData 
 		pinned:       pinned,
 		pinnedManual: pinnedManual,
 		sortValues:   values,
+		rate:         rate,
 	}
 }
 
@@ -2443,8 +2542,9 @@ func (d providerTableData) selected(column providerSortColumn, selection int) (s
 
 // providerSortRow reads one row's ordering values from the data the table
 // renders, including the fresh 't' measurement that replaces mTp and mLat.
-func (m dashboardModel) providerSortRow(provider string, endpoints map[string]endpointMeta, measured map[string]measuredMetrics, records map[string][]requestRecord, blocked bool) providerSortValues {
+func (m dashboardModel) providerSortRow(provider string, endpoints map[string]endpointMeta, measured map[string]measuredMetrics, records map[string][]requestRecord, blocked bool, rate predictionRate) providerSortValues {
 	values := providerSortValues{
+		month:          sortValueMissing,
 		in:             sortValueMissing,
 		out:            sortValueMissing,
 		cache:          sortValueMissing,
@@ -2465,6 +2565,9 @@ func (m dashboardModel) providerSortRow(provider string, endpoints map[string]en
 		values.cache = reportedValue(endpoint.Pricing.InputCacheRead.float())
 		values.throughput = reportedValue(endpoint.Throughput)
 		values.latency = reportedValue(endpoint.Latency)
+		if cost, ok := rate.monthlyCost(endpoint.Pricing); ok {
+			values.month = reportedValue(cost)
+		}
 	}
 	if metrics, ok := measured[provider]; ok {
 		values.measThroughput = reportedValue(metrics.throughput)
@@ -2533,6 +2636,7 @@ func (m dashboardModel) renderProviderTableData(data providerTableData, width, h
 	scores := data.scores
 	blocked := data.blocked
 	pinned, pinnedManual := data.pinned, data.pinnedManual
+	rate := data.rate
 	styleCell := func(value string, score float64) string {
 		if score < 0 {
 			return value
@@ -2546,7 +2650,7 @@ func (m dashboardModel) renderProviderTableData(data providerTableData, width, h
 		minimumWidth += max(6, lipgloss.Width(label))
 	}
 	if width < max(110, minimumWidth) {
-		return m.renderCompactProviderTable(providers, endpointByTag, measured, records, scores, blocked, pinned, pinnedManual, m.selection, width, height, styleCell)
+		return m.renderCompactProviderTable(providers, endpointByTag, measured, records, scores, blocked, pinned, pinnedManual, m.selection, width, height, rate, styleCell)
 	}
 
 	type tableRow struct {
@@ -2607,6 +2711,15 @@ func (m dashboardModel) renderProviderTableData(data providerTableData, width, h
 		quality[2] = styleQualityError(quality[2], s.orToolError)
 		quality[3] = styleQualityError(quality[3], s.orJSONError)
 		observed := []string{quality[0], quality[1], quality[2], quality[3], apiErr, toolErr}
+		// $Mon leads the metrics: what a month of the 'p' workload bills at this
+		// provider's prices, in whole dollars rounded up and colored on the same
+		// cheapest-green scale as the price columns. A blank cell means its catalog
+		// entry is missing a price the workload needs, not a free route.
+		monthCell := ""
+		if cost, priced := rate.monthlyCost(ep.Pricing); priced {
+			monthCell = styleCell(formatWholeDollars(cost), s.month)
+		}
+		cells = append(cells, monthCell)
 		if ok {
 			cells = append(cells,
 				styleCell(pricePerM(ep.Pricing.Prompt), s.prompt),
@@ -2678,7 +2791,7 @@ func (m dashboardModel) renderProviderHeaderRow(names []string, columnWidths []i
 	return shorten(line, maxWidth)
 }
 
-func (m dashboardModel) renderCompactProviderTable(providers []string, endpoints map[string]endpointMeta, measured map[string]measuredMetrics, records map[string][]requestRecord, scores map[string]providerScores, blocked map[string]blockedProvider, pinned string, pinnedManual bool, selection, width, height int, styleCell func(string, float64) string) string {
+func (m dashboardModel) renderCompactProviderTable(providers []string, endpoints map[string]endpointMeta, measured map[string]measuredMetrics, records map[string][]requestRecord, scores map[string]providerScores, blocked map[string]blockedProvider, pinned string, pinnedManual bool, selection, width, height int, rate predictionRate, styleCell func(string, float64) string) string {
 	rows := make([]string, 0, len(providers))
 	for i, provider := range providers {
 		var lines []string
@@ -2728,7 +2841,12 @@ func (m dashboardModel) renderCompactProviderTable(providers []string, endpoints
 		quality[1] = styleCell(quality[1], s.tau)
 		quality[2] = styleQualityError(quality[2], s.orToolError)
 		quality[3] = styleQualityError(quality[3], s.orJSONError)
+		monthCell := ""
+		if cost, priced := rate.monthlyCost(ep.Pricing); priced {
+			monthCell = styleCell(formatWholeDollars(cost), s.month)
+		}
 		pricing := []string{
+			m.metricLabel("$Mon") + " " + monthCell,
 			m.metricLabel("In") + " " + styleCell(pricePerM(ep.Pricing.Prompt), s.prompt),
 			m.metricLabel("Out") + " " + styleCell(pricePerM(ep.Pricing.Completion), s.completion),
 			m.metricLabel("Cache") + " " + styleCell(pricePerM(ep.Pricing.InputCacheRead), s.cacheRead),

@@ -7,10 +7,11 @@ import (
 )
 
 func TestPredictionWorkloadIsTheReferenceDay(t *testing.T) {
-	// 20M tokens over eight active hours, split the reference request's
-	// 2,000 / 30,000 / 200 way: 2.5M/hour in total.
-	rate := newPredictionRate(float64(predictionWorkloadSteps[defaultPredictionWorkloadStep]))
-	perHour := 2_500_000.0
+	// The default day of tokens over eight active hours, split the reference
+	// request's 2,000 / 30,000 / 200 way.
+	daily := float64(predictionWorkloadSteps[defaultPredictionWorkloadStep])
+	rate := newPredictionRate(daily)
+	perHour := daily / predictionActiveHoursPerDay
 	const total = 32_200.0
 	for _, component := range []struct {
 		name string
@@ -43,17 +44,32 @@ func TestFormatPredictionWorkload(t *testing.T) {
 	}
 }
 
-func TestPredictionWorkloadStepsAreTensOfMillions(t *testing.T) {
-	if len(predictionWorkloadSteps) != 20 {
-		t.Fatalf("workload steps = %v, want twenty", predictionWorkloadSteps)
+func TestPredictionWorkloadStepsAdvanceByTheChosenDays(t *testing.T) {
+	want := []int64{50, 100, 300, 500, 700, 1000}
+	if len(predictionWorkloadSteps) != len(want) {
+		t.Fatalf("workload steps = %v, want %v million", predictionWorkloadSteps, want)
 	}
-	for i, tokens := range predictionWorkloadSteps {
-		if want := int64(i+1) * 10_000_000; tokens != want {
-			t.Fatalf("step %d = %d tokens, want %d", i, tokens, want)
+	for i, millions := range want {
+		if got := predictionWorkloadSteps[i]; got != millions*1_000_000 {
+			t.Fatalf("step %d = %d tokens, want %dm", i, got, millions)
 		}
 	}
-	if got := predictionWorkloadSteps[defaultPredictionWorkloadStep]; got != 20_000_000 {
-		t.Fatalf("default workload = %d, want 20m", got)
+	if got := predictionWorkloadSteps[defaultPredictionWorkloadStep]; got != 100_000_000 {
+		t.Fatalf("default workload = %d, want 100m", got)
+	}
+}
+
+func TestPredictionStepForTokensSnapsToNearestStop(t *testing.T) {
+	for tokens, want := range map[int64]int{
+		50_000_000:    0,
+		100_000_000:   1,
+		1_000_000_000: 5,
+		420_000_000:   3, // nearer 500m than 300m
+		650_000_000:   4, // nearer 700m than 500m
+	} {
+		if got := predictionStepForTokens(tokens); got != want {
+			t.Errorf("predictionStepForTokens(%d) = %d, want %d", tokens, got, want)
+		}
 	}
 }
 
@@ -85,6 +101,27 @@ func TestPredictionRateHourlyCostRejectsIncompletePricing(t *testing.T) {
 	rate := predictionRate{prompt: 1000, completion: 1000}
 	if _, ok := rate.hourlyCost(endpointPricing{Prompt: 0.000001}); ok {
 		t.Fatal("projected a cost without an output price")
+	}
+}
+
+// The $Mon column and the projection's 20d horizon price the same working
+// month, so the two must agree.
+func TestPredictionMonthlyCostIsTheTwentyDayHorizon(t *testing.T) {
+	rate := newPredictionRate(100_000_000)
+	pricing := endpointPricing{Prompt: 0.000001, Completion: 0.000004, InputCacheRead: 0.0000002}
+	hourly, ok := rate.hourlyCost(pricing)
+	if !ok {
+		t.Fatal("no hourly cost for complete pricing")
+	}
+	monthly, ok := rate.monthlyCost(pricing)
+	if !ok {
+		t.Fatal("no monthly cost for complete pricing")
+	}
+	if want := hourly * predictionMonthHours; !closeTo(monthly, want) {
+		t.Fatalf("monthly cost = $%v, want $%v", monthly, want)
+	}
+	if _, ok := rate.monthlyCost(endpointPricing{Prompt: 0.000001}); ok {
+		t.Fatal("projected a monthly cost without an output price")
 	}
 }
 

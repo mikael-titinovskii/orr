@@ -15,14 +15,18 @@ const predictionActiveHoursPerDay = 8
 // horizon projects: 20 working days, so the two figures agree.
 const predictionWorkdaysPerMonth = 20
 
+// predictionMonthHours is the month the routing table's $Mon column
+// prices: the working month times the active hours the horizons assume, so the
+// column agrees with the projection's own 20-day figure.
+const predictionMonthHours = predictionWorkdaysPerMonth * predictionActiveHoursPerDay
+
 // predictionWorkloadSteps are the token days the 'p' key cycles through, from a
-// light session to a heavy one in steps of ten million. The volume is a view
-// setting rather than a routing decision, so the choice is not persisted.
+// light session to a heavy one. The volume is a view setting rather than a
+// routing decision, but the choice is kept in the database so a restart keeps
+// pricing the same day.
 var predictionWorkloadSteps = [...]int64{
-	10_000_000, 20_000_000, 30_000_000, 40_000_000, 50_000_000,
-	60_000_000, 70_000_000, 80_000_000, 90_000_000, 100_000_000,
-	110_000_000, 120_000_000, 130_000_000, 140_000_000, 150_000_000,
-	160_000_000, 170_000_000, 180_000_000, 190_000_000, 200_000_000,
+	50_000_000, 100_000_000, 300_000_000,
+	500_000_000, 700_000_000, 1_000_000_000,
 }
 
 // defaultPredictionWorkloadStep is the step a fresh dashboard starts on.
@@ -95,6 +99,31 @@ func (m dashboardModel) predictionStepValue() int64 {
 	return predictionWorkloadSteps[m.predictionStep]
 }
 
+// predictionStepForTokens maps a stored day back to its 'p' stop. A value no
+// stop quotes — the scale changed since it was saved — snaps to the nearest
+// one, so a persisted choice always restores to something the key can move on
+// from.
+func predictionStepForTokens(tokens int64) int {
+	best := defaultPredictionWorkloadStep
+	bestDelta := int64(-1)
+	for i, step := range predictionWorkloadSteps {
+		delta := step - tokens
+		if delta < 0 {
+			delta = -delta
+		}
+		if bestDelta < 0 || delta < bestDelta {
+			best, bestDelta = i, delta
+		}
+	}
+	return best
+}
+
+// predictionRate is the per-hour traffic the 'p' key currently prices, shared by
+// the projection line and the table's $Mon column so the two agree.
+func (m dashboardModel) predictionRate() predictionRate {
+	return newPredictionRate(float64(m.predictionStepValue()))
+}
+
 // hourlyCost is what one active hour of the rate costs at pricing. A provider
 // with no cache-read price bills the cached tokens at its full input price,
 // which is what the workload would really pay there. ok is false when a price
@@ -125,6 +154,17 @@ func (r predictionRate) hourlyCost(pricing endpointPricing) (float64, bool) {
 		total += component.tokens * component.price
 	}
 	return total, total > 0
+}
+
+// monthlyCost is what a full working month of the rate costs at pricing. It is
+// the projection's own 20-day figure, exposed so the routing table can price
+// each provider's row for the month the 'p' key selects.
+func (r predictionRate) monthlyCost(pricing endpointPricing) (float64, bool) {
+	hourly, ok := r.hourlyCost(pricing)
+	if !ok {
+		return 0, false
+	}
+	return hourly * predictionMonthHours, true
 }
 
 // predictionSpend formats one hour's cost across every horizon, in the order

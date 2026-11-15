@@ -200,6 +200,37 @@ func TestTimeWeightRoundTrip(t *testing.T) {
 	}
 }
 
+// The day chosen with 'p' is a view setting, but it outlives the process so a
+// restart keeps pricing the same volume. Zero means "never chosen", so an
+// untouched dashboard still starts on its default stop.
+func TestPredictionTokensRoundTrip(t *testing.T) {
+	db := openTestStore(t)
+	unchosen := newStats()
+	if err := unchosen.save(db); err != nil {
+		t.Fatal(err)
+	}
+	fresh := newStats()
+	if err := fresh.load(db); err != nil {
+		t.Fatal(err)
+	}
+	if got := fresh.currentPredictionTokens(); got != 0 {
+		t.Fatalf("restored an unchosen prediction day = %d, want 0", got)
+	}
+
+	chosen := newStats()
+	chosen.setPredictionTokens(700_000_000)
+	if err := chosen.save(db); err != nil {
+		t.Fatal(err)
+	}
+	loaded := newStats()
+	if err := loaded.load(db); err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.currentPredictionTokens(); got != 700_000_000 {
+		t.Fatalf("restored prediction day = %d, want 700m", got)
+	}
+}
+
 // The degradation switch follows the same rule as the speed/price stop, with
 // two additions: "off" is a real setting, and the value is only written once the
 // user has toggled it, so ORR_DEGRADATION can keep seeding every start until
