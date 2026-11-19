@@ -32,6 +32,7 @@ type config struct {
 	DegradationCooldown        time.Duration
 	DegradationTimeout         time.Duration
 	Loop                       loopConfig
+	Guardrails                 guardrailsConfig
 	db                         *store.Store
 	dbPath                     string
 	preferEnvFile              bool
@@ -142,6 +143,7 @@ func loadConfigWithOptions(envPath string, preferEnvFile bool) (config, error) {
 			MaxContinuations: defaultLoopMaxContinuations,
 			Penalty:          defaultLoopPenalty,
 		},
+		Guardrails:    defaultGuardrailsConfig(),
 		preferEnvFile: preferEnvFile,
 	}
 
@@ -275,6 +277,11 @@ func loadConfigWithOptions(envPath string, preferEnvFile bool) (config, error) {
 		}
 		cfg.Loop.Penalty = parsed
 	}
+	guardrails, err := parseGuardrailsConfig(value)
+	if err != nil {
+		return config{}, err
+	}
+	cfg.Guardrails = guardrails
 	cfg.OpenRouterAPIKey = value("OPENROUTER_API_KEY")
 
 	cfg.Models = make(map[string]providerConfig)
@@ -441,6 +448,9 @@ func (c config) validate() error {
 		return fmt.Errorf("ORR_DEGRADATION_TIMEOUT must be positive")
 	}
 	if err := c.validateLoop(); err != nil {
+		return err
+	}
+	if err := c.Guardrails.validate(); err != nil {
 		return err
 	}
 	return validateModels(c.Models)

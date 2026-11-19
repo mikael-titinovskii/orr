@@ -145,6 +145,8 @@ else
 fi
 chmod 755 "$bin_dir/orr"
 
+printf 'Installing the guardrails sidecar...\n'
+"$bin_dir/orr" guardrails install --env "$config_dir/.env" || fail "The guardrails installation failed. orr requires Python 3.11-3.13 (and python3-venv on Debian/Ubuntu); install it and rerun the installer."
 printf 'Checking Kimi Code and OpenCode configuration...\n'
 "$bin_dir/orr" integrate --env "$config_dir/.env"
 

@@ -63,7 +63,7 @@ func vitalsScore(recent, baseline []requestRecord) (float64, bool) {
 	}
 	answered, answering := 0, 0
 	for _, record := range recent {
-		if record.Benchmark || record.Status == 0 || record.Blocked {
+		if record.Benchmark || record.Status == 0 || record.Blocked || record.guardrailRefusal() {
 			continue
 		}
 		answered++
@@ -149,7 +149,7 @@ func (s *stats) degradationRecords(model, provider string, now time.Time, window
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, record := range s.windowRecords {
-		if record.Model != model || record.Provider != provider || record.Benchmark || record.Blocked || record.Status == 0 {
+		if record.Model != model || record.Provider != provider || record.Benchmark || record.Blocked || record.guardrailRefusal() || record.Status == 0 {
 			continue
 		}
 		if !record.Time.Before(recentCutoff) {
@@ -157,7 +157,7 @@ func (s *stats) degradationRecords(model, provider string, now time.Time, window
 		}
 	}
 	for _, record := range s.metricsRecords {
-		if record.Model != model || record.Provider != provider || record.Benchmark || record.Blocked || record.Status == 0 || record.apiError() {
+		if record.Model != model || record.Provider != provider || record.Benchmark || record.Blocked || record.guardrailRefusal() || record.Status == 0 || record.apiError() {
 			continue
 		}
 		if record.Time.Before(recentCutoff) && !record.Time.Before(baselineCutoff) {
@@ -177,7 +177,7 @@ func (s *stats) lastProvider(model string) string {
 	defer s.mu.RUnlock()
 	for i := len(s.records) - 1; i >= 0; i-- {
 		record := s.records[i]
-		if record.Model == model && record.Provider != "" && record.Status != 0 && !record.Benchmark && !record.Blocked {
+		if record.Model == model && record.Provider != "" && record.Status != 0 && !record.Benchmark && !record.Blocked && !record.guardrailRefusal() {
 			return record.Provider
 		}
 	}

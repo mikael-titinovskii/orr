@@ -29,18 +29,20 @@ const maxRequestBodyBytes = 64 << 20
 var errRequestBodyTooLarge = errors.New("request body exceeds 64 MiB")
 
 type proxy struct {
-	cfg            config
-	upstream       *url.URL
-	client         *http.Client
-	stats          *stats
-	routing        *routingState
-	registry       *modelRegistry
-	trackEndpoints bool
-	dailyMu        sync.Mutex
-	dailyReady     map[string]chan struct{}
-	dailyWG        sync.WaitGroup
-	dailyClosed    bool
-	recoveryWanted map[string]bool
+	cfg              config
+	upstream         *url.URL
+	client           *http.Client
+	guardrailsClient *http.Client
+	verdicts         *verdictLog
+	stats            *stats
+	routing          *routingState
+	registry         *modelRegistry
+	trackEndpoints   bool
+	dailyMu          sync.Mutex
+	dailyReady       map[string]chan struct{}
+	dailyWG          sync.WaitGroup
+	dailyClosed      bool
+	recoveryWanted   map[string]bool
 	// degradationMu guards the watchdog's cooldown and scan throttle, which the
 	// request path and the dashboard both touch.
 	degradationMu      sync.Mutex
@@ -94,6 +96,7 @@ func newProxy(cfg config) (*proxy, error) {
 		stats:              newStats(),
 		routing:            routing,
 		registry:           newModelRegistry(&http.Client{Timeout: 20 * time.Second}, cfg.Upstream, cfg.openRouterKey(), cfg.Listen, registryTTL),
+		guardrailsClient:   &http.Client{Timeout: 2 * time.Second},
 		dailyReady:         make(map[string]chan struct{}),
 		recoveryWanted:     make(map[string]bool),
 		degradationLast:    make(map[string]time.Time),
@@ -146,6 +149,16 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	record, err := p.forward(w, r)
 	p.stats.record(record)
+	if event, ok := guardrailEventFor(record); ok && p.verdicts != nil {
+		if err := p.verdicts.write(event); err != nil {
+			log.Printf("guardrails: write verdict log: %v", err)
+		}
+	}
+	if record.GuardBlocked {
+		log.Printf("guardrails blocked %s %s phase=%s rail=%s model=%s provider=%s", record.Method, record.Path, record.GuardPhase, record.GuardRail, record.Model, record.Provider)
+	} else if record.GuardObserved {
+		log.Printf("guardrails would block %s %s phase=%s rail=%s model=%s provider=%s", record.Method, record.Path, record.GuardPhase, record.GuardRail, record.Model, record.Provider)
+	}
 	p.observeProviderFailure(record)
 	p.observeProviderDegradation(record)
 	if err != nil && !errors.Is(err, r.Context().Err()) {
@@ -248,6 +261,23 @@ func (p *proxy) forward(w http.ResponseWriter, incoming *http.Request) (requestR
 		// hold this user request behind catalog or benchmark latency.
 		p.prepareDailyModel(model)
 		body = bytes.NewReader(modified)
+	}
+
+	if modified != nil {
+		p.checkGuardrailsInput(incoming.Context(), modified, &record)
+		if !record.GuardBlocked {
+			p.checkGuardrailsToolResults(incoming.Context(), modified, &record)
+		}
+		if record.GuardUnavailable {
+			writeGuardrailUnavailable(w)
+			record.Status, record.Err, record.Duration = http.StatusServiceUnavailable, true, p.now().Sub(started)
+			return record, nil
+		}
+		if record.GuardBlocked {
+			writeGuardrailError(w, "guardrails blocked the request: "+record.GuardRail)
+			record.Status, record.Err, record.Duration = http.StatusForbidden, true, p.now().Sub(started)
+			return record, nil
+		}
 	}
 
 	target := *p.upstream
@@ -477,6 +507,21 @@ func (p *proxy) forward(w http.ResponseWriter, incoming *http.Request) (requestR
 
 	record.Status = resp.StatusCode
 	record.Err = resp.StatusCode < 200 || resp.StatusCode >= 300
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 && mutablePaths[incoming.URL.Path] {
+		blocked, rail, guardErr := p.guardUpstreamResponse(incoming.Context(), resp, &record)
+		if guardErr != nil {
+			writeGuardrailUnavailable(w)
+			record.Status, record.Err, record.Duration = http.StatusServiceUnavailable, true, p.now().Sub(started)
+			resp.Body.Close()
+			return record, nil
+		}
+		if blocked {
+			writeGuardrailResponseError(w, rail)
+			record.Status, record.Err, record.Duration = http.StatusBadGateway, true, p.now().Sub(started)
+			resp.Body.Close()
+			return record, nil
+		}
+	}
 
 	copyHeaders(w.Header(), resp.Header)
 	w.Header().Del("Content-Length")
@@ -1001,7 +1046,7 @@ func (p *proxy) loopContinuation(ctx context.Context, path string, target url.UR
 // handled inside the forwarding loop so the request can be replayed; this
 // post-response path handles successful resets and errors found in a stream.
 func (p *proxy) observeProviderFailure(record requestRecord) {
-	if record.Benchmark || record.ProviderFailureHandled || record.Model == "" || record.Provider == "" {
+	if record.Benchmark || record.ProviderFailureHandled || record.Model == "" || record.Provider == "" || record.guardrailRefusal() {
 		return
 	}
 	if record.ProviderUnavailable {
@@ -1762,6 +1807,48 @@ func isConnectionNamed(key string, connectionHeaders []string) bool {
 		}
 	}
 	return false
+}
+
+// guardrailBlockedCode is the machine-readable code orr returns when the
+// guardrails sidecar rejects a request. It is carried in the body rather than
+// in an invented HTTP status: OpenAI-compatible clients understand 403, and
+// the code still tells a policy refusal apart from an authentication failure.
+const guardrailBlockedCode = "guardrail_blocked"
+
+func writeGuardrailError(w http.ResponseWriter, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+		"message": message,
+		"type":    "orr_error",
+		"code":    guardrailBlockedCode,
+	}})
+}
+
+// writeGuardrailUnavailable is what a block-mode request gets when the sidecar
+// cannot answer. Failing closed is deliberate: a guard that silently disappears
+// is worse than a refused turn.
+// writeGuardrailResponseError is what the client gets when the upstream answer
+// itself tripped an output rail. 502 says the gateway refused the upstream
+// response, not the client's request.
+func writeGuardrailResponseError(w http.ResponseWriter, rail string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadGateway)
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+		"message": "guardrails blocked the response: " + rail,
+		"type":    "orr_error",
+		"code":    "guardrail_blocked",
+	}})
+}
+
+func writeGuardrailUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+		"message": "guardrails could not evaluate the request",
+		"type":    "orr_error",
+		"code":    "guardrail_unavailable",
+	}})
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {

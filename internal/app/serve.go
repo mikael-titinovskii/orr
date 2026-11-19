@@ -47,6 +47,12 @@ func serve(cfg config) error {
 	if err := p.stats.load(db); err != nil {
 		return fmt.Errorf("load stats: %w", err)
 	}
+	if verdicts, verdictErr := openVerdictLog(filepath.Join(filepath.Dir(path), "guardrails-verdicts.jsonl")); verdictErr != nil {
+		log.Printf("guardrails: could not open the verdict log: %v", verdictErr)
+	} else {
+		p.verdicts = verdicts
+		defer verdicts.Close()
+	}
 	p.routing.restorePins(p.stats.providerPinsSnapshot())
 	// The persisted speed/price exponent governs the very first benchmark, so a
 	// value dialed in with the dashboard slider outlives the process.
@@ -79,6 +85,12 @@ func serve(cfg config) error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	guardrailsProc, err := startGuardrailsSidecar(ctx, cfg.Guardrails, log.Printf)
+	if err != nil {
+		listener.Close()
+		return err
+	}
+	defer guardrailsProc.Stop()
 	statsDone := make(chan struct{})
 	go saveStatsPeriodically(ctx, p.stats, db, statsDone)
 	go pollCredits(ctx, &http.Client{Timeout: 20 * time.Second}, cfg.Upstream, cfg.openRouterKey(), p.stats)

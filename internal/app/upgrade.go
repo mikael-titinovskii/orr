@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-func runUpgrade(output io.Writer) error {
+func runUpgrade(output io.Writer, envPath string, preferEnvFile bool) error {
 
 	executable, err := os.Executable()
 	if err != nil {
@@ -25,6 +25,11 @@ func runUpgrade(output io.Writer) error {
 	executable, err = filepath.Abs(executable)
 	if err != nil {
 		return fmt.Errorf("resolve current executable: %w", err)
+	}
+	// Fail before the pull and build when the binary is in use, so the operator
+	// is told to close orr instead of waiting for work that cannot be installed.
+	if err := requireExecutableIdle(executable); err != nil {
+		return err
 	}
 
 	repository, cleanup, err := prepareUpgradeSource(output)
@@ -49,11 +54,44 @@ func runUpgrade(output io.Writer) error {
 	if err := buildExecutable(output, repository, temporaryPath); err != nil {
 		return fmt.Errorf("build upgrade: %w", err)
 	}
+	// Re-check right before the replace: a long build gives the operator time
+	// to start orr again, and the check is only useful if it reflects the
+	// moment of replacement.
+	if err := requireExecutableIdle(executable); err != nil {
+		return err
+	}
+	// Prepare the guardrails environment with the new binary before swapping it
+	// in. A failed install then leaves the working binary and environment in
+	// place instead of replacing orr with one that cannot start.
+	fmt.Fprintln(output, "Installing the guardrails sidecar...")
+	if err := installGuardrailsForUpgrade(output, temporaryPath, envPath, preferEnvFile); err != nil {
+		return err
+	}
 	if err := replaceExecutable(temporaryPath, executable); err != nil {
 		return fmt.Errorf("install upgrade: %w", err)
 	}
 
 	fmt.Fprintf(output, "Upgrade complete: %s\n", executable)
+	return nil
+}
+
+// installGuardrailsForUpgrade runs the new binary's installer before the binary
+// replaces the running one. Installations made before guardrails became a
+// requirement have no environment, and the upgrade is where they get one.
+func installGuardrailsForUpgrade(output io.Writer, executable, envPath string, preferEnvFile bool) error {
+	args := []string{"guardrails", "install"}
+	if envPath != "" {
+		args = append(args, "--env", envPath)
+	}
+	if preferEnvFile {
+		args = append(args, "--prefer-env-file")
+	}
+	cmd := exec.Command(executable, args...)
+	cmd.Stdout = output
+	cmd.Stderr = output
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("install guardrails for the upgraded binary: %w (orr serve will not start without it)", err)
+	}
 	return nil
 }
 

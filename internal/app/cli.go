@@ -27,6 +27,7 @@ func newRootCommand(output io.Writer) *cobra.Command {
 		newResetCommand(output),
 		newUpgradeCommand(output),
 		newIntegrateCommand(output),
+		newGuardrailsCommand(output),
 		newVersionCommand(output),
 	)
 	root.InitDefaultCompletionCmd()
@@ -129,14 +130,20 @@ func newResetCommand(output io.Writer) *cobra.Command {
 }
 
 func newUpgradeCommand(output io.Writer) *cobra.Command {
-	return &cobra.Command{
+	var (
+		envPath       string
+		preferEnvFile bool
+	)
+	cmd := &cobra.Command{
 		Use:   "upgrade",
 		Short: "upgrade orr to the latest version",
 		Args:  noPositionalArgs("upgrade"),
 		RunE: func(*cobra.Command, []string) error {
-			return runUpgrade(output)
+			return runUpgrade(output, envPath, preferEnvFile)
 		},
 	}
+	addEnvFlags(cmd, &envPath, &preferEnvFile)
+	return cmd
 }
 
 func newIntegrateCommand(output io.Writer) *cobra.Command {
@@ -150,6 +157,88 @@ func newIntegrateCommand(output io.Writer) *cobra.Command {
 		Args:  noPositionalArgs("integrate"),
 		RunE: func(*cobra.Command, []string) error {
 			return runIntegrateWithOptions(envPath, preferEnvFile, output)
+		},
+	}
+	addEnvFlags(cmd, &envPath, &preferEnvFile)
+	return cmd
+}
+
+func newGuardrailsCommand(output io.Writer) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "guardrails",
+		Short: "manage the optional NeMo Guardrails sidecar",
+		Args:  noPositionalArgs("guardrails"),
+		RunE:  func(c *cobra.Command, _ []string) error { return c.Help() },
+	}
+	cmd.AddCommand(
+		newGuardrailsInstallCommand(output),
+		newGuardrailsStatusCommand(output),
+		newGuardrailsConfigCommand(output),
+	)
+	return cmd
+}
+
+func newGuardrailsInstallCommand(output io.Writer) *cobra.Command {
+	var (
+		envPath       string
+		preferEnvFile bool
+		python        string
+		force         bool
+	)
+	cmd := &cobra.Command{
+		Use:   "install",
+		Short: "create the Python environment for the guardrails sidecar",
+		Args:  noPositionalArgs("guardrails install"),
+		RunE: func(*cobra.Command, []string) error {
+			return runGuardrailsInstall(envPath, preferEnvFile, guardrailsInstallOptions{
+				Python: python,
+				Force:  force,
+				Output: output,
+			})
+		},
+	}
+	addEnvFlags(cmd, &envPath, &preferEnvFile)
+	cmd.Flags().StringVar(&python, "python", "", "path to a Python 3.11 through 3.13 interpreter")
+	cmd.Flags().BoolVar(&force, "force", false, "reinstall the environment and reset the policy")
+	return cmd
+}
+
+func newGuardrailsStatusCommand(output io.Writer) *cobra.Command {
+	var (
+		envPath       string
+		preferEnvFile bool
+	)
+	cmd := &cobra.Command{
+		Use:   "status",
+		Short: "show the guardrails installation",
+		Args:  noPositionalArgs("guardrails status"),
+		RunE: func(*cobra.Command, []string) error {
+			settings, err := loadGuardrailsConfigWithOptions(envPath, preferEnvFile)
+			if err != nil {
+				return err
+			}
+			return runGuardrailsStatus(settings, output)
+		},
+	}
+	addEnvFlags(cmd, &envPath, &preferEnvFile)
+	return cmd
+}
+
+func newGuardrailsConfigCommand(output io.Writer) *cobra.Command {
+	var (
+		envPath       string
+		preferEnvFile bool
+	)
+	cmd := &cobra.Command{
+		Use:   "config",
+		Short: "print the active guardrails policy",
+		Args:  noPositionalArgs("guardrails config"),
+		RunE: func(*cobra.Command, []string) error {
+			settings, err := loadGuardrailsConfigWithOptions(envPath, preferEnvFile)
+			if err != nil {
+				return err
+			}
+			return runGuardrailsConfig(settings, output)
 		},
 	}
 	addEnvFlags(cmd, &envPath, &preferEnvFile)
