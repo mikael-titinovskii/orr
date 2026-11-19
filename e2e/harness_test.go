@@ -143,7 +143,7 @@ func startServerInDirectory(t *testing.T, tempDir, upstreamURL string, providers
 
 	address := unusedAddress(t)
 	envPath := filepath.Join(tempDir, ".env")
-	env := fmt.Sprintf("ORR_LISTEN=%s\nORR_UPSTREAM=%s\nORR_DB_FILE=%s\nORR_LOG_REQUESTS=true\nORR_TUI=false\n", address, upstreamURL, dbPath)
+	env := fmt.Sprintf("ORR_LISTEN=%s\nORR_UPSTREAM=%s\nORR_DB_FILE=%s\nORR_LOG_REQUESTS=true\nORR_TUI=false\nORR_GUARDRAILS=off\n", address, upstreamURL, dbPath)
 	for name, value := range extraEnv {
 		env += name + "=" + value + "\n"
 	}

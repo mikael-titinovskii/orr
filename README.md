@@ -32,10 +32,11 @@ Set-Location orr
 orr serve
 ```
 
-The installer asks for `OPENROUTER_API_KEY`, builds `orr`, and adds it to
-`PATH` where needed. Set `ORR_OPENROUTER_API_KEY` beforehand for unattended
-installs. It also configures installed Kimi Code and OpenCode clients when it
-finds them.
+The installer asks for `OPENROUTER_API_KEY`, builds `orr`, installs the
+required guardrails sidecar, and adds it to `PATH` where needed. It needs
+Python 3.11–3.13 on the machine; on Debian/Ubuntu install `python3-venv` too.
+Set `ORR_OPENROUTER_API_KEY` beforehand for unattended installs. It also
+configures installed Kimi Code and OpenCode clients when it finds them.
 
 Without Go 1.23+, the installer builds `orr` for your platform with Docker and
 the repository's `Dockerfile`. Docker is used only for building; `orr` still
@@ -93,6 +94,9 @@ Keep `ORR_LISTEN` on `127.0.0.1` unless you deliberately want network access.
 Before tagging a release, update `Version` in `internal/app/main.go` to match
 the tag. The dashboard compares this value with release tags, and `orr version`
 reports it. After upgrading, restart `orr serve` to run the new executable.
+On Windows, `orr upgrade` refuses to replace the binary while another orr
+process is running; close `orr serve` (and any other orr window) first, then
+run the upgrade again.
 
 Use a different dotenv file when needed:
 
@@ -137,6 +141,11 @@ ORR_429_FAILOVER_THRESHOLD=2
 `observe` is the quieter middle ground for loop detection: the output is
 untouched and no extra request is made, and the request log still marks the
 responses that would have been cut.
+
+`orr upgrade` also installs the required guardrails sidecar for an installation
+that predates it. That first upgrade downloads the Python dependencies and fails
+rather than leaving an installation that cannot start; see
+[Guardrails](#guardrails).
 
 ## Management API
 
@@ -690,6 +699,97 @@ ORR_LOOP_DETECTION=off
 
 `observe` is the middle ground for deciding whether to keep the feature: the
 output is untouched and no extra request is made.
+
+## Guardrails
+
+`orr` requires a local [NeMo Guardrails](https://github.com/NVIDIA-NeMo/Guardrails)
+sidecar. It is not linked into the binary — it runs as a supervised Python
+process on loopback — so the Go build stays CGO-free and cross-platform.
+
+Installation is automatic. `orr serve` creates the Python environment on first
+run, installs the pinned dependencies, and refuses to start if either step
+fails. The installers do the same at install time, and `orr upgrade` does it for
+an existing installation. The only prerequisite is Python 3.11–3.13; on
+Debian/Ubuntu also install `python3-venv`.
+
+```sh
+orr guardrails status           # installation, mode, endpoint, policy path
+orr guardrails config           # print the active policy
+orr guardrails install --force  # rebuild the environment and reset the policy
+orr guardrails install --python /usr/bin/python3.12
+```
+
+The policy is entirely local and model-free: YARA rules for output injection,
+regex rules for tool-call and output hazards, JSON-schema tool-call validation,
+and tool-result secret patterns. No model is declared, so a check never calls
+an upstream API and the sidecar needs no credentials, no Hugging Face token,
+and no model download. It lives at the `policy` path reported by
+`orr guardrails status` (by default the platform data directory, under
+`guardrails/configs/orr/config.yml`); edit it in place. `--force` is the only
+thing that overwrites an edited policy.
+
+Checks read prose, not code. Fenced blocks and inline spans are removed from
+the answer before it is checked, because a coding model's reply is mostly
+snippets that a client displays rather than executes; a `<script>` tag inside
+a fence is an example, and a React `onClick` is not an attack. The same holds
+for the model's tool calls, whose arguments are judged by the `tool_call`
+rails rather than read as prose. Those rails are keyed to three canonical
+classes, and orr rewrites the names the harnesses actually send onto them —
+`Bash`/`bash` to `run_command`, `Read`/`read` to `read_file`,
+`Write`/`Edit`/`patch` to `write_file` — along with the `file_path`, `filePath`
+and `cmd` argument names they use. A tool that matches no class keeps its own
+name and gets no rail of its own. What remains is the prose a client renders,
+where the rails look for markup that executes (`<script>`, `<iframe>`,
+`javascript:`), a shell that takes over the machine (`bash -i >& /dev/tcp/…`,
+a PHP webshell), a remote image that carries data out, control characters that
+hide text, and the phrasing of an injected turn — `ignore previous
+instructions`, `your new system prompt is`, `<!--`, `<|im_start|>`-style
+framing. A fence that is never closed, or a line with an odd number of
+backticks, is checked instead of dropped: otherwise the answer itself would
+decide what the rails get to see.
+
+NeMo's own `sqli`, `template`, and `code` rule sets are not used: they are
+written for chatbot input, and they fire on ordinary answers of a coding model
+(`{{ .Values.x }}` is a template, any SQL word next to a semicolon is
+injection, `import os` is code execution).
+
+Updates follow the binary. `orr upgrade` — or the next `orr serve` — refreshes
+the installed requirements, the runner, and an **untouched** policy. An edited
+policy is never overwritten: when the shipped default changes, the new one is
+written beside it as `config.yml.new` and the log names that file.
+`orr guardrails status` reports whether the policy is `default`, `edited`, or
+`default, update available`, whether the dependencies are `current` or
+`pending`, and the recent verdicts the running instance recorded: time, phase
+(`input`, `tool_result`, or `output`), rail, model, provider, and whether the request was
+blocked or only observed. Verdicts carry no inspected text; the same list is
+served by `GET /api/v1/guardrails`.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ORR_GUARDRAILS` | `on` | Required sidecar. `off` disables it for development only. |
+| `ORR_GUARDRAILS_ACTION` | `block` | `off` skips checks, `observe` records verdicts and forwards unchanged, `block` refuses the request. |
+| `ORR_GUARDRAILS_PORT` | `8765` | Loopback port the sidecar listens on. |
+| `ORR_GUARDRAILS_URL` | | External sidecar endpoint. When set, `orr` supervises nothing and only requires this endpoint to pass its health check. |
+| `ORR_GUARDRAILS_HOME` | platform data directory | Installation directory. |
+
+Inbound checks run on the last user message and on any tool results in the
+request. Response checks run before the answer reaches the client: a
+non-streaming body in full (up to 8 MiB), and a streamed response on the prefix
+that follows its first bytes and arrives within 1.5 seconds, at most 8 KiB —
+checking a whole stream would stop it being a stream. A returned tool call is
+checked on its arguments by the `tool_call` rails. A blocked request answers
+`403`, a blocked response
+`502`, both with `{"error":{"code":"guardrail_blocked",…}}`, and either is
+marked in the request log with a yellow `⊘ GUARD TRIPPED`; `observe` keeps the
+normal response and only marks it. A request body the gate cannot normalise is
+refused in `block` mode rather than checked as if the unreadable part were
+absent.
+
+Verdicts are appended to `guardrails-verdicts.jsonl` next to the database,
+rotating to `.1` at 5 MiB; each line carries time, phase, rail, model, provider,
+action, and status, never inspected text.
+
+The check API is `POST /v1/checks` on the sidecar.
 
 ## Runtime options
 

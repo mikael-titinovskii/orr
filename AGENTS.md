@@ -24,6 +24,7 @@
 - Maintain macOS, Linux, and Windows compatibility; do not depend on Unix-only terminal handling. The SQLite driver must stay pure Go (`modernc.org/sqlite`) because `Dockerfile` builds with `CGO_ENABLED=0`.
 - The installers and `orr upgrade` build with Docker when Go is unavailable. Keep `.dockerignore` an allowlist so `.env`, the database, and `.git` never enter the build context.
 - Leave missing data blank in dashboards and CLI tables. Do not use `0`, `0%`, `0.0%`, `-`, or `—` as no-data placeholders; an empty cell is fine. Keep zero API/tool error rates blank as well.
+- The NeMo Guardrails sidecar is a hard requirement, not a Go dependency. `serve` installs its Python environment on first run and refuses to start without it (or a healthy `ORR_GUARDRAILS_URL`); `orr upgrade` and both installers run `orr guardrails install`. Keep its assets in `internal/app/guardrails_assets`, keep the default policy model-free, bind the runner to loopback, and never fold Python into the CGO-free binary. `ORR_GUARDRAILS_ACTION` defaults to `block`: a rail verdict fails the request with 403 and `guardrail_blocked`; `observe` only marks the log. Never log the inspected text, only the rail name. Do not add model classifiers or gated downloads; guards stay deterministic and need no token. Response checks are a prefix gate for streams (8 KiB) and a full-body gate for non-streaming answers; verdicts persist as JSON lines next to the database and rotate at 5 MiB.
 
 ## Documentation
 

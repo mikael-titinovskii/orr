@@ -192,6 +192,7 @@ var (
 	titleStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
 	dimStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	errorStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	guardStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
 	watermarkStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("234"))
 	usageQuarterStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("249"))
 	releaseUpdateStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("136"))
@@ -1091,6 +1092,9 @@ func logCellStyles(fg lipgloss.TerminalColor) (plain, shaded lipgloss.Style) {
 // logRowForeground returns the foreground shared by every cell of a log row,
 // or nil when the row takes the terminal's default foreground.
 func logRowForeground(record requestRecord) lipgloss.TerminalColor {
+	if record.GuardBlocked || record.GuardObserved || record.GuardUnavailable {
+		return guardStyle.GetForeground()
+	}
 	if record.apiError() {
 		return errorStyle.GetForeground()
 	}
@@ -1100,15 +1104,37 @@ func logRowForeground(record requestRecord) lipgloss.TerminalColor {
 func renderCompactLogRows(records []requestRecord, width int) string {
 	lines := make([]string, 0, len(records)*2)
 	for _, record := range records {
-		first := shorten(fmt.Sprintf("%s%s  %d  %s  $%.4f", record.Time.Local().Format("15:04:05"), logLoopSuffix(record), record.Status, logDurationText(record.Duration), record.Cost), width)
+		first := shorten(fmt.Sprintf("%s%s%s  %d  %s  $%.4f", record.Time.Local().Format("15:04:05"), logGuardSuffix(record), logLoopSuffix(record), record.Status, logDurationText(record.Duration), record.Cost), width)
 		second := shorten(fmt.Sprintf("%s / %s  %s  %s  %s  %s  %s  %s  %s  %s  %s  %s", record.Model, record.Provider, logReasoningText(record), logTokenValue(record.PromptTokens), logUncachedText(record), logTokenValue(record.CompletionTokens), logThroughputText(record), logThinkPercentText(record), logLatencyText(record), logCacheReadText(record), logCacheWriteText(record), logCachePercentText(record)), width)
-		if record.apiError() {
+		if record.GuardBlocked || record.GuardObserved || record.GuardUnavailable {
+			first = guardStyle.Render(first)
+			second = guardStyle.Render(second)
+		} else if record.apiError() {
 			first = errorStyle.Render(first)
 			second = errorStyle.Render(second)
 		}
 		lines = append(lines, first, second)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// guardMark rides beside the model name for a request the guardrails sidecar
+// judged. A block renders red; an observe verdict renders orange, because the
+// response the client received is unchanged.
+const guardMark = "⊘ GUARD TRIPPED"
+
+func logGuardMarker(record requestRecord) string {
+	if record.GuardBlocked || record.GuardObserved || record.GuardUnavailable {
+		return guardMark
+	}
+	return ""
+}
+
+func logGuardSuffix(record requestRecord) string {
+	if marker := logGuardMarker(record); marker != "" {
+		return " " + marker
+	}
+	return ""
 }
 
 // logLoopMarks are what a request's loop state earns. The mark itself says the
@@ -1152,7 +1178,10 @@ func logLoopSuffix(record requestRecord) string {
 // on rows that never looped. A normal request therefore renders exactly as it
 // did before the mark existed.
 func logModelText(record requestRecord, width int) string {
-	marker := logLoopMarker(record)
+	marker := logGuardMarker(record)
+	if marker == "" {
+		marker = logLoopMarker(record)
+	}
 	if marker == "" {
 		return shorten(record.Model, width)
 	}

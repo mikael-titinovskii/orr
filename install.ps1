@@ -139,6 +139,10 @@ try {
     }
     $env:Path = "$BinDir;$env:Path"
 
+    Write-Host "Installing the guardrails sidecar..."
+    & (Join-Path $BinDir "orr.exe") guardrails install --env $EnvPath
+    if ($LASTEXITCODE -ne 0) { throw "The guardrails installation failed. orr requires Python 3.11-3.13; install it and rerun the installer." }
+
     Write-Host "Checking Kimi Code and OpenCode configuration..."
     & (Join-Path $BinDir "orr.exe") integrate --env $EnvPath
 

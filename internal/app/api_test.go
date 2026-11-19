@@ -269,3 +269,38 @@ func TestAPISuccessfulJobsPreserveManualPin(t *testing.T) {
 		}
 	}
 }
+
+func TestGuardrailsVerdictsEndpoint(t *testing.T) {
+	a := testManagementAPI(t)
+	a.p.stats.record(requestRecord{Time: time.Now(), Model: "a/b", Provider: "p1", Status: 200})
+	a.p.stats.record(requestRecord{
+		Time: time.Now(), Model: "a/b", Provider: "p1", Status: 403,
+		GuardPhase: "input", GuardRail: "regex check input", GuardBlocked: true,
+	})
+	a.p.stats.record(requestRecord{
+		Time: time.Now(), Model: "a/b", Provider: "p2", Status: 200,
+		GuardPhase: "tool_result", GuardRail: "regex check tool result", GuardObserved: true,
+	})
+
+	r := apiRequest(a, http.MethodGet, "guardrails", "")
+	if r.Code != http.StatusOK {
+		t.Fatalf("status = %d", r.Code)
+	}
+	var payload struct {
+		Verdicts []guardrailEvent `json:"verdicts"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Verdicts) != 2 {
+		t.Fatalf("verdicts = %d, want 2: %+v", len(payload.Verdicts), payload.Verdicts)
+	}
+	first := payload.Verdicts[0]
+	if first.Action != "observed" || first.Phase != "tool_result" || first.Rail != "regex check tool result" {
+		t.Fatalf("first verdict = %+v, want the observed tool result", first)
+	}
+	second := payload.Verdicts[1]
+	if second.Action != "blocked" || second.Phase != "input" || second.Provider != "p1" || second.Status != 403 {
+		t.Fatalf("second verdict = %+v, want the blocked input", second)
+	}
+}

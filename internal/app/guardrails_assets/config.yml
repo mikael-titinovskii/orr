@@ -1,0 +1,163 @@
+# Default orr policy for the required NeMo Guardrails sidecar.
+#
+# Every rail here is local: no model is declared, so a check never calls an
+# upstream API and the sidecar needs no credentials or network egress. Add a
+# model-backed rail deliberately, knowing it costs a second LLM round trip.
+#
+# The tool names below are canonical classes. orr rewrites the names the
+# harnesses actually send onto them before the check leaves the proxy — Bash and
+# bash become run_command, Read and read become read_file, Write, Edit, patch and
+# the rest become write_file — and renames their path/command arguments to the
+# names these rails read. A tool that matches no class keeps its own name and
+# gets no per_tool rail.
+
+models: []
+
+rails:
+  config:
+    # Payloads a compromised provider could put in model output: script a viewer
+    # executes, a shell a harness runs, framing that re-parses as a new turn.
+    #
+    # NeMo's own `sqli`, `template`, and `code` rule sets are deliberately
+    # absent. They are written for chatbot input, and a coding model's ordinary
+    # answer trips them constantly: `{{ .Values.x }}` is a template, a SQL word
+    # next to any semicolon is injection, `import os` is code execution. A rail
+    # that blocks most answers protects nothing, so orr ships these rules, which
+    # match only payloads that do something when rendered or run.
+    injection_detection:
+      injections: [orr_output]
+      action: reject
+      yara_rules:
+        orr_output: |
+          rule orr_markup_injection
+          {
+              meta:
+                  description = "Markup that executes when a client renders it"
+
+              strings:
+                  $element      = /<\s*\/?\s*(script|iframe|object|embed)\b/i
+                  $handler      = /<\s*[a-z][a-z0-9-]*\b[^>\n]{0,200}\son[a-z]{3,12}\s*=/i
+                  $script_uri   = /(java|vb)script\s*:/i
+                  $meta_refresh = /<\s*meta\b[^>\n]{0,200}http-equiv\s*=\s*["']?\s*refresh/i
+                  $data_html    = /(src|href)\s*=\s*["']?\s*data:text\/html/i
+
+              condition:
+                  any of them
+          }
+
+          rule orr_shell_payload
+          {
+              meta:
+                  description = "A command that gives away a shell"
+
+              strings:
+                  $reverse_tcp = /\/dev\/(tcp|udp)\/[a-z0-9.:\[\]-]{3,}/i
+                  $netcat      = /\bnc(at)?\b[^\n]{0,60}\s-e\s+["']?(\/bin\/)?(ba|z)?sh/i
+                  $bash_dev    = /\b(ba|z)?sh\s+-i\s*>\s*&\s*\/dev\//i
+                  $fifo_shell  = /mkfifo\s+[^\n|]{1,80}\|[^\n]{0,40}(\/bin\/)?(ba|z)?sh/i
+                  $base64_shell = /[A-Za-z0-9+\/]{60,}={0,2}\s*\|\s*base64\s+(-d|--decode)\s*\|\s*(\/bin\/)?(ba|z)?sh/i
+
+              condition:
+                  any of them
+          }
+
+          rule orr_webshell
+          {
+              meta:
+                  description = "PHP that runs a request parameter"
+
+              strings:
+                  $php_open = "<?php"
+                  $sink     = /(eval|assert|system|passthru|shell_exec|popen|proc_open|preg_replace)\s*\(\s*\$_(POST|GET|REQUEST|COOKIE|SERVER)/i
+
+              condition:
+                  $php_open and $sink
+          }
+
+    regex_detection:
+      # Characters that carry instructions past a human reader.
+      input:
+        patterns:
+          - '[\U000E0000-\U000E007F]'      # unicode tag smuggling
+          - '[\u200B-\u200D\u2060\uFEFF]'  # zero-width
+      output:
+        patterns:
+          - '[\U000E0000-\U000E007F]'
+          - '[\u200B-\u200D\u2060\uFEFF]'
+          - '\x1b\['
+          - '[\u202A-\u202E\u2066-\u2069]'  # bidi overrides
+          - '(?i)<img[^>]+src\s*=\s*[^ >]*https?://'
+          # The answer turns into instructions for whoever reads it next. These
+          # phrases in a coding model's prose are an injected turn, not advice:
+          # recommendations never address the reader's instructions directly.
+          - '(?i)\b(ignore|disregard|forget)\s+(all\s+|any\s+|the\s+)?(previous|prior|above|earlier|preceding)\s+(instructions?|prompts?|messages?|rules?|context)'
+          - '(?i)\byour\s+new\s+(instructions?|system\s+prompt)\s+(are|is)\b'
+          - '(?i)\b(new|updated|real)\s+system\s+prompt\s*:'
+          - '(?i)<\|(im_start|im_end|system|endoftext|tool_call|function_call|assistant|user|end)\|>'
+          - '<<SYS>>'
+          - '\[/?INST\]'
+          - '<!--'
+      tool_call:
+        run_command:
+          patterns:
+            - '\brm\s+-rf\b'
+            - '\b(curl|wget)\b[^\n]*\|\s*(ba)?sh'
+            - '\bchmod\s+\+x\b'
+            - 'base64\s+(-d|--decode)'
+            - '(?i)\b(Invoke-Expression|IEX|Invoke-WebRequest|iwr|irm)\b'
+            - '(?i)\b(schtasks|reg\s+add|net\s+user|vssadmin|bcdedit)\b'
+            - '\b(mkfs|dd\s+if=|format\s+[A-Za-z]:|shutdown|reboot)\b'
+            - '\b(sudo|su)\b'
+            - '>\s*/etc/'
+        write_file:
+          patterns:
+            - '(^|/)\.ssh/'
+            - '(^|/)\.aws/'
+            - '(^|/)\.env$'
+            - '^/etc/'
+            - '(^|/)\.git/config$'
+            - '(^|/)\.(bashrc|zshrc|profile)$'
+            - 'authorized_keys$'
+            - 'id_rsa$'
+            - '(^|/)\.npmrc$'
+            - '(^|/)\.docker/config\.json$'
+            - '(^|/)\.kube/config$'
+      tool_result:
+        read_file:
+          patterns:
+            - 'BEGIN [A-Z ]*PRIVATE KEY'
+            - '\b(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,})\b'
+            - '\bAKIA[0-9A-Z]{16}\b'
+            - '\b(gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b'
+            - '\bxox[baprs]-[A-Za-z0-9-]{10,}\b'
+            - '\b(sk-or-v1-[0-9a-f]{64})\b'
+            - '\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b'
+
+  input:
+    flows:
+      - regex check input
+
+  output:
+    flows:
+      - injection detection
+      - regex check output
+
+  # Tool rails run only on the IORails engine; the sidecar enables it.
+  #
+  # `tool call validation` is deliberately absent: it allows only the tools a
+  # config declares, and a proxy has no toolset to declare, so it denies every
+  # call — including an ordinary one. The per-tool regex rails below are the
+  # protection, and they see the canonical names orr rewrites calls onto.
+  tool_call:
+    per_tool:
+      run_command:
+        - 'regex check tool call $argument=command'
+      write_file:
+        - 'regex check tool call $argument=path'
+
+  tool_result:
+    flows:
+      - tool result validation
+    per_tool:
+      read_file:
+        - 'regex check tool result'

@@ -84,6 +84,14 @@ type requestRecord struct {
 	// the text or a copy of it.
 	LoopPeriod int `json:"loop_period,omitempty"`
 	LoopRepeat int `json:"loop_repeat,omitempty"`
+	// GuardPhase, GuardRail, GuardBlocked, and GuardObserved record a verdict
+	// from the guardrails sidecar. They hold the rail's policy name and the
+	// direction it checked, never any part of the text it inspected.
+	GuardPhase       string `json:"guard_phase,omitempty"`
+	GuardRail        string `json:"guard_rail,omitempty"`
+	GuardBlocked     bool   `json:"guard_blocked,omitempty"`
+	GuardObserved    bool   `json:"guard_observed,omitempty"`
+	GuardUnavailable bool   `json:"guard_unavailable,omitempty"`
 	// ProviderUnavailable marks OpenRouter reporting that the single selected
 	// endpoint no longer serves the model. Like RateLimited, it is routing-only
 	// evidence and is never persisted.
@@ -140,6 +148,19 @@ func (r requestRecord) thinkingPercent() float64 {
 
 func (r requestRecord) apiError() bool {
 	return r.Err || r.Status < 200 || r.Status >= 300
+}
+
+// guardrailRefusal reports a request orr itself refused, or could not check and
+// therefore refused. It never reached the provider, so it says nothing about
+// that provider's health: counting it would convict a healthy provider of
+// degradation for traffic it never served. An unavailable check in observe mode
+// is not a refusal — the provider served the request and the client got the
+// answer — so it stays in the provider's traffic.
+func (r requestRecord) guardrailRefusal() bool {
+	if r.GuardBlocked {
+		return true
+	}
+	return r.GuardUnavailable && r.Status == 503
 }
 
 type diagnosticWindow struct {

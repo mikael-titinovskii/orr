@@ -75,7 +75,7 @@ func (a *managementAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/v1/")
 	allowed := ""
 	switch path {
-	case "stats", "models", "model":
+	case "stats", "models", "model", "guardrails":
 		allowed = "GET"
 	case "pin":
 		allowed = "PUT, DELETE"
@@ -105,6 +105,10 @@ func (a *managementAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		writeError(w, 404, "unknown job")
+		return
+	}
+	if path == "guardrails" {
+		a.guardrailsVerdicts(w)
 		return
 	}
 	if path == "stats" {
@@ -278,4 +282,48 @@ func (a *managementAPI) stop() {
 	a.mu.Lock()
 	a.closed = true
 	a.mu.Unlock()
+}
+
+// guardrailEvent is one guardrail verdict for the diagnostics view. It carries
+// the rail's policy name and where it fired, never the inspected text.
+type guardrailEvent struct {
+	Time     time.Time `json:"time"`
+	Phase    string    `json:"phase"`
+	Rail     string    `json:"rail"`
+	Model    string    `json:"model"`
+	Provider string    `json:"provider"`
+	Action   string    `json:"action"`
+	Status   int       `json:"status"`
+}
+
+func guardrailEventFor(record requestRecord) (guardrailEvent, bool) {
+	if record.GuardPhase == "" || (!record.GuardBlocked && !record.GuardObserved && !record.GuardUnavailable) {
+		return guardrailEvent{}, false
+	}
+	action := "observed"
+	if record.GuardBlocked {
+		action = "blocked"
+	} else if record.GuardUnavailable {
+		action = "unavailable"
+	}
+	return guardrailEvent{
+		Time:     record.Time,
+		Phase:    record.GuardPhase,
+		Rail:     record.GuardRail,
+		Model:    record.Model,
+		Provider: record.Provider,
+		Action:   action,
+		Status:   record.Status,
+	}, true
+}
+
+func (a *managementAPI) guardrailsVerdicts(w http.ResponseWriter) {
+	records := a.p.stats.snapshot().Records
+	events := make([]guardrailEvent, 0, 20)
+	for i := len(records) - 1; i >= 0 && len(events) < 20; i-- {
+		if event, ok := guardrailEventFor(records[i]); ok {
+			events = append(events, event)
+		}
+	}
+	apiJSON(w, 200, map[string]any{"verdicts": events})
 }

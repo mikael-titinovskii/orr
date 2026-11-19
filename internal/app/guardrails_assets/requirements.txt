@@ -1,0 +1,13 @@
+# Pinned to the versions the sidecar and default policy were validated against.
+# `server` brings FastAPI/uvicorn; `jailbreak` brings yara-python.
+nemoguardrails[server,jailbreak]==0.25.0
+aiohttp==3.14.5
+aiohttp-retry==2.9.1
+fastapi==0.165.0
+starlette==1.10.0
+uvicorn==0.54.0
+pydantic==2.14.4
+jsonschema==4.26.0
+openai==2.54.0
+httpx==0.28.1
+yara-python==4.5.4
