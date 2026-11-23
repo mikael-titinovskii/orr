@@ -66,7 +66,7 @@ func TestOpenAPIPathsMatchHandlers(t *testing.T) {
 	if err := json.Unmarshal(openAPISchema, &spec); err != nil {
 		t.Fatal(err)
 	}
-	if spec.OpenAPI != "3.1.0" || len(spec.Paths) != 7 {
+	if spec.OpenAPI != "3.1.0" || len(spec.Paths) != 8 {
 		t.Fatalf("unexpected schema: %s, %d paths", spec.OpenAPI, len(spec.Paths))
 	}
 	if len(spec.Security) != 0 || len(spec.Components.SecuritySchemes) != 0 {

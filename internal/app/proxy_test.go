@@ -533,6 +533,43 @@ func TestProxyAutoPinsBeforeUpstreamError(t *testing.T) {
 	}
 }
 
+func TestUpstreamErrorIsLoggedWithItsMessage(t *testing.T) {
+	cfg := testConfig("https://upstream.test/api/v1")
+	p, err := newProxy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return response(http.StatusBadGateway, `{"error":{"message":"provider rejected the request: too many images"}}`), nil
+	})
+	logs := logCapture(t)
+	req, _ := http.NewRequest(http.MethodPost, "http://proxy.test/v1/chat/completions", strings.NewReader(`{"model":"moonshotai/kimi-k2.5","messages":[{"role":"user","content":"x"}]}`))
+	res := newMemoryResponseWriter()
+	p.ServeHTTP(res, req)
+
+	got := logs.String()
+	if !strings.Contains(got, "upstream POST /v1/chat/completions returned 502") {
+		t.Fatalf("log = %q, want the failed upstream answer", got)
+	}
+	if !strings.Contains(got, "provider rejected the request: too many images") {
+		t.Fatalf("log = %q, want the upstream's own message", got)
+	}
+}
+
+func TestUpstreamErrorDetailReadsEveryShape(t *testing.T) {
+	for _, tc := range []struct{ body, want string }{
+		{`{"error":{"message":"a\nb"}}`, "a b"},
+		{`{"message":"a"}`, "a"},
+		{`{"detail":"a"}`, "a"},
+		{`plain text`, "plain text"},
+		{``, ""},
+	} {
+		if got := upstreamErrorDetail([]byte(tc.body)); got != tc.want {
+			t.Fatalf("upstreamErrorDetail(%q) = %q, want %q", tc.body, got, tc.want)
+		}
+	}
+}
+
 func TestExtractResponseSummaryFromSSE(t *testing.T) {
 	stream := "data: {\"model\":\"moonshotai/kimi-k2.5\",\"provider\":\"fireworks\"}\n\n" +
 		"data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\"cost\":0.0012}}\n\n" +

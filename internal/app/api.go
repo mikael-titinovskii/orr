@@ -81,6 +81,8 @@ func (a *managementAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		allowed = "PUT, DELETE"
 	case "refresh", "benchmarks":
 		allowed = "POST"
+	case "guardrails/allow":
+		allowed = "POST"
 	default:
 		if strings.HasPrefix(path, "jobs/") {
 			allowed = "GET"
@@ -109,6 +111,10 @@ func (a *managementAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if path == "guardrails" {
 		a.guardrailsVerdicts(w)
+		return
+	}
+	if path == "guardrails/allow" {
+		a.guardrailsAllow(w, r)
 		return
 	}
 	if path == "stats" {
@@ -285,7 +291,10 @@ func (a *managementAPI) stop() {
 }
 
 // guardrailEvent is one guardrail verdict for the diagnostics view. It carries
-// the rail's policy name and where it fired, never the inspected text.
+// the rail's policy name and where it fired, and the text the check judged, cut
+// to guardrailSampleLimit — without the sample a false positive cannot be
+// reproduced, and a rail that blocks ordinary traffic is indistinguishable from
+// one that works.
 type guardrailEvent struct {
 	Time     time.Time `json:"time"`
 	Phase    string    `json:"phase"`
@@ -294,6 +303,8 @@ type guardrailEvent struct {
 	Provider string    `json:"provider"`
 	Action   string    `json:"action"`
 	Status   int       `json:"status"`
+	Text     string    `json:"text,omitempty"`
+	Label    string    `json:"label,omitempty"`
 }
 
 func guardrailEventFor(record requestRecord) (guardrailEvent, bool) {
@@ -314,6 +325,8 @@ func guardrailEventFor(record requestRecord) (guardrailEvent, bool) {
 		Provider: record.Provider,
 		Action:   action,
 		Status:   record.Status,
+		Text:     record.GuardText,
+		Label:    record.GuardLabel,
 	}, true
 }
 
@@ -326,4 +339,25 @@ func (a *managementAPI) guardrailsVerdicts(w http.ResponseWriter) {
 		}
 	}
 	apiJSON(w, 200, map[string]any{"verdicts": events})
+}
+
+// guardrailsAllow opens the operator window `orr guardrails allow` asks for. The
+// duration is re-validated here rather than trusted from the CLI, so the range
+// holds for anything that can reach the API.
+func (a *managementAPI) guardrailsAllow(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var body struct {
+		Duration string `json:"duration"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, 400, "invalid allow body")
+		return
+	}
+	span, err := parseGuardrailAllowDuration(body.Duration)
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	until := a.p.allowGuardrails(span)
+	apiJSON(w, 200, map[string]any{"until": until.UTC().Format(time.RFC3339)})
 }

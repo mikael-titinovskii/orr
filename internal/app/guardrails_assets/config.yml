@@ -1,8 +1,11 @@
 # Default orr policy for the required NeMo Guardrails sidecar.
 #
-# Every rail here is local: no model is declared, so a check never calls an
-# upstream API and the sidecar needs no credentials or network egress. Add a
-# model-backed rail deliberately, knowing it costs a second LLM round trip.
+# Every rail here is local: a check never calls an upstream API, and the only
+# model involved is the one `orr guardrails install` already downloaded. The
+# deterministic rails always run. The `hf_classifier` block is filled in by orr
+# from the marker below at install time, and only when a Hugging Face token made
+# the gated Prompt Guard model available; without one the marker stays a comment
+# and the policy is model-free.
 #
 # The tool names below are canonical classes. orr rewrites the names the
 # harnesses actually send onto them before the check leaves the proxy — Bash and
@@ -123,7 +126,7 @@ rails:
             - '(^|/)\.docker/config\.json$'
             - '(^|/)\.kube/config$'
       tool_result:
-        read_file:
+        read_file: &tool_result_secrets
           patterns:
             - 'BEGIN [A-Z ]*PRIVATE KEY'
             - '\b(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,})\b'
@@ -132,15 +135,23 @@ rails:
             - '\bxox[baprs]-[A-Za-z0-9-]{10,}\b'
             - '\b(sk-or-v1-[0-9a-f]{64})\b'
             - '\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b'
+        # Command output carries the same credentials — `env`, `cat .env`,
+        # `git remote -v` — and orr has already rewritten the call to this
+        # canonical name, so the list above is also the one applied to it.
+        run_command: *tool_result_secrets
+
+    # orr:hf-classifier-config
 
   input:
     flows:
       - regex check input
+      # orr:hf-classifier-input
 
   output:
     flows:
       - injection detection
       - regex check output
+      # orr:hf-classifier-output
 
   # Tool rails run only on the IORails engine; the sidecar enables it.
   #
@@ -155,9 +166,14 @@ rails:
       write_file:
         - 'regex check tool call $argument=path'
 
+  # Tool output is also checked by the input rails: NeMo has no model-backed
+  # flow for this surface, so orr sends the trailing results as a user turn
+  # with the `input` rail type. The flows here add linkage and secrets on top.
   tool_result:
     flows:
       - tool result validation
     per_tool:
       read_file:
+        - 'regex check tool result'
+      run_command:
         - 'regex check tool result'

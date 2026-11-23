@@ -11,8 +11,10 @@ import (
 var verdictLogMaxBytes int64 = 5 << 20
 
 // verdictLog appends guardrail verdicts as JSON lines. It records the same
-// fields as the in-memory log, never inspected text, and is safe for concurrent
-// requests.
+// fields as the in-memory log, including the text the check judged, and is safe
+// for concurrent requests. The sample is what makes a false positive
+// reproducible, so it stays on the line rather than in a separate file that
+// would have to be correlated by time.
 type verdictLog struct {
 	mu   sync.Mutex
 	path string

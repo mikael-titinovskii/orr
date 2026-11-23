@@ -28,6 +28,7 @@ The reference page only fetches the schema; it does not execute API operations.
 | DELETE | `/api/v1/pin?model=author/model` | Clear only the manual override, restoring automatic selection; returns the model. |
 | POST | `/api/v1/refresh?model=author/model` | Start a provider-order refresh job. No body. |
 | POST | `/api/v1/benchmarks?model=author/model` | Benchmark the model's providers and apply existing ranking rules. No body. |
+| POST | `/api/v1/guardrails/allow` | Open a window in which a blocked guardrail verdict is recorded instead of refused. Optional body `{ "duration": "5m" }`, from `1m` to `1h`, `5m` when absent; returns `{ "until": ... }`. |
 | GET | `/api/v1/jobs/{id}` | Read job status. |
 
 Models must already be known to the running proxy. Model identifiers are query

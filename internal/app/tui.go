@@ -960,7 +960,7 @@ func (m *dashboardModel) refreshLog() {
 	}
 }
 
-const logTableMinWidth = 151
+const logTableMinWidth = 171
 
 // logTableTimeWidth is the width of the leading Time column, which every row
 // renders as 15:04:05. It is named so that logTableWidths and logTableColumns,
@@ -974,7 +974,7 @@ func renderLogRows(records []requestRecord, width int) string {
 	if tableWidth < logTableMinWidth {
 		return renderCompactLogRows(records, width)
 	}
-	modelWidth, providerWidth, _, _, _, _, _, _, _, _, _, _, _, _, _ := logTableWidths(tableWidth)
+	modelWidth, providerWidth, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ := logTableWidths(tableWidth)
 	lines := make([]string, 0, len(records))
 	for _, record := range records {
 		cells := []string{
@@ -984,6 +984,8 @@ func renderLogRows(records []requestRecord, width int) string {
 			logReasoningText(record),
 			fmt.Sprintf("%d", record.Status),
 			logDurationText(record.Duration),
+			logCheckTimeText(record.GuardNonModel),
+			logCheckTimeText(record.GuardModel),
 			logTokenValue(record.PromptTokens),
 			logUncachedText(record),
 			logTokenValue(record.CompletionTokens),
@@ -1006,16 +1008,16 @@ func logTableWidth(width int) int {
 }
 
 func logTableColumns(width int) []int {
-	modelWidth, providerWidth, reasonWidth, statusWidth, durationWidth, tokenInWidth, tokenInUncachedWidth, tokenOutWidth, thinkPercentWidth, speedWidth, latencyWidth, costWidth, cacheReadWidth, cacheWriteWidth, cachePercentWidth := logTableWidths(width)
-	return []int{logTableTimeWidth, modelWidth, providerWidth, reasonWidth, statusWidth, durationWidth, tokenInWidth, tokenInUncachedWidth, tokenOutWidth, thinkPercentWidth, speedWidth, latencyWidth, costWidth, cacheReadWidth, cacheWriteWidth, cachePercentWidth}
+	modelWidth, providerWidth, reasonWidth, statusWidth, durationWidth, guardCheckWidth, guardModelWidth, tokenInWidth, tokenInUncachedWidth, tokenOutWidth, thinkPercentWidth, speedWidth, latencyWidth, costWidth, cacheReadWidth, cacheWriteWidth, cachePercentWidth := logTableWidths(width)
+	return []int{logTableTimeWidth, modelWidth, providerWidth, reasonWidth, statusWidth, durationWidth, guardCheckWidth, guardModelWidth, tokenInWidth, tokenInUncachedWidth, tokenOutWidth, thinkPercentWidth, speedWidth, latencyWidth, costWidth, cacheReadWidth, cacheWriteWidth, cachePercentWidth}
 }
 
-func logTableWidths(width int) (model, provider, reason, status, duration, tokenIn, tokenInUncached, tokenOut, thinkPercent, speed, latency, cost, cacheRead, cacheWrite, cachePercent int) {
+func logTableWidths(width int) (model, provider, reason, status, duration, guardCheck, guardModel, tokenIn, tokenInUncached, tokenOut, thinkPercent, speed, latency, cost, cacheRead, cacheWrite, cachePercent int) {
 	const (
 		// Every metric column shares one width: a grouped token count reaches
 		// nine cells, and holding the narrower columns to it too keeps the
 		// table a regular grid rather than a ragged one.
-		fixed           = logTableTimeWidth + 6 + 4 + 9 + 9 + 9 + 9 + 9 + 9 + 9 + 9 + 9 + 9 + 9 + 15 // fixed columns plus separators
+		fixed           = logTableTimeWidth + 6 + 4 + 9 + 9 + 9 + 9 + 9 + 9 + 9 + 9 + 9 + 9 + 9 + 9 + 9 + 17 // fixed columns plus separators
 		minimumModel    = 9
 		minimumProvider = 10
 		maximumModel    = 36
@@ -1024,7 +1026,7 @@ func logTableWidths(width int) (model, provider, reason, status, duration, token
 	variable := max(0, width-fixed-minimumModel-minimumProvider)
 	model = min(maximumModel, minimumModel+variable/2)
 	provider = min(maximumProvider, minimumProvider+variable-variable/2)
-	return model, provider, 6, 4, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9
+	return model, provider, 6, 4, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9
 }
 
 func logTableHeaderHeight(width int) int {
@@ -1039,7 +1041,7 @@ func renderLogTableHeader(width int) string {
 	if tableWidth < logTableMinWidth {
 		return dimStyle.Render(strings.Join([]string{
 			shorten("Time  Code  Duration  Cost", width),
-			shorten("Model / Provider  Reason  In  Uncached  Out  Think%  Tp  Lat  CR  CW  C%", width),
+			shorten("Model / Provider  Reason  In  Uncached  Out  Think%  Tp  Lat  Chk  Mod  CR  CW  C%", width),
 		}, "\n"))
 	}
 	return renderLogTableRow(logTableHeaderCells, logTableColumns(tableWidth), dimStyle.GetForeground())
@@ -1047,7 +1049,7 @@ func renderLogTableHeader(width int) string {
 
 // logTableHeaderCells are the column labels of the wide log table, in the same
 // order as logTableColumns. They are abbreviated so the table stays compact.
-var logTableHeaderCells = []string{"Time", "Model", "Provider", "Reason", "Code", "Duration", "In", "Uncached", "Out", "Think%", "Tp", "Lat", "Cost", "CR", "CW", "C%"}
+var logTableHeaderCells = []string{"Time", "Model", "Provider", "Reason", "Code", "Duration", "Chk", "Mod", "In", "Uncached", "Out", "Think%", "Tp", "Lat", "Cost", "CR", "CW", "C%"}
 
 // logTableFirstMetricColumn is the index of Duration, the first column holding
 // a measured value rather than an identifier. It and everything after it is
@@ -1105,7 +1107,7 @@ func renderCompactLogRows(records []requestRecord, width int) string {
 	lines := make([]string, 0, len(records)*2)
 	for _, record := range records {
 		first := shorten(fmt.Sprintf("%s%s%s  %d  %s  $%.4f", record.Time.Local().Format("15:04:05"), logGuardSuffix(record), logLoopSuffix(record), record.Status, logDurationText(record.Duration), record.Cost), width)
-		second := shorten(fmt.Sprintf("%s / %s  %s  %s  %s  %s  %s  %s  %s  %s  %s  %s", record.Model, record.Provider, logReasoningText(record), logTokenValue(record.PromptTokens), logUncachedText(record), logTokenValue(record.CompletionTokens), logThroughputText(record), logThinkPercentText(record), logLatencyText(record), logCacheReadText(record), logCacheWriteText(record), logCachePercentText(record)), width)
+		second := shorten(fmt.Sprintf("%s / %s  %s  %s  %s  %s  %s  %s  %s  %s  %s  %s  %s  %s", record.Model, record.Provider, logReasoningText(record), logTokenValue(record.PromptTokens), logUncachedText(record), logTokenValue(record.CompletionTokens), logThroughputText(record), logThinkPercentText(record), logLatencyText(record), logCheckTimeText(record.GuardNonModel), logCheckTimeText(record.GuardModel), logCacheReadText(record), logCacheWriteText(record), logCachePercentText(record)), width)
 		if record.GuardBlocked || record.GuardObserved || record.GuardUnavailable {
 			first = guardStyle.Render(first)
 			second = guardStyle.Render(second)
@@ -1121,7 +1123,7 @@ func renderCompactLogRows(records []requestRecord, width int) string {
 // guardMark rides beside the model name for a request the guardrails sidecar
 // judged. A block renders red; an observe verdict renders orange, because the
 // response the client received is unchanged.
-const guardMark = "⊘ GUARD TRIPPED"
+const guardMark = "⊘ GUARD BLOCKED"
 
 func logGuardMarker(record requestRecord) string {
 	if record.GuardBlocked || record.GuardObserved || record.GuardUnavailable {
@@ -1278,6 +1280,18 @@ func logLatencyText(record requestRecord) string {
 		return ""
 	}
 	return groupDigits(int(record.TTFT.Round(time.Millisecond) / time.Millisecond))
+}
+
+// logCheckTimeText renders one half of a request's guardrail check time in
+// milliseconds. Chk is everything that was not the classifier and Mod is the
+// classifier's own share; a blank means no check of that kind ran. A check that
+// ran is never zero, so a sub-millisecond measurement reads as 1 rather than as
+// the blank that means no data.
+func logCheckTimeText(duration time.Duration) string {
+	if duration <= 0 {
+		return ""
+	}
+	return groupDigits(int(max(1, duration.Round(time.Millisecond)/time.Millisecond)))
 }
 
 // groupDigits separates an integer into groups of three digits with spaces so
