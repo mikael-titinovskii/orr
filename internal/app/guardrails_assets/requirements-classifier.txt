@@ -1,0 +1,9 @@
+# Prompt Guard dependencies, installed only when a Hugging Face token made the
+# gated model available. torch is pinned here so the version the CPU wheel
+# provided is also what pip verifies; the install itself names the CPU index,
+# because the default Linux wheel carries a CUDA runtime this sidecar never uses.
+torch==2.9.1
+transformers==4.57.6
+# These releases lose tokens past the sequence limit:
+# https://github.com/huggingface/tokenizers/issues/2091
+tokenizers!=0.23.1,!=0.23.2

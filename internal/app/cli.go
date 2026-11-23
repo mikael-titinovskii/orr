@@ -174,7 +174,46 @@ func newGuardrailsCommand(output io.Writer) *cobra.Command {
 		newGuardrailsInstallCommand(output),
 		newGuardrailsStatusCommand(output),
 		newGuardrailsConfigCommand(output),
+		newGuardrailsAllowCommand(output),
 	)
+	return cmd
+}
+
+func newGuardrailsAllowCommand(output io.Writer) *cobra.Command {
+	var (
+		envPath       string
+		preferEnvFile bool
+	)
+	cmd := &cobra.Command{
+		Use:   "allow [duration]",
+		Short: "record blocked verdicts instead of refusing for a while",
+		Long: "Open a window on the running proxy in which a blocked verdict is recorded but\n" +
+			"does not refuse the request. It lasts 5 minutes by default and must be between\n" +
+			"1m and 1h. The window lives in the proxy's memory, so a restart closes it, and\n" +
+			"a sidecar that cannot answer still fails the request.",
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			span := guardrailAllowDefault
+			if len(args) == 1 {
+				parsed, err := parseGuardrailAllowDuration(args[0])
+				if err != nil {
+					return err
+				}
+				span = parsed
+			}
+			settings, err := loadGuardrailsConfigWithOptions(envPath, preferEnvFile)
+			if err != nil {
+				return err
+			}
+			until, err := requestGuardrailAllow(settings, span)
+			if err != nil {
+				return fmt.Errorf("guardrails allow: %v", err)
+			}
+			fmt.Fprintf(output, "guardrails allowed until %s (%s)\n", until.Local().Format("15:04:05"), shortDuration(span))
+			return nil
+		},
+	}
+	addEnvFlags(cmd, &envPath, &preferEnvFile)
 	return cmd
 }
 
@@ -207,6 +246,7 @@ func newGuardrailsStatusCommand(output io.Writer) *cobra.Command {
 	var (
 		envPath       string
 		preferEnvFile bool
+		full          bool
 	)
 	cmd := &cobra.Command{
 		Use:   "status",
@@ -217,9 +257,10 @@ func newGuardrailsStatusCommand(output io.Writer) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return runGuardrailsStatus(settings, output)
+			return runGuardrailsStatus(settings, full, output)
 		},
 	}
+	cmd.Flags().BoolVar(&full, "full", false, "print the whole text each verdict judged")
 	addEnvFlags(cmd, &envPath, &preferEnvFile)
 	return cmd
 }

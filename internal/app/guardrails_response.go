@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -71,55 +72,185 @@ func (p *proxy) guardUpstreamResponse(ctx context.Context, resp *http.Response, 
 		if err != nil {
 			return false, "", err
 		}
-		verdict, err := p.guardrailCheck(ctx, record.Model, []guardrailMessage{{
+		verdict, err := p.guardrailCheck(ctx, record, record.Model, []guardrailMessage{{
 			Role: "assistant", Content: content,
 		}}, []string{"output"})
 		if err != nil {
 			return p.guardResponseFailure(record, "output", action, err)
 		}
-		if blocked, rail := recordGuardVerdict(record, verdict, action); blocked {
+		if blocked, rail := p.recordGuardVerdict(record, verdict, action, text); blocked {
 			return true, rail, nil
 		}
 	}
 	// Tool calls are checked by the tool_call rails, on the arguments the harness
 	// would execute. They are not part of the prose check above, which drops them
 	// on purpose.
-	if calls := responseToolCalls(prefix, streaming); len(calls) > 0 {
-		verdict, err := p.guardrailCheck(ctx, record.Model, []guardrailMessage{{
-			Role: "assistant", ToolCalls: encodeToolCalls(calls),
+	if calls := completeToolCalls(responseToolCalls(prefix, streaming), streaming); len(calls) > 0 {
+		arguments := encodeToolCalls(calls)
+		verdict, err := p.guardrailCheck(ctx, record, record.Model, []guardrailMessage{{
+			Role: "assistant", ToolCalls: arguments,
 		}}, []string{"tool_call"})
 		if err != nil {
 			return p.guardResponseFailure(record, "output", action, err)
 		}
-		if blocked, rail := recordGuardVerdict(record, verdict, action); blocked {
+		if blocked, rail := p.recordGuardVerdict(record, verdict, action, string(arguments)); blocked {
 			return true, rail, nil
 		}
 	}
 	return false, "", nil
 }
 
+// completeToolCalls makes every streamed call judgeable. The window ends
+// wherever the answer had got to, so the last call in a prefix routinely holds
+// half a JSON object; the sidecar cannot parse that and answers with a block
+// that names no rail, which is what refused ordinary long writes. Dropping such
+// a call instead would hand the harness an unjudged call whose arguments the
+// window did not reach. So a truncated call is checked on what the window did
+// see: the argument value the rails read, taken from the partial text. A
+// non-streaming body is read in full, so a call there that still does not parse
+// is a real anomaly and stays in the check as it arrived.
+func completeToolCalls(calls []rawToolCall, streaming bool) []rawToolCall {
+	if !streaming {
+		return calls
+	}
+	judged := make([]rawToolCall, 0, len(calls))
+	for _, call := range calls {
+		if json.Valid([]byte(call.Function.Arguments)) {
+			judged = append(judged, call)
+			continue
+		}
+		arguments := partialToolArguments(canonicalToolName(call.Function.Name), call.Function.Arguments)
+		if arguments == "" {
+			// A tool outside the canonical classes has no rail of its own, so
+			// there is nothing to answer for it either way.
+			continue
+		}
+		call.Function.Arguments = arguments
+		judged = append(judged, call)
+	}
+	return judged
+}
+
+// partialToolArguments builds the argument object a rail reads out of a call the
+// prime window cut. The rails look at one value — the command or the path — so
+// that value is taken from the partial text when it is there; when it is not,
+// the visible text itself is judged rather than passed unchecked, because the
+// provider chooses its field order and could otherwise push the path past the
+// window.
+func partialToolArguments(tool, arguments string) string {
+	aliases := toolArgumentAliases[tool]
+	if len(aliases) == 0 {
+		return ""
+	}
+	target := "path"
+	if tool == "run_command" {
+		target = "command"
+	}
+	value, ok := partialJSONField(arguments, append([]string{target}, aliases...))
+	if !ok {
+		value = arguments
+	}
+	encoded, err := json.Marshal(map[string]string{target: value})
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
+
+// partialJSONField returns the value of the first of names that appears in a
+// possibly truncated JSON object. A value cut by the window is still returned:
+// what the rails match is the text that was visible.
+func partialJSONField(text string, names []string) (string, bool) {
+	for _, name := range names {
+		quoted := `"` + name + `"`
+		at := strings.Index(text, quoted)
+		if at < 0 {
+			continue
+		}
+		rest := text[at+len(quoted):]
+		rest = strings.TrimLeft(rest, " \t\r\n")
+		rest = strings.TrimPrefix(rest, ":")
+		rest = strings.TrimLeft(rest, " \t\r\n")
+		if rest == "" {
+			// The window ended at the key: the value never arrived.
+			return "", true
+		}
+		if !strings.HasPrefix(rest, `"`) {
+			continue
+		}
+		value, closed := partialJSONString(rest[1:])
+		if value != "" || closed {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+// partialJSONString returns the body of a JSON string up to its closing quote,
+// stopping at the end of a truncated input. Nothing is unescaped: the rails match
+// the characters that were visible, and a rewritten escape is one more way for a
+// value to differ from what the harness will run.
+func partialJSONString(text string) (string, bool) {
+	escaped := false
+	for at, character := range text {
+		switch {
+		case escaped:
+			escaped = false
+		case character == '\\':
+			escaped = true
+		case character == '"':
+			return text[:at], true
+		}
+	}
+	return text, false
+}
+
 // recordGuardVerdict stores a blocked verdict, and reports whether the caller
-// should answer with a refusal. In observe mode the verdict is recorded and the
-// response still reaches the client.
-func recordGuardVerdict(record *requestRecord, verdict guardrailVerdict, action string) (bool, string) {
+// should answer with a refusal. In observe mode, or while an operator window
+// from `orr guardrails allow` is open, the verdict is recorded and the response
+// still reaches the client.
+// guardrailUnnamedRail names a block the sidecar reported without a rail. A
+// tool call the sidecar cannot parse is blocked by its manager rather than by
+// a declared rail, and an empty reason in the log would leave an operator with
+// "GUARD BLOCKED" and nothing else to go on.
+func guardrailUnnamedRail(rail, reason string) string {
+	if rail != "" {
+		return rail
+	}
+	if head, _, ok := strings.Cut(reason, ":"); ok && strings.TrimSpace(head) != "" {
+		return strings.TrimSpace(head)
+	}
+	if strings.TrimSpace(reason) != "" {
+		return strings.TrimSpace(reason)
+	}
+	return "check"
+}
+
+func (p *proxy) recordGuardVerdict(record *requestRecord, verdict guardrailVerdict, action, sample string) (bool, string) {
 	if verdict.Status != "blocked" {
 		return false, ""
 	}
+	rail := guardrailUnnamedRail(verdict.Rail, verdict.Reason)
 	record.GuardPhase = "output"
-	record.GuardRail = verdict.Rail
-	if action == guardrailsActionBlock {
+	record.GuardRail = rail
+	record.GuardLabel = verdict.Label
+	record.GuardText = guardrailSample(sample)
+	if p.guardrailsEnforce(action) {
 		record.GuardBlocked = true
 	} else {
 		record.GuardObserved = true
 	}
-	return record.GuardBlocked, verdict.Rail
+	return record.GuardBlocked, rail
 }
 
 // guardResponseFailure records a check that could not answer. It is fatal only
 // in block mode: observe mode documents that the response is left untouched, so
 // a completed upstream answer must not be traded for a 503 because the sidecar
-// was restarting.
+// was restarting. The error is logged in both modes: the refusal alone says a
+// check failed, not whether the sidecar answered with an error or never
+// received the request.
 func (p *proxy) guardResponseFailure(record *requestRecord, phase, action string, err error) (bool, string, error) {
+	log.Printf("guardrails: %s check failed: %v", phase, err)
 	logGuardrailUnavailable(record, phase)
 	if action == guardrailsActionBlock {
 		return false, "", err
@@ -133,8 +264,8 @@ func logGuardrailUnavailable(record *requestRecord, phase string) {
 	record.GuardUnavailable = true
 }
 
-// responseGuardText extracts the strings a response carries, and drops the code
-// in them: a coding model's answer is mostly fenced snippets and inline spans,
+// responseGuardText extracts the answer text a response carries, and drops the
+// code in it: a coding model's answer is mostly fenced snippets and inline spans,
 // which a client renders as text rather than executes. Checking them would block
 // ordinary answers while protecting nothing.
 func responseGuardText(body []byte, streaming bool) string {
@@ -146,7 +277,7 @@ func responseGuardText(body []byte, streaming bool) string {
 		return stripCode(string(body))
 	}
 	var builder strings.Builder
-	collectStrings(value, &builder, 0)
+	collectResponseText(value, &builder, 0, true)
 	return stripCode(builder.String())
 }
 
@@ -171,7 +302,7 @@ func streamGuardText(body []byte) string {
 			continue
 		}
 		found = true
-		collectText(value, &builder, 0)
+		collectResponseText(value, &builder, 0, false)
 	}
 	if !found {
 		return string(body)
@@ -179,57 +310,56 @@ func streamGuardText(body []byte) string {
 	return builder.String()
 }
 
-// collectStrings appends every string in a JSON value, one per line, so that
-// separate fields cannot be read as one run of text.
-func collectStrings(value any, builder *strings.Builder, depth int) {
+// collectResponseText appends the strings a response carries and leaves out the
+// protocol bookkeeping around them. Every frame of a stream repeats its id, model
+// name, object type, provider and role, and every reasoning delta repeats its
+// type and format; read as answer text those are spliced between the fragments
+// of the answer, and a classifier takes the repetition for obfuscation — a
+// benign thinking that passes on its own was blocked once the frame metadata was
+// interleaved with it.
+//
+// A completed message keeps its fields on separate lines so that two of them
+// cannot be read as one run of text; streamed deltas are consecutive pieces of
+// one answer and are joined.
+func collectResponseText(value any, builder *strings.Builder, depth int, separate bool) {
 	if depth > 32 || builder.Len() > 4<<20 {
 		return
 	}
 	switch typed := value.(type) {
 	case string:
 		builder.WriteString(typed)
-		builder.WriteByte('\n')
+		if separate {
+			builder.WriteByte('\n')
+		}
 	case []any:
 		for _, item := range typed {
-			collectStrings(item, builder, depth+1)
+			collectResponseText(item, builder, depth+1, separate)
 		}
 	case map[string]any:
 		if isToolCallValue(typed) {
 			return
 		}
 		for _, key := range sortedKeys(typed) {
-			if isToolCallKey(key) {
+			if isProtocolKey(key) {
 				continue
 			}
-			collectStrings(typed[key], builder, depth+1)
+			// A reasoning block is repeated as structured details beside the
+			// reasoning field; reading both would halve the window's reach.
+			if key == "reasoning_details" && hasText(typed, "reasoning", "reasoning_content") {
+				continue
+			}
+			collectResponseText(typed[key], builder, depth+1, separate)
 		}
 	}
 }
 
-// collectText appends every string in a JSON value without separating them, for
-// streamed deltas that are consecutive pieces of one answer.
-func collectText(value any, builder *strings.Builder, depth int) {
-	if depth > 32 || builder.Len() > 4<<20 {
-		return
-	}
-	switch typed := value.(type) {
-	case string:
-		builder.WriteString(typed)
-	case []any:
-		for _, item := range typed {
-			collectText(item, builder, depth+1)
-		}
-	case map[string]any:
-		if isToolCallValue(typed) {
-			return
-		}
-		for _, key := range sortedKeys(typed) {
-			if isToolCallKey(key) {
-				continue
-			}
-			collectText(typed[key], builder, depth+1)
+func hasText(value map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		if text, ok := value[key].(string); ok && text != "" {
+			return true
 		}
 	}
+	return false
 }
 
 // sortedKeys keeps field order stable: map iteration is randomised, so a frame's
@@ -244,13 +374,25 @@ func sortedKeys(value map[string]any) []string {
 	return keys
 }
 
-// isToolCallKey reports the fields that carry a model's tool call. Their values
-// are code by construction — a file being written, a command being built — so
-// reading them as answer text flags every React component and every HTML
-// snippet. They are judged by the tool_call rails instead.
-func isToolCallKey(key string) bool {
+// isProtocolKey reports the fields that carry a protocol's bookkeeping rather
+// than answer text: an id, a model name, an object type, a provider name, a
+// role, an index, a stop reason, and the type and format of a reasoning block.
+// None of them is rendered as the answer, and each repeats in every frame of a
+// stream.
+//
+// A model's tool call is here too. Its arguments are code by construction — a
+// file being written, a command being built — so reading them as answer text
+// flags every React component and every HTML snippet. They are judged by the
+// tool_call rails instead.
+func isProtocolKey(key string) bool {
 	switch key {
-	case "tool_calls", "tool_call", "function_call", "arguments", "tool_use":
+	case "id", "object", "model", "provider", "provider_name", "created",
+		"system_fingerprint", "service_tier", "type", "format", "role", "index",
+		"finish_reason", "native_finish_reason", "stop_reason", "stop_sequence",
+		"signature", "logprobs", "usage", "event", "status", "request_id",
+		"item_id", "response_id":
+		return true
+	case "tool_calls", "tool_call", "function_call", "tool_use", "arguments", "input", "partial_json":
 		return true
 	}
 	return false

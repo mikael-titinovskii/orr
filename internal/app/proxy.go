@@ -56,6 +56,10 @@ type proxy struct {
 	degradationWanted map[string]string
 	rateLimitMu       sync.Mutex
 	rateLimitRuns     map[rateLimitKey]int
+	// guardrailAllowMu guards the operator window `orr guardrails allow` opens:
+	// until it ends a blocked verdict is recorded instead of enforced.
+	guardrailAllowMu    sync.Mutex
+	guardrailAllowUntil time.Time
 	// Test seams for the daily benchmark coordinator. Production uses
 	// testProvider and dailyBenchmarkGate when these are unset.
 	dailyTestProvider func(context.Context, string, string, int) (providerTestSample, error)
@@ -155,9 +159,9 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if record.GuardBlocked {
-		log.Printf("guardrails blocked %s %s phase=%s rail=%s model=%s provider=%s", record.Method, record.Path, record.GuardPhase, record.GuardRail, record.Model, record.Provider)
+		log.Printf("guardrails blocked %s %s phase=%s rail=%s model=%s provider=%s sample=%q", record.Method, record.Path, record.GuardPhase, record.GuardRail, record.Model, record.Provider, previewLine(record.GuardText))
 	} else if record.GuardObserved {
-		log.Printf("guardrails would block %s %s phase=%s rail=%s model=%s provider=%s", record.Method, record.Path, record.GuardPhase, record.GuardRail, record.Model, record.Provider)
+		log.Printf("guardrails would block %s %s phase=%s rail=%s model=%s provider=%s sample=%q", record.Method, record.Path, record.GuardPhase, record.GuardRail, record.Model, record.Provider, previewLine(record.GuardText))
 	}
 	p.observeProviderFailure(record)
 	p.observeProviderDegradation(record)
@@ -167,6 +171,43 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.LogRequests {
 		log.Printf("%s", formatRecord(record))
 	}
+}
+
+// logUpstreamError reports a failed upstream answer with the reason it gave for
+// it. The status alone cannot tell an image the provider refused from a body it
+// will not take or a key it does not accept, and the error body is the only
+// place it says which. It is bounded to one line, like a guard sample.
+func logUpstreamError(method, path string, record requestRecord, status int, body []byte, size int) {
+	line := fmt.Sprintf("upstream %s %s returned %d for model=%s provider=%s request=%d bytes",
+		method, path, status, record.Model, record.Provider, size)
+	if detail := upstreamErrorDetail(body); detail != "" {
+		line += ": " + detail
+	}
+	log.Printf("%s", line)
+}
+
+// upstreamErrorDetail reads the message out of an error body. Providers wrap it
+// differently — under error.message, message, or detail — and an unrecognized
+// shape is quoted as it arrived rather than dropped.
+func upstreamErrorDetail(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var payload struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Message string `json:"message"`
+		Detail  string `json:"detail"`
+	}
+	if err := json.Unmarshal(body, &payload); err == nil {
+		for _, text := range []string{payload.Error.Message, payload.Message, payload.Detail} {
+			if strings.TrimSpace(text) != "" {
+				return previewLine(text)
+			}
+		}
+	}
+	return previewLine(string(body))
 }
 
 func containsDotSegment(path string) bool {
@@ -507,6 +548,9 @@ func (p *proxy) forward(w http.ResponseWriter, incoming *http.Request) (requestR
 
 	record.Status = resp.StatusCode
 	record.Err = resp.StatusCode < 200 || resp.StatusCode >= 300
+	if record.Err {
+		logUpstreamError(incoming.Method, incoming.URL.Path, record, resp.StatusCode, errorBody, len(modified))
+	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 && mutablePaths[incoming.URL.Path] {
 		blocked, rail, guardErr := p.guardUpstreamResponse(incoming.Context(), resp, &record)
 		if guardErr != nil {

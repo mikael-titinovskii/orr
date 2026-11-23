@@ -92,6 +92,22 @@ type requestRecord struct {
 	GuardBlocked     bool   `json:"guard_blocked,omitempty"`
 	GuardObserved    bool   `json:"guard_observed,omitempty"`
 	GuardUnavailable bool   `json:"guard_unavailable,omitempty"`
+	// GuardModel and GuardNonModel split what the gate cost the request.
+	// GuardModel is the classifier's own share, measured inside the sidecar and
+	// returned on the check response; GuardNonModel is everything else, the rule
+	// rails and the HTTP round trip. Both stay zero when no check of their kind
+	// ran, which the log renders blank.
+	GuardModel    time.Duration `json:"guard_model,omitempty"`
+	GuardNonModel time.Duration `json:"guard_non_model,omitempty"`
+	// GuardText is what the check judged. It is set only when a verdict was
+	// recorded, so a false positive can be reproduced instead of guessed at, and
+	// it never reaches the stats payload: the dashboard log is a metric list, not
+	// a place for prompt text.
+	GuardText string `json:"-"`
+	// GuardLabel is the classifier's own verdict for the sample, such as
+	// "MALICIOUS 0.973", when the sidecar reported one. It is a label and a
+	// score, never text, and like the sample it stays out of the stats payload.
+	GuardLabel string `json:"-"`
 	// ProviderUnavailable marks OpenRouter reporting that the single selected
 	// endpoint no longer serves the model. Like RateLimited, it is routing-only
 	// evidence and is never persisted.

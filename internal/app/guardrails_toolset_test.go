@@ -26,10 +26,10 @@ func TestGuardrailCheckDeclaresToolsForToolCalls(t *testing.T) {
 		guardrailsClient: &http.Client{},
 	}
 	messages := []guardrailMessage{{Role: "assistant"}}
-	if _, err := p.guardrailCheck(context.Background(), "m", messages, []string{"tool_call"}); err != nil {
+	if _, err := p.guardrailCheck(context.Background(), nil, "m", messages, []string{"tool_call"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.guardrailCheck(context.Background(), "m", messages, []string{"input"}); err != nil {
+	if _, err := p.guardrailCheck(context.Background(), nil, "m", messages, []string{"input"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(seen) != 2 {

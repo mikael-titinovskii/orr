@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "orr Management API",
-    "version": "1.5.0",
+    "version": "1.6.3",
     "description": "Manage the running orr proxy with or without its TUI. Local management requests require no authentication header. ORR reads OPENROUTER_API_KEY from environment/dotenv configuration for upstream operations. Anyone who can reach ORR_LISTEN can use the API; keep the default loopback address for local use. Responses are not cached. No prompts, keys, or request/response bodies are exposed. OpenRouter passthrough remains under /v1/*."
   },
   "servers": [
@@ -598,6 +598,79 @@
           }
         ],
         "description": "No body. Makes billable upstream requests, with a 10-second deadline and at most four concurrent provider tests. Partial results may affect routing. A run fails if incomplete or wholly unsuccessful. Manual pins are preserved and stale results cannot overwrite changed routing."
+      }
+    },
+    "/api/v1/guardrails/allow": {
+      "post": {
+        "operationId": "allowGuardrails",
+        "summary": "Record blocked guardrail verdicts instead of refusing for a while",
+        "tags": [
+          "Management"
+        ],
+        "requestBody": {
+          "required": false,
+          "description": "Maximum 4 KiB. An empty body means 5m.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "duration": {
+                    "type": "string",
+                    "description": "A Go duration between 1m and 1h.",
+                    "example": "5m"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The window is open until the returned instant.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "until": {
+                      "type": "string",
+                      "format": "date-time",
+                      "description": "Expiry in RFC 3339, UTC."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Method not allowed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Allow": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/v1/jobs/{id}": {

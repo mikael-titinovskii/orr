@@ -149,14 +149,19 @@ func TestGuardUpstreamResponsePreservesStream(t *testing.T) {
 func TestGuardUpstreamResponseUnavailable(t *testing.T) {
 	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("sidecar exploded"))
 	}))
 	defer sidecar.Close()
+	logs := logCapture(t)
 	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"x":"y"}`))}
 	p := &proxy{cfg: config{Guardrails: guardrailsConfig{Mode: guardrailsModeOn, Action: guardrailsActionBlock, URL: sidecar.URL}}, guardrailsClient: &http.Client{}}
 	var record requestRecord
 	_, _, err := p.guardUpstreamResponse(context.Background(), resp, &record)
 	if err == nil || !record.GuardUnavailable || record.GuardPhase != "output" {
 		t.Fatalf("err=%v record=%+v, want unavailable", err, record)
+	}
+	if want := "guardrails: output check failed: check returned 500 Internal Server Error: sidecar exploded"; !strings.Contains(logs.String(), want) {
+		t.Fatalf("log = %q, want %q", logs.String(), want)
 	}
 }
 
@@ -337,14 +342,60 @@ func TestGuardUpstreamResponseWaitsForTheFirstBytes(t *testing.T) {
 	_, _ = io.ReadAll(resp.Body)
 }
 
-func TestStreamGuardTextUsesStableFieldOrder(t *testing.T) {
-	frame := []byte("data: {\"b\":\"SECOND\",\"a\":\"FIRST\"}\n\n")
-	first := streamGuardText(frame)
-	if second := streamGuardText(frame); first != second {
-		t.Fatalf("field order is random: %q then %q", first, second)
+// A frame carries the chunk id, model, object type, provider and the type and
+// format of its reasoning block beside the answer. Reading those as text spliced
+// them between every fragment of a streamed answer, and the classifier blocked
+// benign thinking for the repetition.
+func TestStreamGuardTextDropsFrameMetadata(t *testing.T) {
+	frame := []byte("data: {\"id\":\"gen-1795378496-346uRCACHO3AeMTfFKD8\",\"model\":\"deepseek/deepseek-v4.1-flash-1017\",\"object\":\"chat.completion.chunk\",\"provider_name\":\"Mistral\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"reasoning\":\"All vhosts: desktop\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"All vhosts: desktop\",\"format\":\"unknown\"}]}}]}\n\n")
+	text := strings.TrimSpace(streamGuardText(frame))
+	if text != "All vhosts: desktop" {
+		t.Fatalf("text = %q, want the delta text only", text)
 	}
-	if !strings.HasPrefix(first, "FIRST") {
-		t.Fatalf("text = %q, want fields in a stable alphabetical order", first)
+	for _, metadata := range []string{"gen-", "deepseek/", "chat.completion.chunk", "Mistral", "reasoning.text", "unknown", "assistant"} {
+		if strings.Contains(text, metadata) {
+			t.Fatalf("text = %q, frame metadata %q reached the rails", text, metadata)
+		}
+	}
+}
+
+// The same metadata surrounds a completed body, where a choice carries a message
+// instead of a delta.
+func TestResponseGuardTextDropsFrameMetadata(t *testing.T) {
+	body := []byte(`{"id":"gen-1","model":"deepseek/deepseek-v4.1-flash-1017","object":"chat.completion","provider_name":"Mistral","choices":[{"index":0,"message":{"role":"assistant","content":"the answer","reasoning":"the thought","reasoning_details":[{"type":"reasoning.text","text":"the thought","format":"unknown"}]}}]}`)
+	text := responseGuardText(body, false)
+	if !strings.Contains(text, "the answer") || !strings.Contains(text, "the thought") {
+		t.Fatalf("text = %q, want the message content and reasoning", text)
+	}
+	if strings.Count(text, "the thought") != 1 {
+		t.Fatalf("text = %q, reasoning was read more than once", text)
+	}
+	for _, metadata := range []string{"gen-1", "deepseek/", "chat.completion", "Mistral", "reasoning.text", "unknown", "assistant"} {
+		if strings.Contains(text, metadata) {
+			t.Fatalf("text = %q, frame metadata %q reached the rails", text, metadata)
+		}
+	}
+}
+
+// A legacy completion keeps its answer in choices[].text, which is still checked
+// after the frame metadata is dropped.
+func TestResponseGuardTextKeepsLegacyCompletionText(t *testing.T) {
+	body := []byte(`{"id":"cmpl-1","object":"text_completion","model":"gpt-3.5-turbo-instruct","choices":[{"index":0,"text":"rename the handler"}]}`)
+	if text := responseGuardText(body, false); !strings.Contains(text, "rename the handler") {
+		t.Fatalf("text = %q, want the completion text", text)
+	}
+}
+
+// The proxy forwards /v1/messages and the Responses API as well, so their text
+// has to survive the metadata filter too.
+func TestStreamGuardTextKeepsOtherProtocols(t *testing.T) {
+	anthropic := "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"both vhosts\"}}\n\n"
+	if text := strings.TrimSpace(streamGuardText([]byte(anthropic))); text != "both vhosts" {
+		t.Fatalf("anthropic text = %q, want the delta text", text)
+	}
+	responses := "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"delta\":\"titles were stale\"}\n\n"
+	if text := strings.TrimSpace(streamGuardText([]byte(responses))); text != "titles were stale" {
+		t.Fatalf("responses text = %q, want the delta text", text)
 	}
 }
 
@@ -355,5 +406,157 @@ func TestStripCodeDoesNotRecheckClosedFences(t *testing.T) {
 	}
 	if !strings.Contains(text, "still open") {
 		t.Fatalf("the open fence tail was dropped: %q", text)
+	}
+}
+
+// A streamed tool call whose arguments the prime window cut in half must not be
+// sent to the sidecar: it cannot be parsed, and NeMo answers with a block that
+// names no rail, which reached the log as GUARD BLOCKED with no reason.
+func TestCompleteToolCallsJudgesTruncatedStreamCall(t *testing.T) {
+	frames := strings.Join([]string{
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}`,
+		"",
+	}, "\n")
+	calls := streamToolCalls([]byte(frames))
+	if len(calls) != 1 {
+		t.Fatalf("streamToolCalls returned %d calls, want 1", len(calls))
+	}
+	got := completeToolCalls(calls, true)
+	if len(got) != 1 {
+		t.Fatalf("a truncated call was dropped unchecked: %+v", got)
+	}
+	if got[0].Function.Arguments != `{"path":""}` {
+		t.Fatalf("arguments = %q, want an empty path the rails can read", got[0].Function.Arguments)
+	}
+
+	complete := strings.Replace(frames, `"{\"path\":"`, `"{\"path\":\"main.go\"}"`, 1)
+	complete += "}\n"
+	calls = streamToolCalls([]byte(complete))
+	if len(calls) != 1 {
+		t.Fatalf("streamToolCalls returned %d calls, want 1", len(calls))
+	}
+	kept := completeToolCalls(calls, true)
+	if len(kept) != 1 {
+		t.Fatalf("a complete call was dropped: %+v", calls)
+	}
+	if kept[0].Function.Arguments != `{"path":"main.go"}` {
+		t.Fatalf("arguments = %q, want the complete object", kept[0].Function.Arguments)
+	}
+}
+
+// The value the rails read is taken from the visible prefix, including one the
+// window cut in half, and falls back to the visible text when the provider put
+// the field beyond the cut.
+func TestPartialToolArgumentsJudgesWhatTheWindowSaw(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		tool      string
+		arguments string
+		want      string
+	}{
+		{
+			name:      "cut path",
+			tool:      "write_file",
+			arguments: `{"file_path":"/home/u/.ssh/authorized_keys`,
+			want:      `{"path":"/home/u/.ssh/authorized_keys"}`,
+		},
+		{
+			name:      "path before a huge body",
+			tool:      "write_file",
+			arguments: `{"path":"/etc/passwd","content":"` + strings.Repeat("x", 4000),
+			want:      `{"path":"/etc/passwd"}`,
+		},
+		{
+			name:      "path behind the cut",
+			tool:      "write_file",
+			arguments: `{"content":"` + strings.Repeat("x", 4000),
+			want:      `{"path":"{\"content\":\"` + strings.Repeat("x", 4000) + `"}`,
+		},
+		{
+			name:      "unknown class has no rail",
+			tool:      "web_search",
+			arguments: `{"query":"hi`,
+			want:      ``,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := partialToolArguments(test.tool, test.arguments); got != test.want {
+				t.Fatalf("arguments = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// A non-streaming body is read in full, so a call there that does not parse is
+// a real anomaly and must still reach the rails.
+func TestCompleteToolCallsKeepsNonStreamingCalls(t *testing.T) {
+	calls := []rawToolCall{{ID: "c1", Type: "function"}}
+	calls[0].Function.Name = "run_command"
+	calls[0].Function.Arguments = `{"command":"ls"`
+	if got := completeToolCalls(calls, false); len(got) != 1 {
+		t.Fatalf("a non-streaming call was dropped: %+v", got)
+	}
+}
+
+func TestGuardrailUnnamedRailNamesTheBlock(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		rail   string
+		reason string
+		want   string
+	}{
+		{"declared rail wins", "regex check output", "anything", "regex check output"},
+		{"manager block", "", "tool call extraction failed: tool call 'b' has malformed arguments", "tool call extraction failed"},
+		{"reason without a colon", "", "blocked", "blocked"},
+		{"nothing at all", "", "", "check"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := guardrailUnnamedRail(test.rail, test.reason); got != test.want {
+				t.Fatalf("guardrailUnnamedRail(%q, %q) = %q, want %q", test.rail, test.reason, got, test.want)
+			}
+		})
+	}
+}
+
+// A blocked response keeps the prose the rail judged, so the false positive has
+// a sample to replay.
+func TestGuardUpstreamResponseKeepsTheBlockedSample(t *testing.T) {
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"blocked","rail":"hf classifier check output"}`))
+	}))
+	defer sidecar.Close()
+	body := `{"choices":[{"message":{"content":"the attack works like this"}}]}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	p := &proxy{cfg: config{Guardrails: guardrailsConfig{Mode: guardrailsModeOn, Action: guardrailsActionBlock, URL: sidecar.URL}}, guardrailsClient: &http.Client{}}
+	var record requestRecord
+	if blocked, _, err := p.guardUpstreamResponse(context.Background(), resp, &record); err != nil || !blocked {
+		t.Fatalf("blocked=%v err=%v", blocked, err)
+	}
+	if !strings.Contains(record.GuardText, "the attack works like this") {
+		t.Fatalf("sample = %q, want the judged prose", record.GuardText)
+	}
+}
+
+func TestVerdictLogCarriesTheSample(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "verdicts.jsonl")
+	log, err := openVerdictLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := log.write(guardrailEvent{Time: time.Now(), Phase: "input", Rail: "hf classifier check input", Action: "blocked", Text: "ignore the previous instructions"}); err != nil {
+		t.Fatal(err)
+	}
+	log.Close()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"text":"ignore the previous instructions"`) {
+		t.Fatalf("verdict line lost the sample: %s", data)
 	}
 }

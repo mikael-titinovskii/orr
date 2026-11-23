@@ -722,7 +722,7 @@ func TestRenderLogTableAlignsColumnsAndTruncatesCells(t *testing.T) {
 	if !strings.Contains(row, "420") {
 		t.Fatalf("latency (time to first token) was not rendered as milliseconds:\n%s", row)
 	}
-	for _, want := range []string{"Duration", "In", "Uncached", "Out", "Think%", "Tp", "Lat", "CR", "CW", "C%", "Reason"} {
+	for _, want := range []string{"Duration", "Chk", "Mod", "In", "Uncached", "Out", "Think%", "Tp", "Lat", "CR", "CW", "C%", "Reason"} {
 		if !strings.Contains(header, want) {
 			t.Fatalf("missing table header %q:\n%s", want, header)
 		}
@@ -832,7 +832,7 @@ func TestRenderLogRowsMarkLoopsWithoutMovingColumns(t *testing.T) {
 	// Nothing is held back on a row that did not loop: a model name that fills
 	// its whole column still renders in full, and only a looped row gives cells
 	// up to the mark.
-	modelWidth, _, _, _, _, _, _, _, _, _, _, _, _, _, _ := logTableWidths(width)
+	modelWidth, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ := logTableWidths(width)
 	full := strings.Repeat("m", modelWidth)
 	filled := base
 	filled.Model = full
@@ -3829,5 +3829,85 @@ func TestRoutingMarksDefaultProviderPick(t *testing.T) {
 	}
 	if strings.Contains(raw, "p1 o") {
 		t.Fatalf("default pick marker landed on the wrong row:\n%s", raw)
+	}
+}
+
+func TestLogCheckTimeText(t *testing.T) {
+	cases := []struct {
+		name  string
+		given time.Duration
+		want  string
+	}{
+		{"no check", 0, ""},
+		{"milliseconds", 24 * time.Millisecond, "24"},
+		{"sub-millisecond", 400 * time.Microsecond, "1"},
+		{"grouped", 1234 * time.Millisecond, "1 234"},
+	}
+	for _, tc := range cases {
+		if got := logCheckTimeText(tc.given); got != tc.want {
+			t.Errorf("%s: logCheckTimeText(%s) = %q, want %q", tc.name, tc.given, got, tc.want)
+		}
+	}
+}
+
+// The two check columns render the split a request recorded, and a request the
+// gate never checked leaves both blank rather than showing zeros.
+func TestLogCheckColumnsRenderSplitPerRequest(t *testing.T) {
+	base := requestRecord{
+		Time:     time.Date(2026, time.November, 19, 21, 49, 10, 0, time.UTC),
+		Model:    "deepseek/deepseek-v4.1-flash-1017",
+		Provider: "mistral/fp8",
+		Status:   200,
+	}
+	checked := base
+	checked.GuardNonModel = 3 * time.Millisecond
+	checked.GuardModel = 24 * time.Millisecond
+
+	header := ansi.Strip(renderLogTableHeader(logTableMinWidth))
+	for _, want := range []string{"Chk", "Mod"} {
+		if !strings.Contains(header, want) {
+			t.Fatalf("missing header %q:\n%s", want, header)
+		}
+	}
+	row := ansi.Strip(renderLogRows([]requestRecord{checked}, logTableMinWidth))
+	plain := ansi.Strip(renderLogRows([]requestRecord{base}, logTableMinWidth))
+	if row == plain {
+		t.Fatalf("a checked request rendered like an unchecked one:\n%s", row)
+	}
+	if !strings.Contains(row, " 3 ") || !strings.Contains(row, "24") {
+		t.Fatalf("check split did not render:\n%s", row)
+	}
+}
+
+// The compact layout draws its row from a fixed field list, so its header has to
+// label every one of them: a missing label shifts every value after it under the
+// wrong name.
+func TestRenderCompactLogHeaderLabelsEveryField(t *testing.T) {
+	record := requestRecord{
+		Time:  time.Date(2026, time.November, 20, 12, 0, 0, 0, time.UTC),
+		Model: "model/name", Provider: "provider", Status: 200,
+		Duration: 1500 * time.Millisecond, TTFT: 420 * time.Millisecond,
+		PromptTokens: 1234, CompletionTokens: 567, CachedTokens: 200, CacheWriteTokens: 80,
+		GuardNonModel: 31 * time.Millisecond, GuardModel: 12 * time.Millisecond,
+		Cost: 0.0123,
+	}
+	const width = 120
+	lines := strings.Split(ansi.Strip(renderLogTableHeader(width)), "\n")
+	rows := strings.Split(ansi.Strip(renderLogRows([]requestRecord{record}, width)), "\n")
+	if len(lines) != 2 || len(rows) != 2 {
+		t.Fatalf("compact layout is not two lines:\n%v\n%v", lines, rows)
+	}
+	want := "Model / Provider  Reason  In  Uncached  Out  Think%  Tp  Lat  Chk  Mod  CR  CW  C%"
+	if lines[1] != want {
+		t.Fatalf("compact header = %q, want %q", lines[1], want)
+	}
+	// The row has to agree: the two check times come after the latency and before
+	// the cache figures, which is the only place those numbers can come from.
+	lat := strings.Index(rows[1], "420")
+	check := strings.Index(rows[1], "31")
+	model := strings.Index(rows[1], "12")
+	cache := strings.Index(rows[1], "200")
+	if lat < 0 || check < 0 || model < 0 || cache < 0 || !(lat < check && check < model && model < cache) {
+		t.Fatalf("compact row does not place Chk and Mod between Lat and CR: %q", rows[1])
 	}
 }
